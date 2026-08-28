@@ -18,3 +18,11 @@ namespace. Keep the package independent of jMail and consumer applications.
 - `composer lint:check` — Pint formatting check.
 - `composer consumer:check` — clean Laravel 13 consumer install proof.
 - `composer verify` — all package checks.
+- `composer pr:check` — exact-commit orb verification and local receipt.
+- `composer pr:signoff -- --approved-sha <sha>` — approved exact-SHA signoff.
+
+Before creating, updating, or signing off a pull request, load the project-local
+`verifying-pull-requests` skill. GitHub Actions and enforced rulesets are
+intentionally absent. Signoff requires explicit human approval of the full
+verified SHA and a GitHub status read-back. Verification and signoff do not
+authorize merge, publication, release, deployment, or provider access.

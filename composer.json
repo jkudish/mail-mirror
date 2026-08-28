@@ -49,6 +49,8 @@
         "test": "vendor/bin/pest --ci",
         "format": "vendor/bin/pint",
         "lint:check": "vendor/bin/pint --test",
+        "pr:check": "node scripts/pr-check.mjs",
+        "pr:signoff": "node scripts/pr-signoff.mjs",
         "consumer:check": "./scripts/test-consumer-install.sh",
         "verify": [
             "@composer validate --strict",

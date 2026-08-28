@@ -4,6 +4,13 @@ set -euo pipefail
 
 fail() { printf 'setup: %s\n' "$*" >&2; exit 1; }
 
+if [ "$(uname -s)" = Linux ] && ! command -v node >/dev/null 2>&1; then
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq --no-install-recommends ca-certificates curl
+  curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+  sudo apt-get install -y -qq --no-install-recommends nodejs
+fi
+
 if ! command -v php >/dev/null 2>&1 || ! php -r 'exit(PHP_VERSION_ID >= 80400 && PHP_VERSION_ID < 80600 ? 0 : 1);'; then
   if [ "$(uname -s)" = Linux ]; then
     curl -fsSL https://php.new/install/linux/8.5 | bash
@@ -14,5 +21,7 @@ if ! command -v php >/dev/null 2>&1 || ! php -r 'exit(PHP_VERSION_ID >= 80400 &&
 fi
 
 command -v composer >/dev/null 2>&1 || fail 'Composer is required'
+command -v node >/dev/null 2>&1 || fail 'Node 24 or newer is required for repository verification'
+node -e 'const major=Number(process.versions.node.split(".")[0]); process.exit(major >= 24 ? 0 : 1)' || fail 'Node 24 or newer is required for repository verification'
 composer install --no-interaction --prefer-dist --no-progress
 printf 'MailMirror setup complete.\n'
