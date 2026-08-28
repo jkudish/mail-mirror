@@ -11,7 +11,7 @@ if [ "$(uname -s)" = Darwin ] && [ -x "$host_home/Library/Application Support/He
   composer_command=("$host_home/Library/Application Support/Herd/bin/php85" "$host_home/Library/Application Support/Herd/bin/composer")
 fi
 
-git -C "$root" archive HEAD | tar -x -C "$work"
+git -C "$root" checkout-index --all --prefix="$work/"
 "${composer_command[@]}" --working-dir="$work" require 'illuminate/contracts:13.*' 'illuminate/support:13.*' --no-interaction --no-update
 "${composer_command[@]}" --working-dir="$work" require --dev 'orchestra/testbench:11.*' --no-interaction --no-update
 "${composer_command[@]}" --working-dir="$work" update --prefer-lowest --prefer-dist --no-interaction --no-progress
