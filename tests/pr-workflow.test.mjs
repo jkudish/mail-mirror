@@ -78,6 +78,17 @@ test('owns stable, lowest, Laravel 12/13, quality, setup, and clean-diff checks'
     ]);
 });
 
+test('guards setup and least-privilege signoff foundation configuration', () => {
+    const setup = readFileSync(new URL('../.agents/setup', import.meta.url), 'utf8');
+    const guidance = readFileSync(new URL('../.agents/skills/verifying-pull-requests/references/setup.md', import.meta.url), 'utf8');
+    assert.match(setup, /composer\.github\.io\/installer\.sig/);
+    assert.match(setup, /hash_file\('sha384'/);
+    assert.match(setup, /02e0cf9c/);
+    assert.match(setup, /gh extension install basecamp\/gh-signoff --pin v0\.4\.1/);
+    assert.match(guidance, /Pull requests read and Commit\s+statuses read\/write/);
+    assert.match(guidance, /Contents access is not needed/);
+});
+
 test('writes a mode-0600 exact-SHA receipt after all checks pass without credentials', () => {
     const mock = runner();
     const result = runCheck({ environment: { PATH: '/usr/bin', GH_TOKEN: 'secret' }, now: () => new Date('2026-08-28T00:00:00Z'), run: mock.run });

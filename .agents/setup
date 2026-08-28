@@ -20,8 +20,27 @@ if ! command -v php >/dev/null 2>&1 || ! php -r 'exit(PHP_VERSION_ID >= 80400 &&
   fi
 fi
 
+if [ "$(uname -s)" = Linux ] && ! command -v composer >/dev/null 2>&1; then
+  composer_installer="$(mktemp)"
+  trap 'rm -f "$composer_installer"' EXIT
+  expected_checksum="$(curl -fsSL https://composer.github.io/installer.sig)"
+  curl -fsSL https://getcomposer.org/installer -o "$composer_installer"
+  actual_checksum="$(php -r "echo hash_file('sha384', '$composer_installer');")"
+  [ "$expected_checksum" = "$actual_checksum" ] || fail 'Composer installer checksum verification failed'
+  sudo php "$composer_installer" --2 --install-dir=/usr/local/bin --filename=composer
+  rm -f "$composer_installer"
+  trap - EXIT
+fi
+
 command -v composer >/dev/null 2>&1 || fail 'Composer is required'
 command -v node >/dev/null 2>&1 || fail 'Node 24 or newer is required for repository verification'
+command -v gh >/dev/null 2>&1 || fail 'GitHub CLI is required'
 node -e 'const major=Number(process.versions.node.split(".")[0]); process.exit(major >= 24 ? 0 : 1)' || fail 'Node 24 or newer is required for repository verification'
+signoff_revision="$(gh extension list 2>/dev/null | awk -F '\t' '$2 == "basecamp/gh-signoff" { print $3; exit }')"
+if [ -n "$signoff_revision" ] && [[ "$signoff_revision" != 02e0cf9c* ]]; then
+  gh extension remove basecamp/gh-signoff
+  signoff_revision=''
+fi
+[ -n "$signoff_revision" ] || gh extension install basecamp/gh-signoff --pin v0.4.1
 composer install --no-interaction --prefer-dist --no-progress
 printf 'MailMirror setup complete.\n'
