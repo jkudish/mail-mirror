@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# MailMirror has no runtime services to resume.
+exit 0

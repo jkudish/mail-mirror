@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Prepare a fresh Amp orb or local checkout for package development.
+set -euo pipefail
+
+fail() { printf 'setup: %s\n' "$*" >&2; exit 1; }
+
+if ! command -v php >/dev/null 2>&1 || ! php -r 'exit(PHP_VERSION_ID >= 80400 && PHP_VERSION_ID < 80600 ? 0 : 1);'; then
+  if [ "$(uname -s)" = Linux ]; then
+    curl -fsSL https://php.new/install/linux/8.5 | bash
+    export PATH="$HOME/.local/bin:$HOME/.config/herd-lite/bin:$PATH"
+  else
+    fail 'PHP 8.4 or 8.5 is required'
+  fi
+fi
+
+command -v composer >/dev/null 2>&1 || fail 'Composer is required'
+composer install --no-interaction --prefer-dist --no-progress
+printf 'MailMirror setup complete.\n'
