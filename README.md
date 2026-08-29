@@ -14,8 +14,8 @@ composer verify
 The package supports PHP 8.4–8.5 and Laravel 12–13.
 
 The setup is independent and idempotent. In the combined Amp project, jMail's
-primary setup invokes it from the adjacent `mail-mirror` checkout because Amp
-automatically runs only the primary repository setup.
+primary setup invokes it from `../repos/mail-mirror` relative to jMail because
+Amp automatically runs only the primary repository setup.
 
 Pull requests use repository-owned, credential-free Amp-orb verification:
 

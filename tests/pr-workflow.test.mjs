@@ -25,7 +25,7 @@ function receiptPath() {
 function success(stdout = '') { return { status: 0, stdout, stderr: '' }; }
 
 function runner({
-    extension = 'gh signoff\tbasecamp/gh-signoff\tv1.0.0', heads = [SHA], localBase = BASE_SHA,
+    extension = 'gh signoff\tbasecamp/gh-signoff\t02e0cf9c', heads = [SHA], localBase = BASE_SHA,
     pullRequest = { headRefOid: SHA, state: 'OPEN' }, remoteBase = BASE_SHA, path = receiptPath(), worktree = '',
 } = {}) {
     const calls = [];
@@ -73,9 +73,26 @@ test('owns stable, lowest, Laravel 12/13, quality, setup, and clean-diff checks'
         ['bash', ['scripts/test-prefer-lowest.sh']],
         ['bash', ['scripts/test-consumer-install.sh', '12']],
         ['node', ['--test', 'tests/pr-workflow.test.mjs']],
-        ['bash', ['-n', '.agents/setup', '.agents/resume', 'scripts/test-laravel-13-suite.sh', 'scripts/test-prefer-lowest.sh', 'scripts/test-consumer-install.sh']],
+        ['bash', ['-n', '.agents/setup']],
+        ['bash', ['-n', '.agents/resume']],
+        ['bash', ['-n', 'scripts/test-laravel-13-suite.sh']],
+        ['bash', ['-n', 'scripts/test-prefer-lowest.sh']],
+        ['bash', ['-n', 'scripts/test-consumer-install.sh']],
         ['git', ['diff', '--exit-code']],
     ]);
+});
+
+test('guards setup and least-privilege signoff foundation configuration', () => {
+    const setup = readFileSync(new URL('../.agents/setup', import.meta.url), 'utf8');
+    const guidance = readFileSync(new URL('../.agents/skills/verifying-pull-requests/references/setup.md', import.meta.url), 'utf8');
+    assert.match(setup, /composer\.github\.io\/installer\.sig/);
+    assert.match(setup, /hash_file\("sha384", \$argv\[1\]\)/);
+    assert.match(setup, /\[ "\$expected_checksum" = "\$actual_checksum" \] \|\| fail/);
+    assert.match(setup, /Composer version 2\\\./);
+    assert.match(setup, /gh extension install basecamp\/gh-signoff --force --pin v0\.4\.1/);
+    assert.match(setup, /"\$signoff_revision" == 02e0cf9c\*/);
+    assert.match(guidance, /Pull requests read and Commit\s+statuses read\/write/);
+    assert.match(guidance, /Contents access is not needed/);
 });
 
 test('writes a mode-0600 exact-SHA receipt after all checks pass without credentials', () => {
@@ -106,11 +123,13 @@ test('signoff requires exact approval and current receipt before GitHub access',
     assert.throws(() => signoff({ approvedSha: SHA, run: mock.run }), /receipt is stale/i);
 });
 
-test('signoff requires dedicated token, extension, and matching open PR', () => {
+test('signoff requires dedicated token, pinned extension, and matching open PR', () => {
     const noToken = runner(); writeReceipt(noToken.path);
     assert.throws(() => signoff({ approvedSha: SHA, environment: { GH_TOKEN: 'ambient' }, run: noToken.run }), /GH_SIGNOFF_TOKEN/);
     const noExtension = runner({ extension: '' }); writeReceipt(noExtension.path);
     assert.throws(() => signoff({ approvedSha: SHA, environment: SIGNOFF_ENV, run: noExtension.run }), /extension is not installed/i);
+    const wrongExtensionRevision = runner({ extension: 'gh signoff\tbasecamp/gh-signoff\tdeadbeef' }); writeReceipt(wrongExtensionRevision.path);
+    assert.throws(() => signoff({ approvedSha: SHA, environment: SIGNOFF_ENV, run: wrongExtensionRevision.run }), /pinned v0\.4\.1 revision/i);
     const closed = runner({ pullRequest: { headRefOid: SHA, state: 'CLOSED' } }); writeReceipt(closed.path);
     assert.throws(() => signoff({ approvedSha: SHA, environment: SIGNOFF_ENV, run: closed.run }), /open pull request/i);
     const mismatch = runner({ pullRequest: { headRefOid: OTHER_SHA, state: 'OPEN' } }); writeReceipt(mismatch.path);

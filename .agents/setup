@@ -20,8 +20,30 @@ if ! command -v php >/dev/null 2>&1 || ! php -r 'exit(PHP_VERSION_ID >= 80400 &&
   fi
 fi
 
-command -v composer >/dev/null 2>&1 || fail 'Composer is required'
+if [ "$(uname -s)" = Linux ] && ! command -v composer >/dev/null 2>&1; then
+  composer_installer="$(mktemp)"
+  trap 'rm -f "$composer_installer"' EXIT
+  expected_checksum="$(curl -fsSL https://composer.github.io/installer.sig)"
+  curl -fsSL https://getcomposer.org/installer -o "$composer_installer"
+  actual_checksum="$(php -r 'echo hash_file("sha384", $argv[1]);' -- "$composer_installer")"
+  [[ "$expected_checksum" =~ ^[[:xdigit:]]{96}$ ]] || fail 'Composer installer signature is invalid'
+  [[ "$actual_checksum" =~ ^[[:xdigit:]]{96}$ ]] || fail 'Composer installer checksum could not be calculated'
+  [ "$expected_checksum" = "$actual_checksum" ] || fail 'Composer installer checksum verification failed'
+  sudo "$(command -v php)" "$composer_installer" --2 --install-dir=/usr/local/bin --filename=composer
+  rm -f "$composer_installer"
+  trap - EXIT
+fi
+
+composer --version --no-ansi 2>/dev/null | grep -q '^Composer version 2\.' || fail 'Composer 2 is required'
 command -v node >/dev/null 2>&1 || fail 'Node 24 or newer is required for repository verification'
+command -v gh >/dev/null 2>&1 || fail 'GitHub CLI is required'
 node -e 'const major=Number(process.versions.node.split(".")[0]); process.exit(major >= 24 ? 0 : 1)' || fail 'Node 24 or newer is required for repository verification'
+# gh reports the first eight characters of this pinned script extension's commit.
+signoff_revision="$(gh extension list | awk -F '\t' '$2 == "basecamp/gh-signoff" { print $3; exit }')"
+if [[ "$signoff_revision" != 02e0cf9c* ]]; then
+  gh extension install basecamp/gh-signoff --force --pin v0.4.1
+fi
+signoff_revision="$(gh extension list | awk -F '\t' '$2 == "basecamp/gh-signoff" { print $3; exit }')"
+[[ "$signoff_revision" == 02e0cf9c* ]] || fail 'basecamp/gh-signoff v0.4.1 revision verification failed'
 composer install --no-interaction --prefer-dist --no-progress
 printf 'MailMirror setup complete.\n'
