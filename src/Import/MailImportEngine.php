@@ -8,6 +8,8 @@ use Closure;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
+use Jkudish\MailMirror\Enums\MailImportCode;
+use Jkudish\MailMirror\Enums\MailImportStage;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\StaleCheckpoint;
@@ -170,7 +172,6 @@ final readonly class MailImportEngine
                         $outcomes[$reference->providerMessageId] = new MailImportFailure(
                             $failure->stage,
                             $failure->safeCode,
-                            $this->safeSummary($failure->safeCode),
                             false,
                             $attempt,
                         );
@@ -178,16 +179,14 @@ final readonly class MailImportEngine
                     }
                 } catch (InvalidArgumentException) {
                     $outcomes[$reference->providerMessageId] = new MailImportFailure(
-                        'retrieve',
-                        'malformed_payload',
-                        $this->safeSummary('malformed_payload'),
+                        MailImportStage::Retrieve,
+                        MailImportCode::MalformedPayload,
                     );
                     break;
                 } catch (Throwable) {
                     $outcomes[$reference->providerMessageId] = new MailImportFailure(
-                        'retrieve',
-                        'unexpected_failure',
-                        'The provider message could not be retrieved safely.',
+                        MailImportStage::Retrieve,
+                        MailImportCode::UnexpectedFailure,
                     );
                     break;
                 }
@@ -204,9 +203,8 @@ final readonly class MailImportEngine
         if ($actual->mailAccountId !== $expected->mailAccountId
             || $actual->driver !== $expected->driver
             || $actual->providerMessageId !== $expected->providerMessageId) {
-            throw new MailImportFailure('retrieve', 'malformed_payload', 'The provider returned mismatched message identity.');
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
         }
-
     }
 
     /** @param array<string, RetrievedMessage|MailImportFailure> $outcomes */
@@ -310,16 +308,16 @@ final readonly class MailImportEngine
     {
         $error = MailImportError::query()->forAccount($account)
             ->where('provider_message_id', $providerMessageId)
-            ->where('stage', $failure->stage)
+            ->where('stage', $failure->stage->value)
             ->first();
 
         if ($error === null) {
             MailImportError::query()->create([
                 'mail_account_id' => $account->id,
                 'provider_message_id' => $providerMessageId,
-                'stage' => $failure->stage,
-                'code' => $failure->safeCode,
-                'summary' => $this->safeSummary($failure->safeCode),
+                'stage' => $failure->stage->value,
+                'code' => $failure->safeCode->value,
+                'summary' => $failure->safeCode->summary(),
                 'attempt_count' => $failure->attempts,
                 'last_failed_at' => now(),
             ]);
@@ -328,8 +326,8 @@ final readonly class MailImportEngine
         }
 
         $error->forceFill([
-            'code' => $failure->safeCode,
-            'summary' => $this->safeSummary($failure->safeCode),
+            'code' => $failure->safeCode->value,
+            'summary' => $failure->safeCode->summary(),
             'attempt_count' => $error->attempt_count + $failure->attempts,
             'last_failed_at' => now(),
             'resolved_at' => null,
@@ -357,6 +355,8 @@ final readonly class MailImportEngine
                 'mail_thread_id' => $thread?->id,
                 'internet_message_id' => $retrieved->internetMessageId,
                 'subject' => $retrieved->subject,
+                'sent_at' => $retrieved->sentAt,
+                'received_at' => $retrieved->receivedAt,
                 'provider_metadata' => $retrieved->providerMetadata,
             ],
         );
@@ -447,16 +447,6 @@ final readonly class MailImportEngine
         }
 
         return $message;
-    }
-
-    private function safeSummary(string $code): string
-    {
-        return match ($code) {
-            'malformed_payload' => 'The provider returned a malformed message payload.',
-            'rate_limited' => 'The provider requested a bounded retry.',
-            'unexpected_failure' => 'The provider message could not be retrieved safely.',
-            default => 'The provider message could not be imported.',
-        };
     }
 
     /** @param array<string, RetrievedMessage|MailImportFailure> $outcomes */

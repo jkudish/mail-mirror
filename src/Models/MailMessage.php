@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Jkudish\MailMirror\Models;
 
+use Carbon\CarbonImmutable;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 
@@ -13,6 +14,8 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  * @property string $provider_message_id
  * @property string|null $internet_message_id
  * @property string|null $subject
+ * @property CarbonImmutable|null $sent_at
+ * @property CarbonImmutable|null $received_at
  */
 final class MailMessage extends AccountScopedModel
 {

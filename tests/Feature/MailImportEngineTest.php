@@ -3,9 +3,13 @@
 declare(strict_types=1);
 
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Jkudish\MailMirror\Contracts\MailboxReader;
 use Jkudish\MailMirror\Enums\MailDriver;
+use Jkudish\MailMirror\Enums\MailImportCode;
+use Jkudish\MailMirror\Enums\MailImportStage;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\StaleCheckpoint;
@@ -189,7 +193,7 @@ it('bounds retryable failures and records only sparse content-safe errors', func
     $reader->pages = ['start' => new InventoryPage([reference($account, 'rate-limited')], null, true)];
     $reader->retrievers['rate-limited'] = function (MessageReference $message, int $attempt): RetrievedMessage {
         if ($attempt < 3) {
-            throw new MailImportFailure('retrieve', 'rate_limited', 'The provider requested a bounded retry.', true);
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::RateLimited, retryable: true);
         }
 
         return new RetrievedMessage($message, 'Invented recovered message');
@@ -253,7 +257,7 @@ it('resolves a later successful import and supports explicit audited waiver', fu
         reference($account, 'eventual-success'), reference($account, 'waived-message'),
     ], null, true)];
     $reader->retrievers['eventual-success'] = $reader->retrievers['waived-message'] = function (): RetrievedMessage {
-        throw new MailImportFailure('retrieve', 'synthetic_failure', 'The invented message is temporarily unavailable.');
+        throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::SyntheticFailure);
     };
     $engine = importEngine($reader);
     $first = $engine->sync($account);
@@ -329,6 +333,8 @@ it('hydrates the complete provider-neutral graph idempotently and replaces stale
         ],
         providerMetadata: ['state' => 'one'],
         providerThreadMetadata: ['native_thread' => 'one'],
+        sentAt: new DateTimeImmutable('2026-01-02T03:04:05+00:00'),
+        receivedAt: new DateTimeImmutable('2026-01-02T03:05:06+00:00'),
     );
     $engine = importEngine($reader);
 
@@ -353,6 +359,8 @@ it('hydrates the complete provider-neutral graph idempotently and replaces stale
     fclose($materializedSource);
 
     expect(MailMessage::query()->forAccount($account)->count())->toBe(1)
+        ->and($message->sent_at?->toIso8601String())->toBe('2026-01-02T03:04:05+00:00')
+        ->and($message->received_at?->toIso8601String())->toBe('2026-01-02T03:05:06+00:00')
         ->and(MailMessageHeader::query()->forAccount($account)->count())->toBe(2)
         ->and(MailMessageParticipant::query()->forAccount($account)->count())->toBe(2)
         ->and(MailAttachment::query()->forAccount($account)->count())->toBe(2)
@@ -370,11 +378,15 @@ it('hydrates the complete provider-neutral graph idempotently and replaces stale
         containers: [['provider_id' => 'container-two', 'name' => 'Second', 'provider_metadata' => ['role' => 'archive']]],
         providerMetadata: ['state' => 'two'],
         providerThreadMetadata: ['native_thread' => 'two'],
+        sentAt: new DateTimeImmutable('2026-02-03T04:05:06+00:00'),
+        receivedAt: new DateTimeImmutable('2026-02-03T04:06:07+00:00'),
     );
     $engine->sync($account);
     $message = MailMessage::query()->forAccount($account)->firstOrFail();
 
     expect($message->subject)->toBe('Second subject')
+        ->and($message->sent_at?->toIso8601String())->toBe('2026-02-03T04:05:06+00:00')
+        ->and($message->received_at?->toIso8601String())->toBe('2026-02-03T04:06:07+00:00')
         ->and($message->provider_metadata)->toBe(['state' => 'two'])
         ->and($message->thread?->provider_thread_id)->toBe('thread-two')
         ->and($message->thread?->provider_metadata)->toBe(['native_thread' => 'two'])
@@ -443,7 +455,7 @@ it('closes a waived episode on success and requires a new waiver after failure r
     $reader = new DeterministicImportReader;
     $reader->pages = ['start' => new InventoryPage([reference($account, 'episode-message')], null, true)];
     $reader->retrievers['episode-message'] = fn (): RetrievedMessage => throw new MailImportFailure(
-        'retrieve', 'synthetic_failure', 'Driver prose must not persist.',
+        MailImportStage::Retrieve, MailImportCode::SyntheticFailure,
     );
     $engine = importEngine($reader);
     $engine->sync($account);
@@ -459,7 +471,7 @@ it('closes a waived episode on success and requires a new waiver after failure r
     expect($error->refresh()->resolved_at)->not->toBeNull();
 
     $reader->retrievers['episode-message'] = fn (): RetrievedMessage => throw new MailImportFailure(
-        'retrieve', 'synthetic_failure', 'Different hostile provider prose.',
+        MailImportStage::Retrieve, MailImportCode::SyntheticFailure,
     );
     $report = $engine->sync($account);
 
@@ -468,7 +480,81 @@ it('closes a waived episode on success and requires a new waiver after failure r
         ->and($error->waiver_reason)->toBeNull()
         ->and($error->waiver_audit_reference)->toBeNull()
         ->and($error->summary)->toBe('The provider message could not be imported.')
-        ->and($report?->transient_error_count)->toBe(0);
+        ->and($report?->transient_error_count)->toBe(1)
+        ->and($report?->waived_error_count)->toBe(0)
+        ->and($report?->mirrored_count)->toBe(0);
+
+    $error->waive('Invented explicit acceptance of the new episode.', 'opaque-waiver-two');
+    $waivedReport = $engine->sync($account);
+
+    expect($error->refresh()->waived_at)->not->toBeNull()
+        ->and($error->resolved_at)->toBeNull()
+        ->and($waivedReport?->transient_error_count)->toBe(0)
+        ->and($waivedReport?->waived_error_count)->toBe(1)
+        ->and($waivedReport?->mirrored_count)->toBe(0);
+});
+
+it('normalizes hostile driver failure metadata to package-owned values', function (): void {
+    $marker = 'invented_secret_token_marker';
+    $failure = new MailImportFailure($marker, $marker);
+    $stateFailure = new MailImportFailure('inventory', 'state_mismatch');
+    $account = importAccount('hostile-failure-metadata');
+    $reader = new DeterministicImportReader;
+    $reader->pages = ['start' => new InventoryPage([reference($account, 'hostile-message')], null, true)];
+    $reader->retrievers['hostile-message'] = fn (): RetrievedMessage => throw $failure;
+
+    expect($failure->stage)->toBe(MailImportStage::Retrieve)
+        ->and($failure->safeCode)->toBe(MailImportCode::UnexpectedFailure)
+        ->and($failure->getMessage())->not->toContain($marker)
+        ->and($stateFailure->stage)->toBe(MailImportStage::Inventory)
+        ->and($stateFailure->safeCode)->toBe(MailImportCode::StateMismatch);
+
+    $report = importEngine($reader)->sync($account);
+    $error = MailImportError::query()->firstOrFail();
+    $persisted = json_encode([$error->toArray(), $report?->toArray()], JSON_THROW_ON_ERROR);
+
+    expect($error->stage)->toBe('retrieve')
+        ->and($error->code)->toBe('unexpected_failure')
+        ->and($error->summary)->toBe('The provider message could not be retrieved safely.')
+        ->and($report?->transient_error_count)->toBe(1)
+        ->and($persisted)->not->toContain($marker);
+});
+
+it('reconciles exclusively on the configured mail mirror connection', function (): void {
+    config()->set('database.connections.mail_mirror_isolated', [
+        'driver' => 'sqlite',
+        'database' => ':memory:',
+        'prefix' => '',
+        'foreign_key_constraints' => true,
+    ]);
+    DB::purge('mail_mirror_isolated');
+    expect(Artisan::call('migrate:fresh', ['--database' => 'mail_mirror_isolated']))->toBe(0);
+    config()->set('mail-mirror.database_connection', 'mail_mirror_isolated');
+
+    $account = importAccount('isolated-connection');
+    $reader = new DeterministicImportReader;
+    $reader->pages = ['start' => new InventoryPage([reference($account, 'isolated-message')], null, true)];
+    $report = importEngine($reader)->sync($account);
+
+    expect($account->getConnectionName())->toBe('mail_mirror_isolated')
+        ->and($report?->getConnectionName())->toBe('mail_mirror_isolated')
+        ->and(DB::connection('mail_mirror_isolated')->table('mail_messages')->count())->toBe(1)
+        ->and(DB::connection('mail_mirror_isolated')->table('mail_reconciliation_reports')->count())->toBe(1)
+        ->and(DB::connection('testing')->table('mail_messages')->count())->toBe(0)
+        ->and(DB::connection('testing')->table('mail_reconciliation_reports')->count())->toBe(0);
+});
+
+it('returns the existing immutable report when the same completed scan is reconciled again', function (): void {
+    $account = importAccount('same-scan-report');
+    $reader = new DeterministicImportReader;
+    $reader->pages = ['start' => new InventoryPage([reference($account, 'same-scan-message')], null, true)];
+    $first = importEngine($reader)->sync($account);
+    $service = new ReconciliationService;
+
+    $second = $service->reconcile($account, (string) $first?->scan_id);
+
+    expect($second->id)->toBe($first?->id)
+        ->and(MailReconciliationReport::query()->forAccount($account)->count())->toBe(1);
 });
 
 it('bounds high-cardinality reconciliation reports to configured metadata samples', function (): void {

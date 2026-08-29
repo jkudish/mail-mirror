@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Jkudish\MailMirror\Read;
 
+use DateTimeImmutable;
 use InvalidArgumentException;
 
 final readonly class RetrievedMessage
@@ -27,6 +28,8 @@ final readonly class RetrievedMessage
         public array $providerMetadata = [],
         public ?RawMessageSource $rawSource = null,
         public array $providerThreadMetadata = [],
+        public ?DateTimeImmutable $sentAt = null,
+        public ?DateTimeImmutable $receivedAt = null,
     ) {
         if (($subject !== null && mb_strlen($subject) > 255)
             || ($internetMessageId !== null && mb_strlen($internetMessageId) > 255)) {

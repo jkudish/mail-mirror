@@ -20,4 +20,7 @@ They were authored for task #3096 on 2026-08-29. The deterministic reader is an
 in-memory test double: pagination, duplicates, retry/rate-limit failures,
 malformed payloads, state changes, deletion evidence, crashes, stale
 checkpoints, resolution, waiver, and incomplete scans perform no network,
-provider, mailbox, queue, credential, or paid-service access.
+provider, mailbox, queue, credential, or paid-service access. High-cardinality
+reconciliation, hostile failure metadata, immutable message timestamps, and
+configured database-connection cases also use only deterministic inline values
+invented for these tests.

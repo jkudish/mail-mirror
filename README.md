@@ -45,7 +45,11 @@ up to `mail-mirror.import_max_attempts`, and commits inventory rows, idempotent
 message/thread/header/participant/attachment/container state, sparse errors,
 scan-qualified deletion evidence, and the checkpoint in one transaction. Later
 provider state replaces stale child rows and memberships while preserving
-provider-native metadata. The optimistic checkpoint version and account row
+provider-native metadata. `RetrievedMessage` carries optional immutable sent and
+received datetimes into the corresponding message columns. Import failures use
+the package-owned `MailImportStage` and `MailImportCode` closed values; unknown
+driver strings normalize to generic content-safe metadata and never reach
+persistence or exceptions. The optimistic checkpoint version and account row
 lock reject concurrent or stale advancement. Inventory pages are rejected above
 `mail-mirror.inventory_page_max_messages`; the cursor changes only after all
 corresponding database and object work is durable.
@@ -61,12 +65,14 @@ report per account/scan. It distinguishes mirrored inventory, provider-proven
 deletions, open transient errors, explicitly waived errors, unexplained missing
 inventory, and unexpected active mirror records. Reports, errors, and thrown
 exceptions contain no message content, credentials, object keys, or provider
-error text. Each report category contains its indexed SQL count plus at most
-`mail-mirror.reconciliation_sample_limit` opaque provider IDs and a `truncated`
-flag; it never stores the full provider inventory. Deletion evidence explains a
-difference only for the completed scan that observed it and is invalidated by
-reappearance. MailMirror does not quarantine, retain, purge, or otherwise apply
-deletion lifecycle policy here.
+error text. For current inventory, an open unwaived error takes precedence over
+a prior mirror row, followed by an open waiver; only rows without an open error
+are mirrored or unexplained. Each report category contains its indexed SQL count
+plus at most `mail-mirror.reconciliation_sample_limit` opaque provider IDs and a
+`truncated` flag; it never stores the full provider inventory. Deletion evidence
+explains a difference only for the completed scan that observed it and is
+invalidated by reappearance. MailMirror does not quarantine, retain, purge, or
+otherwise apply deletion lifecycle policy here.
 
 The upgrade migration refuses to replace populated legacy run/checkpoint state
 before making any schema change. Its rollback restores compatible legacy run,

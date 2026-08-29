@@ -5,25 +5,29 @@ declare(strict_types=1);
 namespace Jkudish\MailMirror\Exceptions;
 
 use InvalidArgumentException;
+use Jkudish\MailMirror\Enums\MailImportCode;
+use Jkudish\MailMirror\Enums\MailImportStage;
 use RuntimeException;
 
 final class MailImportFailure extends RuntimeException
 {
+    public readonly MailImportStage $stage;
+
+    public readonly MailImportCode $safeCode;
+
     public function __construct(
-        public readonly string $stage,
-        public readonly string $safeCode,
-        public readonly string $safeSummary,
+        MailImportStage|string $stage,
+        MailImportCode|string $safeCode,
         public readonly bool $retryable = false,
         public readonly int $attempts = 1,
     ) {
-        if (! preg_match('/^[a-z][a-z0-9_]{1,63}$/', $stage)
-            || ! preg_match('/^[a-z][a-z0-9_.-]{1,63}$/', $safeCode)
-            || trim($safeSummary) === ''
-            || mb_strlen($safeSummary) > 160
-            || $attempts < 1) {
-            throw new InvalidArgumentException('Import failures require bounded, redacted stable metadata.');
+        if ($attempts < 1) {
+            throw new InvalidArgumentException('Import failure attempts must be positive.');
         }
 
-        parent::__construct('Mail import failed with safe code '.$safeCode.'.');
+        $this->stage = MailImportStage::normalize($stage);
+        $this->safeCode = MailImportCode::normalize($safeCode);
+
+        parent::__construct('Mail import failed with package-classified metadata.');
     }
 }
