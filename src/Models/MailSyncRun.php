@@ -25,35 +25,38 @@ final class MailSyncRun extends AccountScopedModel
         });
 
         self::updating(function (self $run): void {
-            if (! $run->isDirty('status')) {
-                return;
+            if ($run->isDirty('status')) {
+                throw new LogicException('A sync run status must be changed with transitionTo().');
             }
-
-            $original = $run->getRawOriginal('status');
-
-            if (! is_string($original)) {
-                throw new LogicException('The persisted sync run status is invalid.');
-            }
-
-            $from = SyncRunStatus::from($original);
-            $run->assertTransitionAllowed($from, $run->status);
         });
     }
 
     public function transitionTo(SyncRunStatus $status, ?string $failureReason = null): void
     {
-        $this->assertTransitionAllowed($this->status, $status);
+        $from = $this->status;
+        $this->assertTransitionAllowed($from, $status);
 
-        $this->status = $status;
-        $this->failure_reason = $status === SyncRunStatus::Failed ? $failureReason : null;
+        $attributes = [
+            'status' => $status->value,
+            'failure_reason' => $status === SyncRunStatus::Failed ? $failureReason : null,
+        ];
 
         if ($status === SyncRunStatus::Running) {
-            $this->started_at = CarbonImmutable::now();
+            $attributes['started_at'] = CarbonImmutable::now();
         } else {
-            $this->finished_at = CarbonImmutable::now();
+            $attributes['finished_at'] = CarbonImmutable::now();
         }
 
-        $this->save();
+        $updated = $this->newModelQuery()
+            ->whereKey($this->getKey())
+            ->where('status', $from->value)
+            ->update($attributes);
+
+        if ($updated !== 1) {
+            throw new LogicException('The sync run status changed before this transition could be persisted.');
+        }
+
+        $this->refresh();
     }
 
     private function assertTransitionAllowed(SyncRunStatus $from, SyncRunStatus $to): void

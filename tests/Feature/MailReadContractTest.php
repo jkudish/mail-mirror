@@ -125,3 +125,12 @@ it('rejects a reader registered under a different enum key', function (): void {
     expect(fn () => $registry->register(MailDriver::Gmail, new SyntheticFixtureReader(MailDriver::Jmap, SyntheticFixtureReader::fixture('jmap'))))
         ->toThrow(InvalidArgumentException::class);
 });
+
+it('rejects duplicate reader registration for an enum key', function (): void {
+    $registry = new MailDriverRegistry;
+    $reader = new SyntheticFixtureReader(MailDriver::Gmail, SyntheticFixtureReader::fixture('gmail'));
+    $registry->register(MailDriver::Gmail, $reader);
+
+    expect(fn () => $registry->register(MailDriver::Gmail, $reader))
+        ->toThrow(LogicException::class, 'already registered');
+});

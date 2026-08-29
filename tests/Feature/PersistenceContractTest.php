@@ -135,6 +135,24 @@ it('persists the minimal account-rooted record graph and provider metadata', fun
         ->and($attachment->refresh()->provider_metadata)->toBe(['blobId' => 'synthetic-blob-1'])
         ->and([$participant->exists, $header->exists, $membership->exists, $raw->exists, $checkpoint->exists])
         ->each->toBeTrue();
+
+    $account->delete();
+
+    expect([
+        MailAccount::query()->count(),
+        MailIdentity::query()->count(),
+        MailThread::query()->count(),
+        MailMessage::query()->count(),
+        MailAddress::query()->count(),
+        MailMessageParticipant::query()->count(),
+        MailMessageHeader::query()->count(),
+        MailContainer::query()->count(),
+        MailMessageContainerMembership::query()->count(),
+        MailAttachment::query()->count(),
+        MailRawObject::query()->count(),
+        MailSyncRun::query()->count(),
+        MailSyncCheckpoint::query()->count(),
+    ])->each->toBe(0);
 });
 
 it('scopes owners by both morph values and excludes ownerless accounts', function (): void {
@@ -166,7 +184,15 @@ it('rejects invalid owner tuples and changes to attached owners or provider iden
         'owner_id' => null,
         'driver' => MailDriver::Gmail,
         'provider_account_id' => 'invalid-owner-path',
-    ]))->toThrow(InvalidArgumentException::class);
+    ]))->toThrow(InvalidArgumentException::class)
+        ->and(fn () => DB::table('mail_accounts')->insert([
+            'owner_type' => 'synthetic-owner',
+            'owner_id' => null,
+            'driver' => MailDriver::Gmail->value,
+            'provider_account_id' => 'invalid-owner-path-through-query-builder',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]))->toThrow(QueryException::class);
 
     $owner = SyntheticOwner::query()->create(['name' => 'Synthetic owner']);
     $account = MailAccount::query()->create([
@@ -175,6 +201,10 @@ it('rejects invalid owner tuples and changes to attached owners or provider iden
         'driver' => MailDriver::Gmail,
         'provider_account_id' => 'immutable-provider-account',
     ]);
+
+    expect(fn () => DB::table('mail_accounts')->where('id', $account->id)->update([
+        'owner_type' => null,
+    ]))->toThrow(QueryException::class);
 
     $account->owner_id = '999';
     expect(fn () => $account->save())->toThrow(LogicException::class);
@@ -206,6 +236,49 @@ it('qualifies provider identifiers and occurrences by account', function (): voi
             'mail_account_id' => $first->id,
             'provider_message_id' => 'another-message',
             'provider_occurrence_id' => 'shared-occurrence',
+        ]))->toThrow(QueryException::class);
+});
+
+it('qualifies attachment and raw object identifiers by message occurrence', function (): void {
+    $account = account('reused-child-provider-identifiers');
+
+    foreach (['first', 'second'] as $position) {
+        $message = MailMessage::query()->create([
+            'mail_account_id' => $account->id,
+            'provider_message_id' => $position.'-message',
+            'provider_occurrence_id' => $position.'-occurrence',
+        ]);
+
+        MailAttachment::query()->create([
+            'mail_account_id' => $account->id,
+            'mail_message_id' => $message->id,
+            'provider_attachment_id' => 'reused-attachment-id',
+        ]);
+        MailRawObject::query()->create([
+            'mail_account_id' => $account->id,
+            'mail_message_id' => $message->id,
+            'provider_object_id' => 'reused-raw-id',
+            'kind' => 'rfc822',
+        ]);
+    }
+
+    expect(MailAttachment::query()->count())->toBe(2)
+        ->and(MailRawObject::query()->count())->toBe(2)
+        ->and(fn () => MailRawObject::query()->create([
+            'mail_account_id' => $account->id,
+            'provider_object_id' => 'account-level-raw-id',
+            'kind' => 'rfc822',
+        ]))->toThrow(QueryException::class)
+        ->and(fn () => MailAttachment::query()->create([
+            'mail_account_id' => $account->id,
+            'mail_message_id' => $message->id,
+            'provider_attachment_id' => 'reused-attachment-id',
+        ]))->toThrow(QueryException::class)
+        ->and(fn () => MailRawObject::query()->create([
+            'mail_account_id' => $account->id,
+            'mail_message_id' => $message->id,
+            'provider_object_id' => 'reused-raw-id',
+            'kind' => 'rfc822',
         ]))->toThrow(QueryException::class);
 });
 
@@ -276,9 +349,29 @@ it('fails closed for unknown drivers and invalid sync lifecycle transitions', fu
     ]);
     expect(fn () => $run->transitionTo(SyncRunStatus::Completed))->toThrow(LogicException::class);
 
+    $run->status = SyncRunStatus::Running;
+    expect(fn () => $run->save())->toThrow(LogicException::class, 'transitionTo');
+
+    $run->refresh();
     $run->transitionTo(SyncRunStatus::Running);
     $run->transitionTo(SyncRunStatus::Completed);
 
     expect($run->refresh()->status)->toBe(SyncRunStatus::Completed)
         ->and(fn () => $run->transitionTo(SyncRunStatus::Running))->toThrow(LogicException::class);
+});
+
+it('rejects a stale sync lifecycle transition', function (): void {
+    $account = account('concurrent-lifecycle-account');
+    $run = MailSyncRun::query()->create([
+        'mail_account_id' => $account->id,
+        'status' => SyncRunStatus::Pending,
+        'operation' => 'inventory',
+    ]);
+    $first = MailSyncRun::query()->findOrFail($run->id);
+    $stale = MailSyncRun::query()->findOrFail($run->id);
+
+    $first->transitionTo(SyncRunStatus::Running);
+
+    expect(fn () => $stale->transitionTo(SyncRunStatus::Running))
+        ->toThrow(LogicException::class, 'changed before this transition');
 });

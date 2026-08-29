@@ -15,9 +15,12 @@ final class MailMirrorServiceProvider extends PackageServiceProvider
     {
         $package
             ->name('mail-mirror')
-            ->hasConfigFile()
-            ->hasMigration('create_mail_mirror_tables')
-            ->runsMigrations();
+            ->hasConfigFile();
+    }
+
+    public function bootingPackage(): void
+    {
+        $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
     }
 
     public function packageRegistered(): void

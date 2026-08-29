@@ -47,9 +47,10 @@ final class MailAccount extends Model
 
     public function getConnectionName(): ?string
     {
+        $instanceConnection = parent::getConnectionName();
         $connection = config('mail-mirror.database_connection');
 
-        return is_string($connection) ? $connection : parent::getConnectionName();
+        return $instanceConnection ?? (is_string($connection) ? $connection : null);
     }
 
     /** @return MorphTo<Model, $this> */

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
@@ -11,6 +12,8 @@ return new class extends Migration
     /** Create MailMirror's account-rooted provider record tables. */
     public function up(): void
     {
+        $this->assertSupportedDatabaseDriver();
+
         Schema::create('mail_accounts', function (Blueprint $table): void {
             $table->id();
             $table->string('owner_type')->nullable();
@@ -23,6 +26,8 @@ return new class extends Migration
             $table->index(['owner_type', 'owner_id']);
             $table->index(['driver', 'provider_account_id']);
         });
+
+        $this->addOwnerTupleConstraint();
 
         Schema::create('mail_identities', function (Blueprint $table): void {
             $table->id();
@@ -64,10 +69,11 @@ return new class extends Migration
             $table->unique(['mail_account_id', 'provider_message_id']);
             $table->unique(['mail_account_id', 'provider_occurrence_id']);
             $table->unique(['mail_account_id', 'id']);
+            $table->index('mail_thread_id');
             $table->foreign(['mail_account_id', 'mail_thread_id'])
                 ->references(['mail_account_id', 'id'])
                 ->on('mail_threads')
-                ->restrictOnDelete();
+                ->noActionOnDelete();
         });
 
         Schema::create('mail_addresses', function (Blueprint $table): void {
@@ -97,12 +103,15 @@ return new class extends Migration
             $table->timestamps();
 
             $table->unique(['mail_account_id', 'mail_message_id', 'role', 'position'], 'mail_participant_position_unique');
+            $table->index('mail_message_id');
+            $table->index('mail_address_id');
+            $table->index('mail_identity_id');
             $table->foreign(['mail_account_id', 'mail_message_id'])
                 ->references(['mail_account_id', 'id'])->on('mail_messages')->cascadeOnDelete();
             $table->foreign(['mail_account_id', 'mail_address_id'])
-                ->references(['mail_account_id', 'id'])->on('mail_addresses')->restrictOnDelete();
+                ->references(['mail_account_id', 'id'])->on('mail_addresses')->noActionOnDelete();
             $table->foreign(['mail_account_id', 'mail_identity_id'])
-                ->references(['mail_account_id', 'id'])->on('mail_identities')->restrictOnDelete();
+                ->references(['mail_account_id', 'id'])->on('mail_identities')->noActionOnDelete();
         });
 
         Schema::create('mail_message_headers', function (Blueprint $table): void {
@@ -116,6 +125,7 @@ return new class extends Migration
             $table->timestamps();
 
             $table->unique(['mail_account_id', 'mail_message_id', 'name', 'position'], 'mail_header_position_unique');
+            $table->index('mail_message_id');
             $table->foreign(['mail_account_id', 'mail_message_id'])
                 ->references(['mail_account_id', 'id'])->on('mail_messages')->cascadeOnDelete();
         });
@@ -143,6 +153,8 @@ return new class extends Migration
             $table->timestamps();
 
             $table->unique(['mail_account_id', 'mail_message_id', 'mail_container_id'], 'mail_container_membership_unique');
+            $table->index('mail_message_id');
+            $table->index('mail_container_id');
             $table->foreign(['mail_account_id', 'mail_message_id'])
                 ->references(['mail_account_id', 'id'])->on('mail_messages')->cascadeOnDelete();
             $table->foreign(['mail_account_id', 'mail_container_id'])
@@ -162,7 +174,8 @@ return new class extends Migration
             $table->json('provider_metadata')->nullable();
             $table->timestamps();
 
-            $table->unique(['mail_account_id', 'provider_attachment_id']);
+            $table->unique(['mail_account_id', 'mail_message_id', 'provider_attachment_id'], 'mail_attachment_provider_unique');
+            $table->index('mail_message_id');
             $table->foreign(['mail_account_id', 'mail_message_id'])
                 ->references(['mail_account_id', 'id'])->on('mail_messages')->cascadeOnDelete();
         });
@@ -170,7 +183,7 @@ return new class extends Migration
         Schema::create('mail_raw_objects', function (Blueprint $table): void {
             $table->id();
             $table->foreignId('mail_account_id')->constrained()->cascadeOnDelete();
-            $table->unsignedBigInteger('mail_message_id')->nullable();
+            $table->unsignedBigInteger('mail_message_id');
             $table->string('provider_object_id');
             $table->string('kind');
             $table->string('media_type')->nullable();
@@ -179,9 +192,10 @@ return new class extends Migration
             $table->json('provider_metadata')->nullable();
             $table->timestamps();
 
-            $table->unique(['mail_account_id', 'kind', 'provider_object_id'], 'mail_raw_object_provider_unique');
+            $table->unique(['mail_account_id', 'mail_message_id', 'kind', 'provider_object_id'], 'mail_raw_object_provider_unique');
+            $table->index('mail_message_id');
             $table->foreign(['mail_account_id', 'mail_message_id'])
-                ->references(['mail_account_id', 'id'])->on('mail_messages')->restrictOnDelete();
+                ->references(['mail_account_id', 'id'])->on('mail_messages')->noActionOnDelete();
         });
 
         Schema::create('mail_sync_runs', function (Blueprint $table): void {
@@ -208,9 +222,53 @@ return new class extends Migration
             $table->timestamps();
 
             $table->unique(['mail_account_id', 'checkpoint_key']);
+            $table->index('mail_sync_run_id');
             $table->foreign(['mail_account_id', 'mail_sync_run_id'])
-                ->references(['mail_account_id', 'id'])->on('mail_sync_runs')->restrictOnDelete();
+                ->references(['mail_account_id', 'id'])->on('mail_sync_runs')->noActionOnDelete();
         });
+    }
+
+    private function addOwnerTupleConstraint(): void
+    {
+        $driver = Schema::getConnection()->getDriverName();
+
+        if ($driver === 'pgsql') {
+            DB::statement(<<<'SQL'
+                ALTER TABLE mail_accounts
+                ADD CONSTRAINT mail_accounts_owner_tuple_check
+                CHECK ((owner_type IS NULL AND owner_id IS NULL) OR (owner_type IS NOT NULL AND owner_id IS NOT NULL))
+                SQL);
+
+            return;
+        }
+
+        DB::statement(<<<'SQL'
+            CREATE TRIGGER mail_accounts_owner_tuple_insert
+            BEFORE INSERT ON mail_accounts
+            FOR EACH ROW
+            WHEN (NEW.owner_type IS NULL) != (NEW.owner_id IS NULL)
+            BEGIN
+                SELECT RAISE(ABORT, 'Owner type and owner ID must both be null or both be present.');
+            END
+            SQL);
+        DB::statement(<<<'SQL'
+            CREATE TRIGGER mail_accounts_owner_tuple_update
+            BEFORE UPDATE OF owner_type, owner_id ON mail_accounts
+            FOR EACH ROW
+            WHEN (NEW.owner_type IS NULL) != (NEW.owner_id IS NULL)
+            BEGIN
+                SELECT RAISE(ABORT, 'Owner type and owner ID must both be null or both be present.');
+            END
+            SQL);
+    }
+
+    private function assertSupportedDatabaseDriver(): void
+    {
+        $driver = Schema::getConnection()->getDriverName();
+
+        if (! in_array($driver, ['pgsql', 'sqlite'], true)) {
+            throw new RuntimeException("MailMirror does not support the {$driver} database driver.");
+        }
     }
 
     public function down(): void

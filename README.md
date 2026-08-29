@@ -18,7 +18,9 @@ and composite account/parent foreign keys. Drivers are selected with the closed
 composer verify
 ```
 
-The package supports PHP 8.4–8.5 and Laravel 12–13.
+The package supports PHP 8.4–8.5 and Laravel 12–13. PostgreSQL is the supported
+runtime database; SQLite is supported for package tests and local consumers.
+The migration fails closed on other database drivers.
 
 The package [ownership and boundary contract](docs/architecture/ownership-and-boundaries.md)
 defines mail accounts as the roots for provider-derived records while keeping
@@ -27,9 +29,11 @@ import, reconciliation, and provider work must add its concrete isolation tests
 alongside the implementation.
 
 The package automatically registers its config and migration. Applications can
-publish them with Laravel's conventional `vendor:publish` commands. Models use
-the application's default database connection unless
-`mail-mirror.database_connection` selects another configured connection.
+publish the config with Laravel's conventional `vendor:publish` command; the
+migration is loaded directly from the package so it cannot also be published
+and accidentally run twice. Models use the application's default database
+connection unless `mail-mirror.database_connection` selects another configured
+connection.
 
 No lifecycle events are emitted by this foundation: no concrete downstream
 consumer requires one yet. A later import or projection task should add only

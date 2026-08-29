@@ -20,6 +20,10 @@ final class MailDriverRegistry
             throw new InvalidArgumentException('The reader driver does not match its registry key.');
         }
 
+        if (array_key_exists($driver->value, $this->readers)) {
+            throw new LogicException(sprintf('A reader is already registered for %s.', $driver->value));
+        }
+
         $this->readers[$driver->value] = $reader;
     }
 
