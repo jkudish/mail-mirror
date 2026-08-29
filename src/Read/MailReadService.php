@@ -21,8 +21,13 @@ final readonly class MailReadService
             $maximum = 500;
         }
 
-        if (count($page->messages) + count($page->deletions) > $maximum) {
+        if (count($page->messages) + count($page->deletions) + count($page->identities) > $maximum) {
             throw new InvalidArgumentException('The provider inventory page exceeds the configured resource limit.');
+        }
+
+        if ($page->accountProfile !== null
+            && $page->accountProfile->providerAccountId !== $account->provider_account_id) {
+            throw new InvalidArgumentException('The provider account profile does not belong to the supplied mail account.');
         }
 
         foreach ($page->messages as $reference) {

@@ -1,0 +1,45 @@
+{
+    "profile": {"emailAddress": "mirror@invented.test", "messagesTotal": 2, "threadsTotal": 1, "historyId": "history-100"},
+    "labels": {"labels": [
+        {"id": "SENT", "name": "Sent", "type": "system"},
+        {"id": "DRAFT", "name": "Drafts", "type": "system"},
+        {"id": "SPAM", "name": "Spam", "type": "system"},
+        {"id": "TRASH", "name": "Trash", "type": "system"},
+        {"id": "Label_synthetic", "name": "Invented project", "type": "user", "labelListVisibility": "labelShow", "messageListVisibility": "show"}
+    ]},
+    "identities": {"sendAs": [
+        {"sendAsEmail": "mirror@invented.test", "displayName": "Synthetic Mirror", "replyToAddress": "reply@invented.test", "signature": "<p>Invented signature</p>", "isPrimary": true, "isDefault": true, "verificationStatus": "accepted"},
+        {"sendAsEmail": "alias@invented.test", "displayName": "Synthetic Alias", "signature": "", "isPrimary": false, "isDefault": false, "verificationStatus": "accepted"}
+    ]},
+    "inventory_page_1": {"messages": [
+        {"id": "gmail-message-a", "threadId": "gmail-thread-1"}
+    ], "nextPageToken": "page-two"},
+    "inventory_page_2": {"messages": [
+        {"id": "gmail-message-a", "threadId": "gmail-thread-1"},
+        {"id": "gmail-message-b", "threadId": "gmail-thread-1"}
+    ]},
+    "message_a": {
+        "id": "gmail-message-a", "threadId": "gmail-thread-1", "historyId": "history-100", "internalDate": "1700000000000", "sizeEstimate": 640,
+        "labelIds": ["SENT", "Label_synthetic"],
+        "payload": {"partId": "", "mimeType": "multipart/mixed", "headers": [
+            {"name": "From", "value": "Synthetic Sender <sender@invented.test>"},
+            {"name": "To", "value": "Synthetic Recipient <recipient@invented.test>"},
+            {"name": "Subject", "value": "Invented storage fixture"},
+            {"name": "Message-ID", "value": "<synthetic-storage-001@invented.test>"},
+            {"name": "Date", "value": "Tue, 14 Nov 2023 22:13:20 +0000"}
+        ], "parts": [{"partId": "1", "mimeType": "text/plain", "filename": "invented-note.txt", "headers": [{"name": "Content-ID", "value": "<invented-attachment>"}], "body": {"attachmentId": "attachment-a", "size": 28}}]}
+    },
+    "message_b": {
+        "id": "gmail-message-b", "threadId": "gmail-thread-1", "historyId": "history-100", "internalDate": "1700000001000", "sizeEstimate": 480,
+        "labelIds": ["DRAFT", "SPAM", "TRASH"],
+        "payload": {"partId": "", "mimeType": "text/plain", "headers": [
+            {"name": "From", "value": "Synthetic Sender <sender@invented.test>"},
+            {"name": "To", "value": "Synthetic Recipient <recipient@invented.test>"},
+            {"name": "Subject", "value": "Invented readable draft"},
+            {"name": "Message-ID", "value": "<synthetic-draft-002@invented.test>"}
+        ], "body": {"size": 20}}
+    },
+    "history": {"history": [
+        {"id": "history-101", "labelsAdded": [{"message": {"id": "gmail-message-a", "threadId": "gmail-thread-1"}}], "messagesDeleted": [{"message": {"id": "gmail-message-b", "threadId": "gmail-thread-1"}}]}
+    ], "historyId": "history-200"}
+}

@@ -23,4 +23,14 @@ return [
 
     /* Reconciliation reports retain counts plus only this many opaque IDs per category. */
     'reconciliation_sample_limit' => 20,
+
+    'gmail' => [
+        /* Fail closed unless provider network access is explicitly enabled by a consumer. */
+        'enabled' => env('MAIL_MIRROR_GMAIL_ENABLED', false),
+        'client_id' => env('MAIL_MIRROR_GMAIL_CLIENT_ID'),
+        'redirect_uri' => env('MAIL_MIRROR_GMAIL_REDIRECT_URI'),
+        'page_size' => 100,
+        'timeout_seconds' => 30,
+        'max_raw_bytes' => 52428800,
+    ],
 ];

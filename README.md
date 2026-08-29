@@ -3,14 +3,21 @@
 MailMirror is a private, standalone Laravel package foundation. It provides an
 account-rooted, provider-neutral persistence schema, resumable inventory/import
 and reconciliation orchestration, read-only driver contracts, and immutable
-raw-message and materialized-attachment byte storage. It does not include a
-provider integration, mailbox access, search, or provider mutation API.
+raw-message and materialized-attachment byte storage. It includes a read-only
+Gmail integration, but no search or provider mutation API.
 
 Mail accounts may optionally belong to a consumer model through a polymorphic
 owner. Provider-derived records are isolated by account-qualified identifiers
 and composite account/parent foreign keys. Drivers are selected with the closed
 `MailDriver` enum (`gmail` and `jmap`); consumers register read adapters in
 `MailDriverRegistry` with enum keys rather than arbitrary strings.
+
+The package registers its Gmail reader under `MailDriver::Gmail`. Gmail OAuth
+requests exactly `gmail.modify`, validates the exact returned grant, and keeps
+token refresh, rotation, and local invalid-grant revocation inside
+`MailAccountConnection`. Provider network access is fail-closed unless
+`MAIL_MIRROR_GMAIL_ENABLED=true`; ordinary verification never enables it. See
+[the separately authorized live development lane](docs/gmail-live-development.md).
 
 ## Development
 
