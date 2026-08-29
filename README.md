@@ -2,8 +2,9 @@
 
 MailMirror is a private, standalone Laravel package foundation. It provides an
 account-rooted, provider-neutral persistence schema and read-only driver
-contracts without provider integrations, credentials, import orchestration,
-object bytes, search, or mutation APIs.
+contracts plus immutable raw-message and materialized-attachment byte storage,
+without provider integrations, credentials, import orchestration, search, or
+provider mutation APIs.
 
 Mail accounts may optionally belong to a consumer model through a polymorphic
 owner. Provider-derived records are isolated by account-qualified identifiers
@@ -34,6 +35,25 @@ migration is loaded directly from the package so it cannot also be published
 and accidentally run twice. Models use the application's default database
 connection unless `mail-mirror.database_connection` selects another configured
 connection.
+
+## Immutable object storage
+
+Set `mail-mirror.storage_disk` to a private Laravel Filesystem disk. Consumers
+use the package-owned `MailObjectStorage` boundary and must pass both the
+`MailAccount` and matching message, raw object, or attachment record for every
+operation. Reads verify SHA-256 and byte count before exposing a rewindable
+stream. `integrityReport()` returns IDs, MIME metadata, checksums, sizes, and
+statuses only; it never returns object keys, filenames, or content.
+
+Writes first hash a bounded-memory stream into an account-qualified temporary
+object. Inside a database transaction they lock the message row, reject any
+different immutable record, finalize an account/message/content-addressed
+private object, verify it, and create the uniquely constrained record. The
+temporary object is always deleted. If object finalization succeeds but the
+database transaction fails, the unreferenced content-addressed object is left
+for an identical retry to adopt safely; it cannot collide with different bytes.
+Missing materialized attachments can be regenerated from the verified,
+unchanged RFC 822 raw source.
 
 No lifecycle events are emitted by this foundation: no concrete downstream
 consumer requires one yet. A later import or projection task should add only
