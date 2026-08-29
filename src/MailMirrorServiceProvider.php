@@ -4,7 +4,11 @@ declare(strict_types=1);
 
 namespace Jkudish\MailMirror;
 
+use Illuminate\Contracts\Foundation\Application;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
+use Jkudish\MailMirror\Enums\MailDriver;
+use Jkudish\MailMirror\Gmail\GmailMailboxReader;
+use Jkudish\MailMirror\Gmail\GmailOAuth;
 use Jkudish\MailMirror\Import\MailImportEngine;
 use Jkudish\MailMirror\Import\ReconciliationService;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
@@ -29,7 +33,14 @@ final class MailMirrorServiceProvider extends PackageServiceProvider
 
     public function packageRegistered(): void
     {
-        $this->app->singleton(MailDriverRegistry::class);
+        $this->app->singleton(GmailOAuth::class);
+        $this->app->singleton(GmailMailboxReader::class);
+        $this->app->singleton(MailDriverRegistry::class, function (Application $app): MailDriverRegistry {
+            $registry = new MailDriverRegistry;
+            $registry->register(MailDriver::Gmail, $app->make(GmailMailboxReader::class));
+
+            return $registry;
+        });
         $this->app->singleton(MailReadService::class);
         $this->app->singleton(MailObjectStorage::class);
         $this->app->singleton(MailAccountConnection::class);

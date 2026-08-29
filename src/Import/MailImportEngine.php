@@ -6,17 +6,20 @@ namespace Jkudish\MailMirror\Import;
 
 use Closure;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Support\Sleep;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
+use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\StaleCheckpoint;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAddress;
 use Jkudish\MailMirror\Models\MailAttachment;
 use Jkudish\MailMirror\Models\MailContainer;
+use Jkudish\MailMirror\Models\MailIdentity;
 use Jkudish\MailMirror\Models\MailImportError;
 use Jkudish\MailMirror\Models\MailInventoryItem;
 use Jkudish\MailMirror\Models\MailMessage;
@@ -84,9 +87,24 @@ final readonly class MailImportEngine
 
         $checkpoint = $this->checkpoint($account);
         $pages = 0;
+        $restarts = 0;
+        $maximumRestarts = config('mail-mirror.import_max_scan_restarts', 1);
+        $maximumRestarts = is_int($maximumRestarts) && $maximumRestarts >= 0 && $maximumRestarts <= 3
+            ? $maximumRestarts : 1;
 
         while ($pageLimit === null || $pages < $pageLimit) {
-            $page = $this->reads->inventoryPage($account, $checkpoint->provider_cursor);
+            try {
+                $page = $this->reads->inventoryPage($account, $checkpoint->provider_cursor);
+            } catch (InventoryRestartRequired $restart) {
+                if ($restarts >= $maximumRestarts) {
+                    throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::StateMismatch);
+                }
+
+                $checkpoint = $this->restartCheckpoint($account, $checkpoint, $restart->restartCursor);
+                $restarts++;
+
+                continue;
+            }
             $outcomes = $this->retrieve($account, $page);
 
             try {
@@ -103,6 +121,33 @@ final readonly class MailImportEngine
         }
 
         return null;
+    }
+
+    private function restartCheckpoint(MailAccount $account, MailSyncCheckpoint $expected, string $cursor): MailSyncCheckpoint
+    {
+        return $account->getConnection()->transaction(function () use ($account, $expected, $cursor): MailSyncCheckpoint {
+            MailAccount::query()->whereKey($account->id)->lockForUpdate()->firstOrFail();
+            $checkpoint = MailSyncCheckpoint::query()->forAccount($account)
+                ->where('scan_id', $expected->scan_id)
+                ->where('version', $expected->version)
+                ->lockForUpdate()
+                ->first();
+
+            if ($checkpoint === null) {
+                throw new StaleCheckpoint;
+            }
+
+            $checkpoint->forceFill([
+                'scan_id' => (string) Str::uuid(),
+                'provider_cursor' => $cursor,
+                'version' => $checkpoint->version + 1,
+                'processed_count' => 0,
+                'scan_started_at' => now(),
+                'scan_completed_at' => null,
+            ])->save();
+
+            return $checkpoint;
+        }, 3);
     }
 
     private function reacquire(MailAccount $supplied): MailAccount
@@ -177,6 +222,10 @@ final readonly class MailImportEngine
                         );
                         break;
                     }
+
+                    if ($failure->retryAfterSeconds !== null) {
+                        Sleep::sleep($failure->retryAfterSeconds);
+                    }
                 } catch (InvalidArgumentException) {
                     $outcomes[$reference->providerMessageId] = new MailImportFailure(
                         MailImportStage::Retrieve,
@@ -227,6 +276,38 @@ final readonly class MailImportEngine
 
                 if ($checkpoint === null) {
                     throw new StaleCheckpoint;
+                }
+
+                if ($page->accountProfile !== null) {
+                    $durableAccount = MailAccount::query()->whereKey($account->id)->lockForUpdate()->firstOrFail();
+
+                    if ($page->accountProfile->providerAccountId !== $durableAccount->provider_account_id) {
+                        throw new AccountResourceMismatch('The provider profile does not match the durable account identity.');
+                    }
+
+                    $durableAccount->forceFill(['provider_metadata' => $page->accountProfile->providerMetadata])->save();
+                }
+
+                foreach ($page->identities as $identity) {
+                    MailIdentity::query()->updateOrCreate(
+                        ['mail_account_id' => $account->id, 'provider_identity_id' => $identity->providerIdentityId],
+                        [
+                            'email_address' => $identity->emailAddress,
+                            'display_name' => $identity->displayName,
+                            'provider_metadata' => $identity->providerMetadata,
+                        ],
+                    );
+                }
+
+                if ($page->identitiesComplete) {
+                    $identityIds = array_map(fn ($identity): string => $identity->providerIdentityId, $page->identities);
+                    $staleIdentities = MailIdentity::query()->forAccount($account);
+
+                    if ($identityIds !== []) {
+                        $staleIdentities->whereNotIn('provider_identity_id', $identityIds);
+                    }
+
+                    $staleIdentities->delete();
                 }
 
                 foreach ($page->messages as $reference) {
@@ -284,6 +365,15 @@ final readonly class MailImportEngine
                             'provider_metadata' => $deletion->providerMetadata,
                         ],
                     );
+                }
+
+                if ($page->deletionResolutions !== []) {
+                    MailProviderDeletionEvidence::query()->forAccount($account)
+                        ->whereIn('provider_message_id', array_map(
+                            fn ($resolution): string => $resolution->providerMessageId,
+                            $page->deletionResolutions,
+                        ))
+                        ->delete();
                 }
 
                 $checkpoint->forceFill([

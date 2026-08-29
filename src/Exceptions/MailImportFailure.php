@@ -20,9 +20,10 @@ final class MailImportFailure extends RuntimeException
         MailImportCode|string $safeCode,
         public readonly bool $retryable = false,
         public readonly int $attempts = 1,
+        public readonly ?int $retryAfterSeconds = null,
     ) {
-        if ($attempts < 1) {
-            throw new InvalidArgumentException('Import failure attempts must be positive.');
+        if ($attempts < 1 || ($retryAfterSeconds !== null && ($retryAfterSeconds < 1 || $retryAfterSeconds > 300))) {
+            throw new InvalidArgumentException('Import failure retry metadata must be positive and bounded.');
         }
 
         $this->stage = MailImportStage::normalize($stage);

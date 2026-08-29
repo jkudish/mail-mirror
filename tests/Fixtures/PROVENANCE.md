@@ -24,3 +24,12 @@ provider, mailbox, queue, credential, or paid-service access. High-cardinality
 reconciliation, hostile failure metadata, immutable message timestamps, and
 configured database-connection cases also use only deterministic inline values
 invented for these tests.
+
+`gmail-driver.json` was invented for task #3206 on 2026-08-29. It is a compact
+synthetic representation of Gmail API response shapes, not a recorded,
+downloaded, transformed, or structurally copied mailbox response. Its profile,
+messages, draft, labels, history, send-as identities, signature, addresses,
+IDs, pagination token, and timestamps are fictional; all addresses use reserved
+`.test` domains. Tests combine it with the already synthetic RFC822 fixture and
+Laravel HTTP fakes. No fixture contains an OAuth code, client secret, access
+token, refresh token, personal data, or provider-derived mailbox content.

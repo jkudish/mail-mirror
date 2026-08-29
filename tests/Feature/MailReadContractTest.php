@@ -10,6 +10,7 @@ use Jkudish\MailMirror\Read\MailDriverRegistry;
 use Jkudish\MailMirror\Read\MailReadService;
 use Jkudish\MailMirror\Read\MessageReference;
 use Jkudish\MailMirror\Read\ProviderDeletionEvidence;
+use Jkudish\MailMirror\Read\ProviderDeletionResolution;
 use Jkudish\MailMirror\Read\RetrievedMessage;
 
 /**
@@ -123,6 +124,46 @@ it('rejects cross-account and cross-driver message references before adapter ret
         ->toThrow(InvalidArgumentException::class);
 });
 
+it('rejects cross-account deletion resolutions before persistence', function (): void {
+    $first = MailAccount::query()->create([
+        'driver' => MailDriver::Gmail,
+        'provider_account_id' => 'resolution-account-one',
+    ]);
+    $second = MailAccount::query()->create([
+        'driver' => MailDriver::Gmail,
+        'provider_account_id' => 'resolution-account-two',
+    ]);
+    $reader = new class($second->id) implements MailboxReader
+    {
+        public function __construct(private readonly int $wrongAccountId) {}
+
+        public function driver(): MailDriver
+        {
+            return MailDriver::Gmail;
+        }
+
+        public function inventoryPage(MailAccount $account, ?string $cursor): InventoryPage
+        {
+            return new InventoryPage(
+                [],
+                null,
+                true,
+                deletionResolutions: [new ProviderDeletionResolution($this->wrongAccountId, 'cross-account-message')],
+            );
+        }
+
+        public function retrieve(MailAccount $account, MessageReference $message): RetrievedMessage
+        {
+            throw new RuntimeException('Retrieval must not be reached.');
+        }
+    };
+    $registry = new MailDriverRegistry;
+    $registry->register(MailDriver::Gmail, $reader);
+
+    expect(fn () => (new MailReadService($registry))->inventoryPage($first))
+        ->toThrow(InvalidArgumentException::class, 'does not belong to the supplied mail account');
+});
+
 it('rejects oversized pages before retrieval and contradictory completion cursors', function (): void {
     $account = MailAccount::query()->create([
         'driver' => MailDriver::Gmail,
@@ -158,7 +199,7 @@ it('rejects oversized pages before retrieval and contradictory completion cursor
         ->toThrow(InvalidArgumentException::class, 'complete inventory page cannot include');
 });
 
-it('validates account-qualified opaque references and deletion evidence at construction', function (): void {
+it('validates account-qualified opaque references and deletion state at construction', function (): void {
     expect(fn () => new MessageReference(0, MailDriver::Gmail, 'message'))
         ->toThrow(InvalidArgumentException::class)
         ->and(fn () => new MessageReference(1, MailDriver::Gmail, ''))
@@ -172,6 +213,10 @@ it('validates account-qualified opaque references and deletion evidence at const
         ->and(fn () => new ProviderDeletionEvidence(1, 'message', 'INVALID CODE', 'opaque-audit'))
         ->toThrow(InvalidArgumentException::class)
         ->and(fn () => new ProviderDeletionEvidence(1, 'message', 'provider_tombstone', ''))
+        ->toThrow(InvalidArgumentException::class)
+        ->and(fn () => new ProviderDeletionResolution(0, 'message'))
+        ->toThrow(InvalidArgumentException::class)
+        ->and(fn () => new ProviderDeletionResolution(1, str_repeat('x', 256)))
         ->toThrow(InvalidArgumentException::class);
 });
 

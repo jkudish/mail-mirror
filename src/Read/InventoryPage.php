@@ -11,12 +11,18 @@ final readonly class InventoryPage
     /**
      * @param  list<MessageReference>  $messages
      * @param  list<ProviderDeletionEvidence>  $deletions
+     * @param  list<MailboxIdentity>  $identities
+     * @param  list<ProviderDeletionResolution>  $deletionResolutions
      */
     public function __construct(
         public array $messages,
         public ?string $nextCursor,
         public bool $complete,
         public array $deletions = [],
+        public ?AccountProfile $accountProfile = null,
+        public array $identities = [],
+        public bool $identitiesComplete = false,
+        public array $deletionResolutions = [],
     ) {
         if (! $complete && ($nextCursor === null || $nextCursor === '')) {
             throw new InvalidArgumentException('An incomplete inventory page requires an opaque next cursor.');
@@ -24,6 +30,10 @@ final readonly class InventoryPage
 
         if ($complete && $nextCursor !== null) {
             throw new InvalidArgumentException('A complete inventory page cannot include a next cursor.');
+        }
+
+        if ($identitiesComplete && $accountProfile === null) {
+            throw new InvalidArgumentException('A complete identity inventory requires its account profile.');
         }
     }
 }
