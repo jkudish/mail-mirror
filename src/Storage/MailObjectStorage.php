@@ -409,7 +409,7 @@ final class MailObjectStorage
         }
 
         if ($segments === []) {
-            throw new ObjectIntegrityFailure('The raw source contains an unidentifiable attachment part.');
+            return 'mime:root';
         }
 
         return 'mime:'.implode('.', $segments);
@@ -633,12 +633,35 @@ final class MailObjectStorage
     private function matches(MailRawObject|MailAttachment $object, array $expected): bool
     {
         foreach ($expected as $attribute => $value) {
-            if ($object->getAttribute($attribute) !== $value) {
+            $actual = $object->getAttribute($attribute);
+
+            if ($attribute === 'provider_metadata') {
+                if ($this->normalizedMetadata($actual) !== $this->normalizedMetadata($value)) {
+                    return false;
+                }
+
+                continue;
+            }
+
+            if ($actual !== $value) {
                 return false;
             }
         }
 
         return true;
+    }
+
+    private function normalizedMetadata(mixed $value): mixed
+    {
+        if (! is_array($value)) {
+            return $value;
+        }
+
+        if (! array_is_list($value)) {
+            ksort($value);
+        }
+
+        return array_map(fn (mixed $item): mixed => $this->normalizedMetadata($item), $value);
     }
 
     private function diskName(): string

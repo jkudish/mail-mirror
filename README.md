@@ -23,6 +23,12 @@ The package supports PHP 8.4–8.5 and Laravel 12–13. PostgreSQL is the suppor
 runtime database; SQLite is supported for package tests and local consumers.
 The migration fails closed on other database drivers.
 
+The package suite uses SQLite by default. To exercise the feature tests on a
+disposable PostgreSQL database, set `MAIL_MIRROR_TEST_POSTGRES=1` and the
+`MAIL_MIRROR_TEST_POSTGRES_*` connection variables before running Pest. The
+test harness runs `migrate:fresh` before every test and must never target a
+shared or persistent database.
+
 The package [ownership and boundary contract](docs/architecture/ownership-and-boundaries.md)
 defines mail accounts as the roots for provider-derived records while keeping
 consumer ownership optional and consumer-neutral. Future storage, credential,

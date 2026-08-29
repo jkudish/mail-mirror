@@ -4,12 +4,23 @@ declare(strict_types=1);
 
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
 {
     public function up(): void
     {
+        $duplicateRawSource = DB::table('mail_raw_objects')
+            ->select(['mail_account_id', 'mail_message_id'])
+            ->groupBy(['mail_account_id', 'mail_message_id'])
+            ->havingRaw('COUNT(*) > 1')
+            ->exists();
+
+        if ($duplicateRawSource) {
+            throw new RuntimeException('MailMirror object storage requires at most one raw source per message.');
+        }
+
         Schema::table('mail_attachments', function (Blueprint $table): void {
             $table->string('source_part_id')->nullable();
             $table->string('checksum', 64)->nullable();

@@ -28,7 +28,7 @@ abstract class TestCase extends Orchestra
                 'password' => getenv('MAIL_MIRROR_TEST_POSTGRES_PASSWORD') ?: '',
                 'charset' => 'utf8',
                 'prefix' => '',
-                'schema' => 'public',
+                'search_path' => 'public',
                 'sslmode' => 'prefer',
             ]);
 

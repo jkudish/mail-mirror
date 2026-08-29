@@ -122,7 +122,7 @@ it('converges identical retries and rejects immutable byte or metadata changes',
         $message,
         $firstSource,
         'stable-provider-object',
-        providerMetadata: ['native' => 'stable'],
+        providerMetadata: ['native' => 'stable', 'nested' => ['first' => 1, 'second' => 2]],
     );
     fclose($firstSource);
     $retrySource = storageStream('stable synthetic raw bytes');
@@ -131,12 +131,24 @@ it('converges identical retries and rejects immutable byte or metadata changes',
         $message,
         $retrySource,
         'stable-provider-object',
-        providerMetadata: ['native' => 'stable'],
+        providerMetadata: ['native' => 'stable', 'nested' => ['first' => 1, 'second' => 2]],
     );
     fclose($retrySource);
 
     expect($retry->is($first))->toBeTrue()
         ->and(MailRawObject::query()->count())->toBe(1);
+
+    $reorderedMetadata = storageStream('stable synthetic raw bytes');
+    $reorderedRetry = app(MailObjectStorage::class)->storeRaw(
+        $account,
+        $message,
+        $reorderedMetadata,
+        'stable-provider-object',
+        providerMetadata: ['nested' => ['second' => 2, 'first' => 1], 'native' => 'stable'],
+    );
+    fclose($reorderedMetadata);
+
+    expect($reorderedRetry->is($first))->toBeTrue();
 
     $different = storageStream('different synthetic raw bytes');
     expect(fn () => app(MailObjectStorage::class)->storeRaw($account, $message, $different, 'stable-provider-object'))
@@ -149,7 +161,7 @@ it('converges identical retries and rejects immutable byte or metadata changes',
         $message,
         $changedMetadata,
         'stable-provider-object',
-        providerMetadata: ['native' => 'changed'],
+        providerMetadata: ['native' => 'changed', 'nested' => ['first' => 1, 'second' => 2]],
     ))->toThrow(ImmutableObjectConflict::class);
     fclose($changedMetadata);
 
@@ -336,6 +348,27 @@ it('materializes and regenerates attachments from an unchanged synthetic MIME so
         ->and(Storage::disk('mail-mirror-test')->exists($attachmentKey))->toBeTrue()
         ->and($raw->refresh()->checksum)->toBe($originalRawChecksum)
         ->and(MailAttachment::query()->count())->toBe(1);
+});
+
+it('regenerates an attachment represented by the MIME message root', function (): void {
+    [$account, $message] = storageMessage('root-attachment');
+    $source = storageStream(<<<'EML'
+        From: Synthetic Sender <sender@root-attachment.test>
+        To: Synthetic Recipient <recipient@root-attachment.test>
+        Subject: Synthetic root attachment
+        MIME-Version: 1.0
+        Content-Type: application/octet-stream
+        Content-Disposition: attachment; filename="synthetic-root.bin"
+
+        Synthetic root attachment bytes.
+        EML);
+    $raw = app(MailObjectStorage::class)->storeRaw($account, $message, $source, 'root-attachment-object');
+    fclose($source);
+
+    [$attachment] = app(MailObjectStorage::class)->regenerateAttachments($account, $raw);
+
+    expect($attachment->source_part_id)->toBe('mime:root')
+        ->and($attachment->filename)->toBe('synthetic-root.bin');
 });
 
 it('returns a metadata-only machine-readable integrity report', function (): void {
