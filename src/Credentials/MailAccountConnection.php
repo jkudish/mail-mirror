@@ -109,6 +109,8 @@ final readonly class MailAccountConnection
         MailAccountCredential $stored,
         int $expectedVersion,
     ): MailAccountCredential {
+        $disabledPayload = $this->encryptDisabledMarker();
+
         return $this->transition(
             $account,
             $stored,
@@ -116,6 +118,7 @@ final readonly class MailAccountConnection
             [ConnectionStatus::Ready],
             ConnectionStatus::Disabled,
             ConnectionTransition::Disabled,
+            encryptedPayload: $disabledPayload,
         );
     }
 
@@ -326,6 +329,17 @@ final readonly class MailAccountConnection
     {
         try {
             $encrypted = $this->encrypter->encrypt('{"revoked":true}', false);
+
+            return $encrypted;
+        } catch (Throwable) {
+            throw new ConnectionCredentialException('Credentials could not be encrypted.');
+        }
+    }
+
+    private function encryptDisabledMarker(): string
+    {
+        try {
+            $encrypted = $this->encrypter->encrypt('{"disabled":true}', false);
 
             return $encrypted;
         } catch (Throwable) {

@@ -39,6 +39,10 @@ final class MailAccountCredential extends AccountScopedModel
         self::updating(function (): never {
             throw new LogicException('Account credentials must be changed through the connection lifecycle.');
         });
+
+        self::deleting(function (): never {
+            throw new LogicException('Account credentials must be changed through the connection lifecycle.');
+        });
     }
 
     /**

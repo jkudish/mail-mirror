@@ -125,7 +125,7 @@ return new class extends Migration
                 $$ LANGUAGE plpgsql;
 
                 CREATE TRIGGER mail_mirror_credential_history_immutable
-                BEFORE UPDATE OR DELETE ON mail_account_credential_history
+                BEFORE UPDATE ON mail_account_credential_history
                 FOR EACH ROW EXECUTE FUNCTION mail_mirror_reject_credential_history_change();
                 SQL);
 
@@ -143,12 +143,6 @@ return new class extends Migration
 
             CREATE TRIGGER mail_mirror_credential_history_update_immutable
             BEFORE UPDATE ON mail_account_credential_history
-            BEGIN
-                SELECT RAISE(ABORT, 'MailMirror credential history is immutable.');
-            END;
-
-            CREATE TRIGGER mail_mirror_credential_history_delete_immutable
-            BEFORE DELETE ON mail_account_credential_history
             BEGIN
                 SELECT RAISE(ABORT, 'MailMirror credential history is immutable.');
             END;

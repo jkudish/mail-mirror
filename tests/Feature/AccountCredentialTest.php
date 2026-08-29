@@ -150,9 +150,12 @@ it('records store rotate disable reconnect and revoke without credential materia
     $stored = $connection->store($account, apiCredential('lifecycle-initial'));
     $stored = $connection->rotate($account, $stored, oauthCredential('lifecycle-rotated'), 1);
     $stored = $connection->disable($account, $stored, 2);
+    $disabledPayload = DB::table('mail_account_credentials')->where('id', $stored->id)->value('encrypted_payload');
+    assert(is_string($disabledPayload));
 
     expect($stored->status)->toBe(ConnectionStatus::Disabled)
         ->and($stored->disabled_at)->not->toBeNull()
+        ->and(decrypt($disabledPayload, false))->toBe('{"disabled":true}')
         ->and(fn () => $connection->credentials($account, $stored))
         ->toThrow(ConnectionCredentialException::class, 'unavailable');
 
@@ -186,6 +189,14 @@ it('records store rotate disable reconnect and revoke without credential materia
         ])
         ->and($historyJson)->not->toContain('synthetic-3097-')
         ->and(Http::recorded())->toHaveCount(0);
+
+    $stored = $connection->reconnect($account, $stored, apiCredential('lifecycle-after-revoke'), 6);
+    $read = $connection->credentials($account, $stored);
+
+    expect($stored->status)->toBe(ConnectionStatus::Ready)
+        ->and($stored->version)->toBe(7)
+        ->and($read)->toBeInstanceOf(ApiTokenCredential::class)
+        ->and(MailAccountCredentialHistory::query()->forAccount($account)->count())->toBe(7);
 
     $cacheSpy->shouldNotHaveReceived('get');
     $cacheSpy->shouldNotHaveReceived('put');
@@ -259,14 +270,31 @@ it('protects credential identity payload state and history from unsafe model upd
     $history->to_status = ConnectionStatus::Revoked;
     expect(fn () => $history->save())->toThrow(LogicException::class, 'immutable')
         ->and(fn () => $history->delete())->toThrow(LogicException::class, 'immutable')
+        ->and(fn () => MailAccountCredentialHistory::query()->whereKey($history->id)->delete())
+        ->toThrow(LogicException::class, 'immutable')
+        ->and(fn () => $stored->delete())->toThrow(LogicException::class, 'connection lifecycle')
+        ->and(fn () => MailAccountCredential::query()->whereKey($stored->id)->delete())
+        ->toThrow(LogicException::class, 'connection lifecycle')
         ->and(fn () => DB::table('mail_account_credentials')->where('id', $stored->id)->update([
             'mail_account_id' => $second->id,
         ]))->toThrow(QueryException::class)
         ->and(fn () => DB::table('mail_accounts')->where('id', $first->id)->update([
             'provider_account_id' => 'credential-account-unsafe-changed',
         ]))->toThrow(QueryException::class)
-        ->and(fn () => DB::table('mail_account_credential_history')->where('id', $history->id)->delete())
-        ->toThrow(QueryException::class);
+        ->and(MailAccountCredentialHistory::query()->whereKey($history->id)->exists())->toBeTrue();
+});
+
+it('cascades credentials and history when the account isolation root is deleted', function (): void {
+    $account = credentialAccount('cascade-delete');
+    $stored = app(MailAccountConnection::class)->store($account, apiCredential('cascade-delete'));
+
+    expect(MailAccountCredential::query()->whereKey($stored->id)->exists())->toBeTrue()
+        ->and(MailAccountCredentialHistory::query()->forAccount($account)->count())->toBe(1);
+
+    $account->delete();
+
+    expect(MailAccountCredential::query()->whereKey($stored->id)->exists())->toBeFalse()
+        ->and(MailAccountCredentialHistory::query()->where('mail_account_id', $account->id)->exists())->toBeFalse();
 });
 
 it('redacts nested secrets from logs and exception chains on corrupt persistence failures', function (): void {

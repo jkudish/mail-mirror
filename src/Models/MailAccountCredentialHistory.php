@@ -5,9 +5,11 @@ declare(strict_types=1);
 namespace Jkudish\MailMirror\Models;
 
 use Carbon\CarbonImmutable;
+use Illuminate\Database\Query\Builder as QueryBuilder;
 use Jkudish\MailMirror\Enums\ConnectionStatus;
 use Jkudish\MailMirror\Enums\ConnectionTransition;
 use Jkudish\MailMirror\Enums\CredentialType;
+use Jkudish\MailMirror\Models\Builders\MailAccountCredentialHistoryBuilder;
 use LogicException;
 
 /**
@@ -39,6 +41,18 @@ final class MailAccountCredentialHistory extends AccountScopedModel
         self::deleting(function (): never {
             throw new LogicException('Credential lifecycle history is immutable.');
         });
+    }
+
+    /**
+     * @param  QueryBuilder  $query
+     * @return MailAccountCredentialHistoryBuilder<MailAccountCredentialHistory>
+     */
+    public function newEloquentBuilder($query): MailAccountCredentialHistoryBuilder
+    {
+        /** @var MailAccountCredentialHistoryBuilder<MailAccountCredentialHistory> $builder */
+        $builder = new MailAccountCredentialHistoryBuilder($query);
+
+        return $builder;
     }
 
     /** @return array<string, class-string<ConnectionStatus>|class-string<ConnectionTransition>|class-string<CredentialType>|string> */
