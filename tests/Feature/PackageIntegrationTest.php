@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\ServiceProvider;
+use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\MailMirrorServiceProvider;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailMessage;
@@ -19,6 +20,7 @@ it('loads through Laravel package discovery', function (): void {
         ->and(app(MailDriverRegistry::class))->toBe(app(MailDriverRegistry::class))
         ->and(app(MailReadService::class))->toBe(app(MailReadService::class))
         ->and(app(MailObjectStorage::class))->toBe(app(MailObjectStorage::class))
+        ->and(app(MailAccountConnection::class))->toBe(app(MailAccountConnection::class))
         ->and(Schema::hasTable('mail_accounts'))->toBeTrue();
 });
 
