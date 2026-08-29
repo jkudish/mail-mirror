@@ -45,15 +45,16 @@ operation. Reads verify SHA-256 and byte count before exposing a rewindable
 stream. `integrityReport()` returns IDs, MIME metadata, checksums, sizes, and
 statuses only; it never returns object keys, filenames, or content.
 
-Writes first hash a bounded-memory stream into an account-qualified temporary
-object. Inside a database transaction they lock the message row, reject any
-different immutable record, finalize an account/message/content-addressed
-private object, verify it, and create the uniquely constrained record. The
-temporary object is always deleted. If object finalization succeeds but the
-database transaction fails, the unreferenced content-addressed object is left
-for an identical retry to adopt safely; it cannot collide with different bytes.
-Missing materialized attachments can be regenerated from the verified,
-unchanged RFC 822 raw source.
+Writes first hash a bounded-memory local stream. Inside a database transaction
+they lock the message row, reject any different immutable record, create the
+uniquely constrained record, stream an account/message/content-addressed object
+with private visibility, and verify it. A failed write is removed; a partial
+object left by process interruption is repaired by an identical retry. If
+object finalization succeeds but the database commit fails, the unreferenced
+content-addressed object is left for an identical retry to adopt safely; it
+cannot collide with different bytes. Missing materialized attachments can be
+regenerated from the verified, unchanged RFC 822 raw source using stable MIME
+part paths.
 
 No lifecycle events are emitted by this foundation: no concrete downstream
 consumer requires one yet. A later import or projection task should add only

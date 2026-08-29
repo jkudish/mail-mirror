@@ -6,6 +6,7 @@ namespace Jkudish\MailMirror\Storage;
 
 use Illuminate\Contracts\Filesystem\Filesystem;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Database\QueryException;
 use Illuminate\Filesystem\FilesystemManager;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\ImmutableObjectConflict;
@@ -17,6 +18,7 @@ use Jkudish\MailMirror\Models\MailMessage;
 use Jkudish\MailMirror\Models\MailRawObject;
 use Throwable;
 use ZBateson\MailMimeParser\MailMimeParser;
+use ZBateson\MailMimeParser\Message\IMessagePart;
 
 final class MailObjectStorage
 {
@@ -40,18 +42,27 @@ final class MailObjectStorage
         $message = $this->matchedMessage($account, $message);
         $diskName = $this->diskName();
         $disk = $this->filesystems->disk($diskName);
-        $staged = $this->stage($disk, $account->id, $source);
+        $staged = $this->stage($source);
+        $key = $this->canonicalKey($account->id, $message->id, 'raw', $staged['checksum']);
+        $attributes = [
+            'provider_object_id' => $providerObjectId,
+            'kind' => 'rfc822',
+            'media_type' => $mediaType,
+            'byte_size' => $staged['byte_size'],
+            'checksum' => $staged['checksum'],
+            'storage_disk' => $diskName,
+            'object_key' => $key,
+            'provider_metadata' => $providerMetadata,
+        ];
 
         try {
             return $message->getConnection()->transaction(function () use (
                 $account,
                 $message,
-                $providerObjectId,
-                $mediaType,
-                $providerMetadata,
-                $diskName,
                 $disk,
                 $staged,
+                $key,
+                $attributes,
             ): MailRawObject {
                 $this->lockMatchedMessage($account, $message);
                 $existing = MailRawObject::query()
@@ -59,37 +70,43 @@ final class MailObjectStorage
                     ->where('mail_message_id', $message->id)
                     ->first();
 
-                $key = $this->canonicalKey($account->id, $message->id, 'raw', $staged['checksum']);
-                $attributes = [
-                    'provider_object_id' => $providerObjectId,
-                    'kind' => 'rfc822',
-                    'media_type' => $mediaType,
-                    'byte_size' => $staged['byte_size'],
-                    'checksum' => $staged['checksum'],
-                    'storage_disk' => $diskName,
-                    'object_key' => $key,
-                ];
+                if ($existing !== null) {
+                    if (! $this->matches($existing, $attributes)) {
+                        throw new ImmutableObjectConflict('The raw source is immutable and already contains different bytes or metadata.');
+                    }
+
+                    $this->placeCanonicalObject($disk, $staged['stream'], $key, $staged['checksum'], $staged['byte_size']);
+
+                    return $existing;
+                }
+
+                $raw = MailRawObject::query()->create($attributes + [
+                    'mail_account_id' => $account->id,
+                    'mail_message_id' => $message->id,
+                ]);
+
+                $this->placeCanonicalObject($disk, $staged['stream'], $key, $staged['checksum'], $staged['byte_size']);
+
+                return $raw;
+            }, 3);
+        } catch (QueryException $exception) {
+            if ($this->isUniqueConstraintViolation($exception)) {
+                $existing = $this->rawAfterRace($account, $message);
 
                 if ($existing !== null) {
                     if (! $this->matches($existing, $attributes)) {
                         throw new ImmutableObjectConflict('The raw source is immutable and already contains different bytes or metadata.');
                     }
 
-                    $this->placeCanonicalObject($disk, $staged['key'], $key, $staged['checksum'], $staged['byte_size']);
+                    $this->placeCanonicalObject($disk, $staged['stream'], $key, $staged['checksum'], $staged['byte_size']);
 
                     return $existing;
                 }
+            }
 
-                $this->placeCanonicalObject($disk, $staged['key'], $key, $staged['checksum'], $staged['byte_size']);
-
-                return MailRawObject::query()->create($attributes + [
-                    'mail_account_id' => $account->id,
-                    'mail_message_id' => $message->id,
-                    'provider_metadata' => $providerMetadata,
-                ]);
-            }, 3);
+            throw new MailObjectException('Raw source storage could not be persisted.');
         } finally {
-            $this->deleteQuietly($disk, $staged['key']);
+            fclose($staged['stream']);
         }
     }
 
@@ -112,22 +129,32 @@ final class MailObjectStorage
         $message = $this->matchedMessage($account, $message);
         $diskName = $this->diskName();
         $disk = $this->filesystems->disk($diskName);
-        $staged = $this->stage($disk, $account->id, $source);
+        $staged = $this->stage($source);
+        $partNamespace = hash('sha256', $sourcePartId);
+        $key = $this->canonicalKey($account->id, $message->id, "attachments/{$partNamespace}", $staged['checksum']);
+        $attributes = [
+            'provider_attachment_id' => $providerAttachmentId,
+            'source_part_id' => $sourcePartId,
+            'filename' => $filename,
+            'media_type' => $mediaType,
+            'byte_size' => $staged['byte_size'],
+            'checksum' => $staged['checksum'],
+            'storage_disk' => $diskName,
+            'object_key' => $key,
+            'content_id' => $contentId,
+            'is_inline' => $isInline,
+            'provider_metadata' => $providerMetadata,
+        ];
 
         try {
             return $message->getConnection()->transaction(function () use (
                 $account,
                 $message,
-                $providerAttachmentId,
-                $sourcePartId,
-                $mediaType,
-                $filename,
-                $contentId,
-                $isInline,
-                $providerMetadata,
-                $diskName,
                 $disk,
                 $staged,
+                $sourcePartId,
+                $key,
+                $attributes,
             ): MailAttachment {
                 $this->lockMatchedMessage($account, $message);
                 $existing = MailAttachment::query()
@@ -136,41 +163,43 @@ final class MailObjectStorage
                     ->where('source_part_id', $sourcePartId)
                     ->first();
 
-                $partNamespace = hash('sha256', $sourcePartId);
-                $key = $this->canonicalKey($account->id, $message->id, "attachments/{$partNamespace}", $staged['checksum']);
-                $attributes = [
-                    'provider_attachment_id' => $providerAttachmentId,
-                    'source_part_id' => $sourcePartId,
-                    'filename' => $filename,
-                    'media_type' => $mediaType,
-                    'byte_size' => $staged['byte_size'],
-                    'checksum' => $staged['checksum'],
-                    'storage_disk' => $diskName,
-                    'object_key' => $key,
-                    'content_id' => $contentId,
-                    'is_inline' => $isInline,
-                ];
+                if ($existing !== null) {
+                    if (! $this->matches($existing, $attributes)) {
+                        throw new ImmutableObjectConflict('The attachment source part is immutable and already contains different bytes or metadata.');
+                    }
+
+                    $this->placeCanonicalObject($disk, $staged['stream'], $key, $staged['checksum'], $staged['byte_size']);
+
+                    return $existing;
+                }
+
+                $attachment = MailAttachment::query()->create($attributes + [
+                    'mail_account_id' => $account->id,
+                    'mail_message_id' => $message->id,
+                ]);
+
+                $this->placeCanonicalObject($disk, $staged['stream'], $key, $staged['checksum'], $staged['byte_size']);
+
+                return $attachment;
+            }, 3);
+        } catch (QueryException $exception) {
+            if ($this->isUniqueConstraintViolation($exception)) {
+                $existing = $this->attachmentAfterRace($account, $message, $sourcePartId);
 
                 if ($existing !== null) {
                     if (! $this->matches($existing, $attributes)) {
                         throw new ImmutableObjectConflict('The attachment source part is immutable and already contains different bytes or metadata.');
                     }
 
-                    $this->placeCanonicalObject($disk, $staged['key'], $key, $staged['checksum'], $staged['byte_size']);
+                    $this->placeCanonicalObject($disk, $staged['stream'], $key, $staged['checksum'], $staged['byte_size']);
 
                     return $existing;
                 }
+            }
 
-                $this->placeCanonicalObject($disk, $staged['key'], $key, $staged['checksum'], $staged['byte_size']);
-
-                return MailAttachment::query()->create($attributes + [
-                    'mail_account_id' => $account->id,
-                    'mail_message_id' => $message->id,
-                    'provider_metadata' => $providerMetadata,
-                ]);
-            }, 3);
+            throw new MailObjectException('Attachment storage could not be persisted.');
         } finally {
-            $this->deleteQuietly($disk, $staged['key']);
+            fclose($staged['stream']);
         }
     }
 
@@ -200,7 +229,7 @@ final class MailObjectStorage
             $message = $this->mimeParser->parse($source, true);
             $stored = [];
 
-            foreach ($message->getAllAttachmentParts() as $index => $part) {
+            foreach ($message->getAllAttachmentParts() as $part) {
                 $partSource = $part->getBinaryContentResourceHandle();
 
                 if (! is_resource($partSource)) {
@@ -208,7 +237,7 @@ final class MailObjectStorage
                 }
 
                 try {
-                    $sourcePartId = 'attachment:'.($index + 1);
+                    $sourcePartId = $this->mimePartId($part);
                     $stored[] = $this->storeAttachment(
                         $account,
                         $this->messageForRaw($account, $raw),
@@ -328,10 +357,68 @@ final class MailObjectStorage
         return $message;
     }
 
+    private function rawAfterRace(MailAccount $account, MailMessage $message): ?MailRawObject
+    {
+        try {
+            return MailRawObject::query()
+                ->forAccount($account)
+                ->where('mail_message_id', $message->id)
+                ->first();
+        } catch (Throwable) {
+            throw new MailObjectException('Raw source storage could not be persisted.');
+        }
+    }
+
+    private function attachmentAfterRace(
+        MailAccount $account,
+        MailMessage $message,
+        string $sourcePartId,
+    ): ?MailAttachment {
+        try {
+            return MailAttachment::query()
+                ->forAccount($account)
+                ->where('mail_message_id', $message->id)
+                ->where('source_part_id', $sourcePartId)
+                ->first();
+        } catch (Throwable) {
+            throw new MailObjectException('Attachment storage could not be persisted.');
+        }
+    }
+
+    private function isUniqueConstraintViolation(QueryException $exception): bool
+    {
+        $sqlState = $exception->errorInfo[0] ?? null;
+
+        return $sqlState === '23000' || $sqlState === '23505';
+    }
+
+    private function mimePartId(IMessagePart $part): string
+    {
+        $segments = [];
+        $current = $part;
+
+        while (($parent = $current->getParent()) !== null) {
+            $index = array_search($current, $parent->getChildParts(), true);
+
+            if (! is_int($index)) {
+                throw new ObjectIntegrityFailure('The raw source contains an unidentifiable attachment part.');
+            }
+
+            array_unshift($segments, (string) ($index + 1));
+            $current = $parent;
+        }
+
+        if ($segments === []) {
+            throw new ObjectIntegrityFailure('The raw source contains an unidentifiable attachment part.');
+        }
+
+        return 'mime:'.implode('.', $segments);
+    }
+
     /** @param resource $source
-     * @return array{key: string, checksum: string, byte_size: int}
+     * @return array{stream: resource, checksum: string, byte_size: int}
      */
-    private function stage(Filesystem $disk, int|string|null $accountId, mixed $source): array
+    private function stage(mixed $source): array
     {
         if (! is_resource($source)) {
             throw new MailObjectException('Object input must be a readable stream.');
@@ -369,45 +456,59 @@ final class MailObjectStorage
             }
 
             rewind($buffer);
-            $key = "mail-mirror/accounts/{$accountId}/temporary/".bin2hex(random_bytes(16));
 
-            try {
-                $written = $disk->writeStream($key, $buffer, ['visibility' => 'private']);
-            } catch (Throwable) {
-                $this->deleteQuietly($disk, $key);
-                throw new MailObjectException('Object staging failed.');
-            }
-
-            if (! $written) {
-                $this->deleteQuietly($disk, $key);
-                throw new MailObjectException('Object staging failed.');
-            }
-
-            return ['key' => $key, 'checksum' => hash_final($hash), 'byte_size' => $byteSize];
-        } finally {
+            return ['stream' => $buffer, 'checksum' => hash_final($hash), 'byte_size' => $byteSize];
+        } catch (Throwable $exception) {
             fclose($buffer);
+
+            if ($exception instanceof MailObjectException) {
+                throw $exception;
+            }
+
+            throw new MailObjectException('Object staging failed.');
         }
     }
 
+    /** @param resource $staged */
     private function placeCanonicalObject(
         Filesystem $disk,
-        string $stagedKey,
+        mixed $staged,
         string $canonicalKey,
         string $checksum,
         int $byteSize,
     ): void {
-        $created = false;
+        $writeAttempted = false;
 
         try {
-            if (! $disk->exists($canonicalKey)) {
-                $created = true;
+            if ($disk->exists($canonicalKey)) {
+                if ($this->probe($disk, $canonicalKey, $checksum, $byteSize) === 'healthy') {
+                    if ($disk->getVisibility($canonicalKey) !== 'private'
+                        && ! $disk->setVisibility($canonicalKey, 'private')) {
+                        throw new ObjectIntegrityFailure('The immutable object could not be finalized.');
+                    }
 
-                if (! $disk->copy($stagedKey, $canonicalKey) || ! $disk->setVisibility($canonicalKey, 'private')) {
-                    throw new ObjectIntegrityFailure('The immutable object could not be finalized.');
+                    return;
+                }
+
+                if (! $disk->delete($canonicalKey)) {
+                    throw new ObjectIntegrityFailure('The immutable object could not be repaired.');
                 }
             }
+
+            rewind($staged);
+            $writeAttempted = true;
+
+            if (! $disk->writeStream($canonicalKey, $staged, ['visibility' => 'private']) || ! $disk->setVisibility($canonicalKey, 'private')) {
+                throw new ObjectIntegrityFailure('The immutable object could not be finalized.');
+            }
+        } catch (MailObjectException $exception) {
+            if ($writeAttempted) {
+                $this->deleteQuietly($disk, $canonicalKey);
+            }
+
+            throw $exception;
         } catch (Throwable) {
-            if ($created) {
+            if ($writeAttempted) {
                 $this->deleteQuietly($disk, $canonicalKey);
             }
 
@@ -415,9 +516,7 @@ final class MailObjectStorage
         }
 
         if ($this->probe($disk, $canonicalKey, $checksum, $byteSize) !== 'healthy') {
-            if ($created) {
-                $this->deleteQuietly($disk, $canonicalKey);
-            }
+            $this->deleteQuietly($disk, $canonicalKey);
 
             throw new ObjectIntegrityFailure('The immutable object failed integrity verification.');
         }

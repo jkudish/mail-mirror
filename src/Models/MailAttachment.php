@@ -46,12 +46,16 @@ final class MailAttachment extends AccountScopedModel
             'object_key',
             'content_id',
             'is_inline',
+            'provider_metadata',
         ];
     }
 
     /** @return array<string, string> */
     protected function casts(): array
     {
-        return parent::casts() + ['is_inline' => 'boolean'];
+        return parent::casts() + [
+            'byte_size' => 'integer',
+            'is_inline' => 'boolean',
+        ];
     }
 }

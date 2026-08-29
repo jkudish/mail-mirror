@@ -39,6 +39,13 @@ final class MailRawObject extends AccountScopedModel
             'checksum',
             'storage_disk',
             'object_key',
+            'provider_metadata',
         ];
+    }
+
+    /** @return array<string, string> */
+    protected function casts(): array
+    {
+        return parent::casts() + ['byte_size' => 'integer'];
     }
 }

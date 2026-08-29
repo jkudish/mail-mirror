@@ -166,20 +166,15 @@ return new class extends Migration
             $table->foreignId('mail_account_id')->constrained()->cascadeOnDelete();
             $table->unsignedBigInteger('mail_message_id');
             $table->string('provider_attachment_id');
-            $table->string('source_part_id')->nullable();
             $table->string('filename')->nullable();
             $table->string('media_type')->nullable();
             $table->unsignedBigInteger('byte_size')->nullable();
-            $table->string('checksum', 64)->nullable();
-            $table->string('storage_disk')->nullable();
-            $table->string('object_key')->nullable();
             $table->string('content_id')->nullable();
             $table->boolean('is_inline')->default(false);
             $table->json('provider_metadata')->nullable();
             $table->timestamps();
 
             $table->unique(['mail_account_id', 'mail_message_id', 'provider_attachment_id'], 'mail_attachment_provider_unique');
-            $table->unique(['mail_account_id', 'mail_message_id', 'source_part_id'], 'mail_attachment_source_part_unique');
             $table->index('mail_message_id');
             $table->foreign(['mail_account_id', 'mail_message_id'])
                 ->references(['mail_account_id', 'id'])->on('mail_messages')->cascadeOnDelete();
@@ -193,14 +188,11 @@ return new class extends Migration
             $table->string('kind');
             $table->string('media_type')->nullable();
             $table->unsignedBigInteger('byte_size')->nullable();
-            $table->string('checksum', 64)->nullable();
-            $table->string('storage_disk')->nullable();
-            $table->string('object_key')->nullable();
+            $table->string('checksum')->nullable();
             $table->json('provider_metadata')->nullable();
             $table->timestamps();
 
             $table->unique(['mail_account_id', 'mail_message_id', 'kind', 'provider_object_id'], 'mail_raw_object_provider_unique');
-            $table->unique(['mail_account_id', 'mail_message_id'], 'mail_raw_object_message_unique');
             $table->index('mail_message_id');
             $table->foreign(['mail_account_id', 'mail_message_id'])
                 ->references(['mail_account_id', 'id'])->on('mail_messages')->noActionOnDelete();

@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Illuminate\Contracts\Filesystem\Filesystem;
 use Illuminate\Database\QueryException;
 use Illuminate\Filesystem\FilesystemManager;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
@@ -116,10 +117,22 @@ it('denies cross-account reads and writes even when provider identifiers match',
 it('converges identical retries and rejects immutable byte or metadata changes', function (): void {
     [$account, $message] = storageMessage('idempotent');
     $firstSource = storageStream('stable synthetic raw bytes');
-    $first = app(MailObjectStorage::class)->storeRaw($account, $message, $firstSource, 'stable-provider-object');
+    $first = app(MailObjectStorage::class)->storeRaw(
+        $account,
+        $message,
+        $firstSource,
+        'stable-provider-object',
+        providerMetadata: ['native' => 'stable'],
+    );
     fclose($firstSource);
     $retrySource = storageStream('stable synthetic raw bytes');
-    $retry = app(MailObjectStorage::class)->storeRaw($account, $message, $retrySource, 'stable-provider-object');
+    $retry = app(MailObjectStorage::class)->storeRaw(
+        $account,
+        $message,
+        $retrySource,
+        'stable-provider-object',
+        providerMetadata: ['native' => 'stable'],
+    );
     fclose($retrySource);
 
     expect($retry->is($first))->toBeTrue()
@@ -130,7 +143,20 @@ it('converges identical retries and rejects immutable byte or metadata changes',
         ->toThrow(ImmutableObjectConflict::class);
     fclose($different);
 
+    $changedMetadata = storageStream('stable synthetic raw bytes');
+    expect(fn () => app(MailObjectStorage::class)->storeRaw(
+        $account,
+        $message,
+        $changedMetadata,
+        'stable-provider-object',
+        providerMetadata: ['native' => 'changed'],
+    ))->toThrow(ImmutableObjectConflict::class);
+    fclose($changedMetadata);
+
     $first->checksum = str_repeat('0', 64);
+    expect(fn () => $first->save())->toThrow(LogicException::class);
+    $first->refresh();
+    $first->provider_metadata = ['native' => 'changed'];
     expect(fn () => $first->save())->toThrow(LogicException::class);
 });
 
@@ -139,13 +165,14 @@ it('enforces database uniqueness as the final concurrent-write guard and adopts 
     $bytes = 'synthetic race bytes';
     $checksum = hash('sha256', $bytes);
     $canonical = "mail-mirror/accounts/{$account->id}/messages/{$message->id}/raw/sha256/{$checksum}";
-    Storage::disk('mail-mirror-test')->put($canonical, $bytes, ['visibility' => 'private']);
+    Storage::disk('mail-mirror-test')->put($canonical, $bytes, ['visibility' => 'public']);
 
     $source = storageStream($bytes);
     $raw = app(MailObjectStorage::class)->storeRaw($account, $message, $source, 'race-provider-object');
     fclose($source);
 
     expect($raw->object_key)->toBe($canonical)
+        ->and(Storage::disk('mail-mirror-test')->getVisibility($canonical))->toBe('private')
         ->and(fn () => MailRawObject::query()->create([
             'mail_account_id' => $account->id,
             'mail_message_id' => $message->id,
@@ -154,12 +181,11 @@ it('enforces database uniqueness as the final concurrent-write guard and adopts 
         ]))->toThrow(QueryException::class);
 });
 
-it('cleans temporary objects when filesystem staging is interrupted', function (): void {
+it('cleans a partial canonical object when streaming finalization is interrupted', function (): void {
     $disk = mock(Filesystem::class, function (MockInterface $mock): void {
+        $mock->shouldReceive('exists')->once()->andReturnFalse();
         $mock->shouldReceive('writeStream')->once()->andReturnFalse();
-        $mock->shouldReceive('delete')->once()->with(Mockery::on(
-            fn (string $key): bool => str_contains($key, '/temporary/'),
-        ))->andReturnTrue();
+        $mock->shouldReceive('delete')->once()->andReturnTrue();
     });
     /** @var FilesystemManager&MockInterface $manager */
     $manager = mock(FilesystemManager::class, function (MockInterface $mock) use ($disk): void {
@@ -173,43 +199,83 @@ it('cleans temporary objects when filesystem staging is interrupted', function (
         $message,
         $source,
         'interrupted-provider-object',
-    ))->toThrow(MailObjectException::class, 'Object staging failed.');
+    ))->toThrow(ObjectIntegrityFailure::class, 'could not be finalized');
     fclose($source);
 
     expect(MailRawObject::query()->count())->toBe(0);
 });
 
-it('cleans partial canonical and temporary objects when finalization fails', function (): void {
-    $deleted = [];
-    $disk = mock(Filesystem::class, function (MockInterface $mock) use (&$deleted): void {
-        $mock->shouldReceive('writeStream')->once()->andReturnTrue();
-        $mock->shouldReceive('exists')->once()->andReturnFalse();
-        $mock->shouldReceive('copy')->once()->andReturnFalse();
-        $mock->shouldReceive('delete')->twice()->andReturnUsing(function (string $key) use (&$deleted): bool {
-            $deleted[] = $key;
+it('repairs a corrupt canonical object on an identical retry', function (): void {
+    [$account, $message] = storageMessage('repair');
+    $bytes = 'synthetic recoverable bytes';
+    $checksum = hash('sha256', $bytes);
+    $canonical = "mail-mirror/accounts/{$account->id}/messages/{$message->id}/raw/sha256/{$checksum}";
+    Storage::disk('mail-mirror-test')->put($canonical, 'partial', ['visibility' => 'private']);
+    $source = storageStream($bytes);
 
-            return true;
-        });
-    });
-    /** @var FilesystemManager&MockInterface $manager */
-    $manager = mock(FilesystemManager::class, function (MockInterface $mock) use ($disk): void {
-        $mock->shouldReceive('disk')->with('mail-mirror-test')->andReturn($disk);
-    });
-    [$account, $message] = storageMessage('finalization-failure');
-    $source = storageStream('private partial finalization marker');
-
-    expect(fn () => (new MailObjectStorage($manager, new MailMimeParser))->storeRaw(
-        $account,
-        $message,
-        $source,
-        'partial-provider-object',
-    ))->toThrow(ObjectIntegrityFailure::class, 'could not be finalized');
+    $raw = app(MailObjectStorage::class)->storeRaw($account, $message, $source, 'repair-provider-object');
     fclose($source);
 
-    expect($deleted)->toHaveCount(2)
-        ->and($deleted)->each->toStartWith("mail-mirror/accounts/{$account->id}/");
-    expect(array_any($deleted, fn (string $key): bool => str_contains($key, '/temporary/')))->toBeTrue();
-    expect(MailRawObject::query()->count())->toBe(0);
+    expect($raw->object_key)->toBe($canonical)
+        ->and(Storage::disk('mail-mirror-test')->get($canonical))->toBe($bytes)
+        ->and(MailRawObject::query()->count())->toBe(1);
+});
+
+it('redacts database failures at the storage boundary', function (): void {
+    [$account, $message] = storageMessage('database-redaction');
+    $postgres = DB::connection()->getDriverName() === 'pgsql';
+
+    if ($postgres) {
+        DB::unprepared(<<<'SQL'
+            DROP FUNCTION IF EXISTS reject_private_raw_metadata_function() CASCADE;
+
+            CREATE FUNCTION reject_private_raw_metadata_function()
+            RETURNS trigger AS $$
+            BEGIN
+                RAISE EXCEPTION 'private-database-marker';
+            END;
+            $$ LANGUAGE plpgsql;
+
+            CREATE TRIGGER reject_private_raw_metadata
+            BEFORE INSERT ON mail_raw_objects
+            FOR EACH ROW EXECUTE FUNCTION reject_private_raw_metadata_function();
+            SQL);
+    } else {
+        DB::unprepared(<<<'SQL'
+            CREATE TRIGGER reject_private_raw_metadata
+            BEFORE INSERT ON mail_raw_objects
+            BEGIN
+                SELECT RAISE(ABORT, 'private-database-marker');
+            END
+            SQL);
+    }
+
+    $source = storageStream('private bytes hidden from database errors');
+
+    try {
+        app(MailObjectStorage::class)->storeRaw(
+            $account,
+            $message,
+            $source,
+            'database-error-provider-object',
+            providerMetadata: ['private' => 'metadata-marker'],
+        );
+        throw new RuntimeException('Expected database failure redaction.');
+    } catch (MailObjectException $exception) {
+        expect($exception->getMessage())->toBe('Raw source storage could not be persisted.')
+            ->and($exception->getMessage())->not->toContain('private-database-marker')
+            ->and($exception->getMessage())->not->toContain('metadata-marker')
+            ->and($exception->getPrevious())->toBeNull();
+    } finally {
+        fclose($source);
+
+        if ($postgres) {
+            DB::statement('DROP TRIGGER reject_private_raw_metadata ON mail_raw_objects');
+            DB::statement('DROP FUNCTION reject_private_raw_metadata_function');
+        } else {
+            DB::statement('DROP TRIGGER reject_private_raw_metadata');
+        }
+    }
 });
 
 it('detects missing and corrupt objects without exposing content or storage keys', function (): void {
@@ -255,7 +321,7 @@ it('materializes and regenerates attachments from an unchanged synthetic MIME so
     $read = app(MailObjectStorage::class)->readAttachment($account, $attachment);
 
     expect(stream_get_contents($read))->toBe("Synthetic attachment bytes.\n")
-        ->and($attachment->source_part_id)->toBe('attachment:1')
+        ->and($attachment->source_part_id)->toStartWith('mime:')
         ->and($attachment->media_type)->toBe('text/plain');
     fclose($read);
 
