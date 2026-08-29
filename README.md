@@ -81,5 +81,5 @@ prefer-lowest graph, a clean Laravel 12 consumer, quality checks, workflow
 safeguards, and a final clean diff. It writes a mode-`0600` exact-commit receipt
 in `.git`. GitHub Actions and enforced rulesets are intentionally absent. See
 the [pull-request verification skill](.agents/skills/verifying-pull-requests/SKILL.md)
-for approval, dedicated-token signoff, required status read-back, and authority
-boundaries.
+for exact-SHA or prospectively delegated approval, dedicated-token signoff,
+required status read-back, and authority boundaries.
