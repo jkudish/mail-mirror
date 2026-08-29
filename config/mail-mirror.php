@@ -8,4 +8,10 @@ return [
      * consumer explicitly selects another configured connection.
      */
     'database_connection' => null,
+
+    /*
+     * Raw messages and materialized attachments are always written with
+     * private visibility to this Laravel Filesystem disk.
+     */
+    'storage_disk' => env('MAIL_MIRROR_STORAGE_DISK', 'local'),
 ];

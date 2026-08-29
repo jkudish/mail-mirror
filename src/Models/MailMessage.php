@@ -7,7 +7,12 @@ namespace Jkudish\MailMirror\Models;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 
-/** @property int|null $mail_thread_id */
+/**
+ * @property int $id
+ * @property int|null $mail_thread_id
+ * @property string $provider_message_id
+ * @property string $provider_occurrence_id
+ */
 final class MailMessage extends AccountScopedModel
 {
     /** @return BelongsTo<MailThread, $this> */

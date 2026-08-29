@@ -1,0 +1,18 @@
+From: Synthetic Sender <sender@invented.test>
+To: Synthetic Recipient <recipient@invented.test>
+Subject: Invented storage fixture
+Message-ID: <synthetic-storage-001@invented.test>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="invented-boundary-3095"
+
+--invented-boundary-3095
+Content-Type: text/plain; charset=utf-8
+
+Private synthetic body marker alpha-3095.
+--invented-boundary-3095
+Content-Type: text/plain; name="invented-note.txt"
+Content-Disposition: attachment; filename="invented-note.txt"
+Content-Transfer-Encoding: base64
+
+U3ludGhldGljIGF0dGFjaG1lbnQgYnl0ZXMuCg==
+--invented-boundary-3095--

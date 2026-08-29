@@ -2,8 +2,9 @@
 
 MailMirror is a private, standalone Laravel package foundation. It provides an
 account-rooted, provider-neutral persistence schema and read-only driver
-contracts without provider integrations, credentials, import orchestration,
-object bytes, search, or mutation APIs.
+contracts plus immutable raw-message and materialized-attachment byte storage,
+without provider integrations, credentials, import orchestration, search, or
+provider mutation APIs.
 
 Mail accounts may optionally belong to a consumer model through a polymorphic
 owner. Provider-derived records are isolated by account-qualified identifiers
@@ -22,6 +23,12 @@ The package supports PHP 8.4–8.5 and Laravel 12–13. PostgreSQL is the suppor
 runtime database; SQLite is supported for package tests and local consumers.
 The migration fails closed on other database drivers.
 
+The package suite uses SQLite by default. To exercise the feature tests on a
+disposable PostgreSQL database, set `MAIL_MIRROR_TEST_POSTGRES=1` and the
+`MAIL_MIRROR_TEST_POSTGRES_*` connection variables before running Pest. The
+test harness runs `migrate:fresh` before every test and must never target a
+shared or persistent database.
+
 The package [ownership and boundary contract](docs/architecture/ownership-and-boundaries.md)
 defines mail accounts as the roots for provider-derived records while keeping
 consumer ownership optional and consumer-neutral. Future storage, credential,
@@ -34,6 +41,26 @@ migration is loaded directly from the package so it cannot also be published
 and accidentally run twice. Models use the application's default database
 connection unless `mail-mirror.database_connection` selects another configured
 connection.
+
+## Immutable object storage
+
+Set `mail-mirror.storage_disk` to a private Laravel Filesystem disk. Consumers
+use the package-owned `MailObjectStorage` boundary and must pass both the
+`MailAccount` and matching message, raw object, or attachment record for every
+operation. Reads verify SHA-256 and byte count before exposing a rewindable
+stream. `integrityReport()` returns IDs, MIME metadata, checksums, sizes, and
+statuses only; it never returns object keys, filenames, or content.
+
+Writes first hash a bounded-memory local stream. Inside a database transaction
+they lock the message row, reject any different immutable record, create the
+uniquely constrained record, stream an account/message/content-addressed object
+with private visibility, and verify it. A failed write is removed; a partial
+object left by process interruption is repaired by an identical retry. If
+object finalization succeeds but the database commit fails, the unreferenced
+content-addressed object is left for an identical retry to adopt safely; it
+cannot collide with different bytes. Missing materialized attachments can be
+regenerated from the verified, unchanged RFC 822 raw source using stable MIME
+part paths.
 
 No lifecycle events are emitted by this foundation: no concrete downstream
 consumer requires one yet. A later import or projection task should add only

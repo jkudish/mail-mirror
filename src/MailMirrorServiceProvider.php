@@ -6,6 +6,7 @@ namespace Jkudish\MailMirror;
 
 use Jkudish\MailMirror\Read\MailDriverRegistry;
 use Jkudish\MailMirror\Read\MailReadService;
+use Jkudish\MailMirror\Storage\MailObjectStorage;
 use Spatie\LaravelPackageTools\Package;
 use Spatie\LaravelPackageTools\PackageServiceProvider;
 
@@ -27,5 +28,6 @@ final class MailMirrorServiceProvider extends PackageServiceProvider
     {
         $this->app->singleton(MailDriverRegistry::class);
         $this->app->singleton(MailReadService::class);
+        $this->app->singleton(MailObjectStorage::class);
     }
 }

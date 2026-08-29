@@ -9,13 +9,16 @@ use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailMessage;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
 use Jkudish\MailMirror\Read\MailReadService;
+use Jkudish\MailMirror\Storage\MailObjectStorage;
 
 it('loads through Laravel package discovery', function (): void {
     expect(app()->getProvider(MailMirrorServiceProvider::class))
         ->toBeInstanceOf(MailMirrorServiceProvider::class)
         ->and(config('mail-mirror.database_connection'))->toBeNull()
+        ->and(config('mail-mirror.storage_disk'))->toBe('local')
         ->and(app(MailDriverRegistry::class))->toBe(app(MailDriverRegistry::class))
         ->and(app(MailReadService::class))->toBe(app(MailReadService::class))
+        ->and(app(MailObjectStorage::class))->toBe(app(MailObjectStorage::class))
         ->and(Schema::hasTable('mail_accounts'))->toBeTrue();
 });
 
