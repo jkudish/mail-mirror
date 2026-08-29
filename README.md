@@ -13,6 +13,12 @@ composer verify
 
 The package supports PHP 8.4–8.5 and Laravel 12–13.
 
+The package [ownership and boundary contract](docs/architecture/ownership-and-boundaries.md)
+defines mail accounts as the roots for provider-derived records while keeping
+consumer ownership optional and consumer-neutral. Future schema, storage,
+credential, and driver work must add its concrete isolation tests alongside the
+implementation.
+
 The setup is independent and idempotent. In the combined Amp project, jMail's
 primary setup invokes it from `../repos/mail-mirror` relative to jMail because
 Amp automatically runs only the primary repository setup.
