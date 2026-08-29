@@ -7,6 +7,7 @@ namespace Jkudish\MailMirror\Models;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\Relations\MorphTo;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Enums\MailDriver;
@@ -87,6 +88,18 @@ final class MailAccount extends Model
     public function syncRuns(): HasMany
     {
         return $this->hasMany(MailSyncRun::class);
+    }
+
+    /** @return HasOne<MailAccountCredential, $this> */
+    public function credential(): HasOne
+    {
+        return $this->hasOne(MailAccountCredential::class);
+    }
+
+    /** @return HasMany<MailAccountCredentialHistory, $this> */
+    public function credentialHistory(): HasMany
+    {
+        return $this->hasMany(MailAccountCredentialHistory::class);
     }
 
     /** @param Builder<static> $query */

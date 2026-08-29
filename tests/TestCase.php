@@ -16,6 +16,7 @@ abstract class TestCase extends Orchestra
 
     protected function defineEnvironment($app): void
     {
+        $app['config']->set('app.key', 'base64:'.base64_encode(str_repeat('m', 32)));
         $app['config']->set('database.default', 'testing');
 
         if (getenv('MAIL_MIRROR_TEST_POSTGRES') === '1') {
