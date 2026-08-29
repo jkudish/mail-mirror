@@ -21,7 +21,7 @@ final readonly class MailReadService
             $maximum = 500;
         }
 
-        if (count($page->messages) + count($page->deletions) + count($page->identities) > $maximum) {
+        if (count($page->messages) + count($page->deletions) + count($page->identities) + count($page->deletionResolutions) > $maximum) {
             throw new InvalidArgumentException('The provider inventory page exceeds the configured resource limit.');
         }
 
@@ -38,6 +38,20 @@ final readonly class MailReadService
             if ($deletion->mailAccountId !== $account->getKey()) {
                 throw new InvalidArgumentException('The provider deletion evidence does not belong to the supplied mail account.');
             }
+        }
+
+        $resolutionIds = [];
+
+        foreach ($page->deletionResolutions as $resolution) {
+            if ($resolution->mailAccountId !== $account->getKey()) {
+                throw new InvalidArgumentException('The provider deletion resolution does not belong to the supplied mail account.');
+            }
+
+            $resolutionIds[] = $resolution->providerMessageId;
+        }
+
+        if (count(array_unique($resolutionIds)) !== count($resolutionIds)) {
+            throw new InvalidArgumentException('The provider deletion resolutions must be unique.');
         }
 
         return $page;

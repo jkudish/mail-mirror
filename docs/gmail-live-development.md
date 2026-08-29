@@ -28,6 +28,11 @@ In a disposable Laravel 12 or 13 consumer application:
 3. Complete consent only after separate human authorization, then store the
    returned `OAuthTokenSetCredential` through `MailAccountConnection` for a
    Gmail `MailAccount` owned by an explicit consumer owner tuple.
+   The consumer must generate and retain the OAuth state and PKCE verifier in
+   its own short-lived server-side session, pass the matching S256 challenge to
+   `GmailOAuth::authorizationUrl()`, and pass the verifier to
+   `GmailOAuth::exchange()`. MailMirror validates PKCE values but intentionally
+   does not own consumer session persistence.
 4. Supply the client ID, client secret, and redirect URI through the consumer's
    secret manager as `MAIL_MIRROR_GMAIL_CLIENT_ID`,
    `MAIL_MIRROR_GMAIL_CLIENT_SECRET`, and
@@ -55,3 +60,9 @@ The script refuses to run unless every gate is present, the consumer boots as
 `local`, Gmail is explicitly enabled, and the account ID, owner tuple, and Gmail
 driver all match durable state. This script is intentionally absent from all
 Composer scripts and verification commands.
+
+Laravel's HTTP client materializes a provider JSON response before MailMirror
+can inspect decoded fields. MailMirror therefore keeps the transport/provider
+body limit as a consumer HTTP-boundary responsibility, then independently
+bounds pages, cursors, history outputs, headers, MIME parts, identities, and the
+encoded raw RFC822 value before base64 decoding and allocation.

@@ -18,6 +18,9 @@ return [
     /* Provider reads are sequential and retry only explicitly retryable failures. */
     'import_max_attempts' => 3,
 
+    /* A rejected opaque provider cursor may restart one fresh scan, never loop indefinitely. */
+    'import_max_scan_restarts' => 1,
+
     /* Reject unexpectedly large provider pages before retaining raw streams. */
     'inventory_page_max_messages' => 500,
 

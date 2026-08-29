@@ -9,6 +9,8 @@ use Illuminate\Http\Client\Factory;
 use Illuminate\Http\Client\Response;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
+use Jkudish\MailMirror\Enums\ConnectionStatus;
+use Jkudish\MailMirror\Exceptions\ConnectionCredentialException;
 use Jkudish\MailMirror\Exceptions\GmailAuthorizationException;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAccountCredential;
@@ -31,9 +33,9 @@ final readonly class GmailOAuth
         private MailAccountConnection $connections,
     ) {}
 
-    public function authorizationUrl(string $state): string
+    public function authorizationUrl(string $state, string $codeChallenge): string
     {
-        if (trim($state) === '' || mb_strlen($state) > 1024) {
+        if (trim($state) === '' || mb_strlen($state) > 1024 || ! $this->validCodeChallenge($codeChallenge)) {
             throw new GmailAuthorizationException;
         }
 
@@ -48,14 +50,18 @@ final readonly class GmailOAuth
             'access_type' => 'offline',
             'include_granted_scopes' => 'false',
             'prompt' => 'consent',
+            'code_challenge' => $codeChallenge,
+            'code_challenge_method' => 'S256',
         ], '', '&', PHP_QUERY_RFC3986);
 
         return self::AUTHORIZATION_ENDPOINT.'?'.$query;
     }
 
-    public function exchange(#[SensitiveParameter] string $code): GmailAuthorization
-    {
-        if ($code === '') {
+    public function exchange(
+        #[SensitiveParameter] string $code,
+        #[SensitiveParameter] string $codeVerifier,
+    ): GmailAuthorization {
+        if ($code === '' || ! $this->validCodeVerifier($codeVerifier)) {
             throw new GmailAuthorizationException;
         }
 
@@ -63,6 +69,7 @@ final readonly class GmailOAuth
             'code' => $code,
             'grant_type' => 'authorization_code',
             'redirect_uri' => $this->configuration('redirect_uri'),
+            'code_verifier' => $codeVerifier,
         ]);
         $credential = $this->credentialFromResponse($response, null, true, requireRefreshToken: true);
 
@@ -86,7 +93,31 @@ final readonly class GmailOAuth
         ]);
 
         $replacement = $this->credentialFromResponse($response, $refreshToken, false, $current->scopes());
-        $this->connections->rotate($account, $stored, $replacement, $stored->version);
+        $attemptedVersion = $stored->version;
+
+        try {
+            $this->connections->rotate($account, $stored, $replacement, $attemptedVersion);
+        } catch (ConnectionCredentialException) {
+            $stored->refresh();
+
+            if ($stored->status !== ConnectionStatus::Ready || $stored->version === $attemptedVersion) {
+                throw new GmailAuthorizationException;
+            }
+
+            try {
+                $winner = $this->connections->credentials($account, $stored);
+            } catch (ConnectionCredentialException) {
+                throw new GmailAuthorizationException;
+            }
+
+            if (! $winner instanceof OAuthTokenSetCredential
+                || $winner->scopes() !== [self::SCOPE]
+                || ($winner->expiresAt() !== null && $winner->expiresAt() <= new DateTimeImmutable)) {
+                throw new GmailAuthorizationException;
+            }
+
+            return $winner;
+        }
 
         return $replacement;
     }
@@ -103,7 +134,10 @@ final readonly class GmailOAuth
         }
 
         if (! $response->successful()) {
-            throw new GmailAuthorizationException(in_array($response->status(), [400, 401, 403], true));
+            throw new GmailAuthorizationException(
+                accessRejected: $response->status() === 401,
+                permissionDenied: $response->status() === 403,
+            );
         }
 
         $payload = $response->json();
@@ -156,7 +190,7 @@ final readonly class GmailOAuth
         $invalidGrant = is_array($payload) && ($payload['error'] ?? null) === 'invalid_grant';
 
         if (! $response->successful() || ! is_array($payload)) {
-            throw new GmailAuthorizationException($invalidGrant || in_array($response->status(), [400, 401, 403], true));
+            throw new GmailAuthorizationException(grantInvalid: $invalidGrant);
         }
 
         $accessToken = $payload['access_token'] ?? null;
@@ -173,7 +207,9 @@ final readonly class GmailOAuth
             || ! is_int($expiresIn) || $expiresIn < 1
             || ($scopeRequired && ! is_string($scopeValue))
             || $scopes !== [self::SCOPE]) {
-            throw new GmailAuthorizationException;
+            throw new GmailAuthorizationException(
+                grantInvalid: $requireRefreshToken && ! is_string($refreshToken),
+            );
         }
 
         return new OAuthTokenSetCredential(
@@ -218,5 +254,18 @@ final readonly class GmailOAuth
         $timeout = config('mail-mirror.gmail.timeout_seconds', 30);
 
         return is_int($timeout) && $timeout >= 1 && $timeout <= 120 ? $timeout : 30;
+    }
+
+    private function validCodeChallenge(string $codeChallenge): bool
+    {
+        return strlen($codeChallenge) === 43 && preg_match('/^[A-Za-z0-9_-]+$/', $codeChallenge) === 1;
+    }
+
+    private function validCodeVerifier(#[SensitiveParameter] string $codeVerifier): bool
+    {
+        $length = strlen($codeVerifier);
+
+        return $length >= 43 && $length <= 128
+            && preg_match('/^[A-Za-z0-9._~-]+$/', $codeVerifier) === 1;
     }
 }

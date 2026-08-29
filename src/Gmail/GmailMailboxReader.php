@@ -15,6 +15,7 @@ use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
 use Jkudish\MailMirror\Exceptions\GmailAuthorizationException;
+use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAccountCredential;
@@ -23,6 +24,7 @@ use Jkudish\MailMirror\Read\InventoryPage;
 use Jkudish\MailMirror\Read\MailboxIdentity;
 use Jkudish\MailMirror\Read\MessageReference;
 use Jkudish\MailMirror\Read\ProviderDeletionEvidence;
+use Jkudish\MailMirror\Read\ProviderDeletionResolution;
 use Jkudish\MailMirror\Read\RawMessageSource;
 use Jkudish\MailMirror\Read\RetrievedMessage;
 use Throwable;
@@ -70,6 +72,17 @@ final class GmailMailboxReader implements MailboxReader
             $this->labels[$account->id] = $this->fetchLabels($account);
         }
 
+        if ($identitiesComplete && count($identities) >= $this->resourceLimit()) {
+            return new InventoryPage(
+                [],
+                $this->encodeCursor($state),
+                false,
+                accountProfile: $profile,
+                identities: $identities,
+                identitiesComplete: true,
+            );
+        }
+
         if ($state['phase'] === 'history') {
             return $this->historyPage($account, $state, $profile, $identities, $identitiesComplete);
         }
@@ -94,7 +107,7 @@ final class GmailMailboxReader implements MailboxReader
             throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
         }
 
-        $rawBytes = $this->base64UrlDecode($raw);
+        $rawBytes = $this->base64UrlDecode($raw, MailImportStage::Retrieve, $this->maxRawBytes());
 
         if (strlen($rawBytes) > $this->maxRawBytes()) {
             throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
@@ -183,7 +196,8 @@ final class GmailMailboxReader implements MailboxReader
      */
     private function historyPage(MailAccount $account, array $state, ?AccountProfile $profile, array $identities, bool $identitiesComplete): InventoryPage
     {
-        $query = ['startHistoryId' => $state['history_id'], 'maxResults' => $this->pageSize()];
+        $resourceBudget = $this->resourceLimit() - count($identities);
+        $query = ['startHistoryId' => $state['history_id'], 'maxResults' => $this->pageSize($resourceBudget)];
 
         if ($state['page_token'] !== null) {
             $query['pageToken'] = $state['page_token'];
@@ -192,6 +206,10 @@ final class GmailMailboxReader implements MailboxReader
         try {
             $payload = $this->request($account, 'GET', self::API.'/users/me/history', $query);
         } catch (MailImportFailure $failure) {
+            if ($state['page_token'] !== null && $failure->safeCode === MailImportCode::StateMismatch) {
+                throw new InventoryRestartRequired($this->fullRestartCursor());
+            }
+
             if ($failure->safeCode !== MailImportCode::HistoryExpired) {
                 throw $failure;
             }
@@ -201,12 +219,17 @@ final class GmailMailboxReader implements MailboxReader
             ]), false, accountProfile: $profile, identities: $identities, identitiesComplete: $identitiesComplete);
         }
 
-        $messages = [];
-        $deletions = [];
-        $resourceCount = 0;
+        /** @var array<string, ProviderDeletionEvidence|null> $finalStates */
+        $finalStates = [];
         $history = $payload['history'] ?? [];
 
         if (! is_array($history)) {
+            throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
+        }
+
+        $next = $payload['nextPageToken'] ?? null;
+
+        if ($next !== null && ! is_string($next)) {
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
         }
 
@@ -215,39 +238,22 @@ final class GmailMailboxReader implements MailboxReader
                 throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
             }
 
+            $recordId = $record['id'] ?? null;
+
+            if (! is_string($recordId) || trim($recordId) === '' || mb_strlen($recordId) > 255) {
+                throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
+            }
+
             foreach (['messagesAdded', 'labelsAdded', 'labelsRemoved'] as $key) {
                 foreach ($this->historyMessages($record[$key] ?? []) as $native) {
-                    $resourceCount++;
-
-                    if ($resourceCount > $this->resourceLimit()) {
-                        throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
-                    }
-
-                    $reference = $this->reference($account, $native, ['history_event' => $key]);
-                    $messages[$reference->providerMessageId] = $reference;
+                    $finalStates[$this->historyMessageId($native)] = null;
                 }
             }
 
             foreach ($this->historyMessages($record['messagesDeleted'] ?? []) as $native) {
-                $resourceCount++;
+                $id = $this->historyMessageId($native);
 
-                if ($resourceCount > $this->resourceLimit()) {
-                    throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
-                }
-
-                $id = $native['id'] ?? null;
-
-                if (! is_string($id)) {
-                    throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
-                }
-
-                $recordId = $record['id'] ?? null;
-
-                if (! is_string($recordId)) {
-                    throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
-                }
-
-                $deletions[$id] = new ProviderDeletionEvidence(
+                $finalStates[$id] = new ProviderDeletionEvidence(
                     $account->id,
                     $id,
                     'gmail_history_deleted',
@@ -255,23 +261,39 @@ final class GmailMailboxReader implements MailboxReader
                     ['history_id' => $recordId],
                 );
             }
+
+            if (count($finalStates) > $resourceBudget) {
+                throw new InventoryRestartRequired($this->fullRestartCursor());
+            }
         }
 
-        $next = $payload['nextPageToken'] ?? null;
+        $deletions = array_values(array_filter(
+            $finalStates,
+            fn (?ProviderDeletionEvidence $state): bool => $state !== null,
+        ));
+        $resolutions = array_map(
+            fn (string $id): ProviderDeletionResolution => new ProviderDeletionResolution($account->id, $id),
+            array_keys(array_filter(
+                $finalStates,
+                fn (?ProviderDeletionEvidence $state): bool => $state === null,
+            )),
+        );
+
         $nextState = [
             'phase' => $next === null ? 'full' : 'history',
-            'history_id' => is_string($payload['historyId'] ?? null) ? $payload['historyId'] : $state['history_id'],
+            'history_id' => $state['history_id'],
             'page_token' => is_string($next) ? $next : null,
         ];
 
         return new InventoryPage(
-            array_values($messages),
+            [],
             $this->encodeCursor($nextState),
             false,
-            array_values($deletions),
+            $deletions,
             $profile,
             $identities,
             $identitiesComplete,
+            $resolutions,
         );
     }
 
@@ -281,17 +303,26 @@ final class GmailMailboxReader implements MailboxReader
      */
     private function fullPage(MailAccount $account, array $state, ?AccountProfile $profile, array $identities, bool $identitiesComplete): InventoryPage
     {
-        $query = ['includeSpamTrash' => 'true', 'maxResults' => $this->pageSize()];
+        $resourceBudget = $this->resourceLimit() - count($identities);
+        $query = ['includeSpamTrash' => 'true', 'maxResults' => $this->pageSize($resourceBudget)];
 
         if ($state['page_token'] !== null) {
             $query['pageToken'] = $state['page_token'];
         }
 
-        $payload = $this->request($account, 'GET', self::API.'/users/me/messages', $query);
+        try {
+            $payload = $this->request($account, 'GET', self::API.'/users/me/messages', $query);
+        } catch (MailImportFailure $failure) {
+            if ($state['page_token'] !== null && $failure->safeCode === MailImportCode::StateMismatch) {
+                throw new InventoryRestartRequired($this->fullRestartCursor());
+            }
+
+            throw $failure;
+        }
         $nativeMessages = $payload['messages'] ?? [];
         $next = $payload['nextPageToken'] ?? null;
 
-        if (! is_array($nativeMessages) || count($nativeMessages) > $this->pageSize()
+        if (! is_array($nativeMessages) || count($nativeMessages) > $resourceBudget
             || ($next !== null && ! is_string($next))) {
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
         }
@@ -319,8 +350,12 @@ final class GmailMailboxReader implements MailboxReader
         try {
             $profile = $this->oauth->profile($credential);
         } catch (GmailAuthorizationException $failure) {
-            if (! $failure->grantInvalid) {
-                throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::ProviderUnavailable, true);
+            if (! $failure->accessRejected) {
+                throw new MailImportFailure(
+                    MailImportStage::Inventory,
+                    $failure->permissionDenied ? MailImportCode::PermissionDenied : MailImportCode::ProviderUnavailable,
+                    ! $failure->permissionDenied,
+                );
             }
 
             $credential = $this->refresh($account, $stored, $credential);
@@ -329,14 +364,16 @@ final class GmailMailboxReader implements MailboxReader
             try {
                 $profile = $this->oauth->profile($credential);
             } catch (GmailAuthorizationException $retryFailure) {
-                if ($retryFailure->grantInvalid) {
+                if ($retryFailure->accessRejected) {
                     $this->revoke($account, $stored);
                 }
 
                 throw new MailImportFailure(
                     MailImportStage::Inventory,
-                    $retryFailure->grantInvalid ? MailImportCode::AuthenticationFailed : MailImportCode::ProviderUnavailable,
-                    ! $retryFailure->grantInvalid,
+                    $retryFailure->accessRejected
+                        ? MailImportCode::AuthenticationFailed
+                        : ($retryFailure->permissionDenied ? MailImportCode::PermissionDenied : MailImportCode::ProviderUnavailable),
+                    ! $retryFailure->accessRejected && ! $retryFailure->permissionDenied,
                 );
             }
         }
@@ -399,7 +436,7 @@ final class GmailMailboxReader implements MailboxReader
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
         }
 
-        if (count($nativeIdentities) > 500) {
+        if (count($nativeIdentities) > $this->resourceLimit()) {
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
         }
 
@@ -411,21 +448,25 @@ final class GmailMailboxReader implements MailboxReader
             $signature = $identity['signature'] ?? null;
             $verificationStatus = $identity['verificationStatus'] ?? null;
 
-            if (! is_string($email) || trim($email) === ''
-                || ($name !== null && ! is_string($name))
+            if (! is_string($email) || trim($email) === '' || mb_strlen($email) > 255
+                || ($name !== null && (! is_string($name) || mb_strlen($name) > 255))
                 || ($replyTo !== null && (! is_string($replyTo) || mb_strlen($replyTo) > 255))
                 || ($signature !== null && (! is_string($signature) || strlen($signature) > 100000))
                 || ($verificationStatus !== null && (! is_string($verificationStatus) || mb_strlen($verificationStatus) > 255))) {
                 throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
             }
 
-            return new MailboxIdentity($email, $email, $name, [
-                'reply_to_address' => $replyTo,
-                'signature' => $signature,
-                'is_primary' => ($identity['isPrimary'] ?? false) === true,
-                'is_default' => ($identity['isDefault'] ?? false) === true,
-                'verification_status' => $verificationStatus,
-            ]);
+            try {
+                return new MailboxIdentity($email, $email, $name, [
+                    'reply_to_address' => $replyTo,
+                    'signature' => $signature,
+                    'is_primary' => ($identity['isPrimary'] ?? false) === true,
+                    'is_default' => ($identity['isDefault'] ?? false) === true,
+                    'verification_status' => $verificationStatus,
+                ]);
+            } catch (InvalidArgumentException) {
+                throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
+            }
         }, $nativeIdentities));
     }
 
@@ -508,12 +549,32 @@ final class GmailMailboxReader implements MailboxReader
 
     private function refresh(MailAccount $account, MailAccountCredential $stored, OAuthTokenSetCredential $credential): OAuthTokenSetCredential
     {
+        $attemptedVersion = $stored->version;
+
         try {
             $replacement = $this->oauth->refresh($account, $stored, $credential);
 
             return $replacement;
         } catch (GmailAuthorizationException $failure) {
             if ($failure->grantInvalid) {
+                $stored->refresh();
+
+                if ($stored->version !== $attemptedVersion) {
+                    try {
+                        $winner = $this->connections->credentials($account, $stored);
+                    } catch (Throwable) {
+                        throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::ProviderUnavailable, true);
+                    }
+
+                    if ($winner instanceof OAuthTokenSetCredential
+                        && $winner->scopes() === [GmailOAuth::SCOPE]
+                        && ($winner->expiresAt() === null || $winner->expiresAt() > new DateTimeImmutable)) {
+                        return $winner;
+                    }
+
+                    throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::ProviderUnavailable, true);
+                }
+
                 $this->revoke($account, $stored);
             }
 
@@ -539,6 +600,7 @@ final class GmailMailboxReader implements MailboxReader
         $stage = $this->stageFor($url);
 
         return match ($response->status()) {
+            400 => new MailImportFailure($stage, MailImportCode::StateMismatch),
             401 => new MailImportFailure($stage, MailImportCode::AuthenticationFailed),
             404 => str_contains($url, '/history')
                 ? new MailImportFailure($stage, MailImportCode::HistoryExpired)
@@ -705,14 +767,14 @@ final class GmailMailboxReader implements MailboxReader
         return $attachments;
     }
 
-    /** @return list<array<string, mixed>> */
-    private function historyMessages(mixed $events): array
+    /** @return iterable<array<string, mixed>> */
+    private function historyMessages(mixed $events): iterable
     {
         if (! is_array($events)) {
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
         }
 
-        return array_values(array_map(function (mixed $event): array {
+        foreach ($events as $event) {
             $message = is_array($event) ? ($event['message'] ?? null) : null;
 
             if (! is_array($message)) {
@@ -720,8 +782,20 @@ final class GmailMailboxReader implements MailboxReader
             }
 
             /** @var array<string, mixed> $message */
-            return $message;
-        }, $events));
+            yield $message;
+        }
+    }
+
+    /** @param array<string, mixed> $message */
+    private function historyMessageId(array $message): string
+    {
+        $id = $message['id'] ?? null;
+
+        if (! is_string($id) || trim($id) === '' || mb_strlen($id) > 255) {
+            throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
+        }
+
+        return $id;
     }
 
     /** @param array<string, mixed> $metadata */
@@ -784,7 +858,7 @@ final class GmailMailboxReader implements MailboxReader
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::StateMismatch);
         }
 
-        $decoded = $this->base64UrlDecode($cursor);
+        $decoded = $this->base64UrlDecode($cursor, MailImportStage::Inventory, 6144);
         $state = json_decode($decoded, true);
 
         if (! is_array($state)
@@ -816,16 +890,25 @@ final class GmailMailboxReader implements MailboxReader
         return rtrim(strtr(base64_encode(json_encode($state, JSON_THROW_ON_ERROR)), '+/', '-_'), '=');
     }
 
-    private function base64UrlDecode(string $encoded): string
+    private function fullRestartCursor(): string
+    {
+        return $this->encodeCursor(['phase' => 'full', 'history_id' => null, 'page_token' => null]);
+    }
+
+    private function base64UrlDecode(string $encoded, MailImportStage $stage, ?int $maximumDecodedBytes = null): string
     {
         if (! preg_match('/^[A-Za-z0-9_-]+$/', $encoded)) {
-            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+            throw new MailImportFailure($stage, MailImportCode::MalformedPayload);
+        }
+
+        if ($maximumDecodedBytes !== null && intdiv(strlen($encoded) * 3, 4) > $maximumDecodedBytes) {
+            throw new MailImportFailure($stage, MailImportCode::MalformedPayload);
         }
 
         $decoded = base64_decode(strtr($encoded, '-_', '+/'), true);
 
         if (! is_string($decoded)) {
-            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+            throw new MailImportFailure($stage, MailImportCode::MalformedPayload);
         }
 
         return $decoded;
@@ -852,11 +935,12 @@ final class GmailMailboxReader implements MailboxReader
         }
     }
 
-    private function pageSize(): int
+    private function pageSize(int $resourceBudget): int
     {
         $size = config('mail-mirror.gmail.page_size', 100);
+        $size = is_int($size) && $size >= 1 && $size <= 500 ? $size : 100;
 
-        return is_int($size) && $size >= 1 && $size <= 500 ? $size : 100;
+        return max(1, min($size, $resourceBudget));
     }
 
     private function timeout(): int
@@ -875,8 +959,8 @@ final class GmailMailboxReader implements MailboxReader
 
     private function resourceLimit(): int
     {
-        $maximum = config('mail-mirror.read_page_maximum', 500);
+        $maximum = config('mail-mirror.inventory_page_max_messages', 500);
 
-        return is_int($maximum) && $maximum >= 1 && $maximum <= 5000 ? $maximum : 500;
+        return is_int($maximum) && $maximum >= 1 ? $maximum : 500;
     }
 }

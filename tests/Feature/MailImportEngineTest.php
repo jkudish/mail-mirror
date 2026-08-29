@@ -11,6 +11,7 @@ use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
+use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\StaleCheckpoint;
 use Jkudish\MailMirror\Import\MailImportEngine;
@@ -110,6 +111,25 @@ function importEngine(DeterministicImportReader $reader): MailImportEngine
 
     return new MailImportEngine(new MailReadService($registry), new ReconciliationService, app(MailObjectStorage::class));
 }
+
+it('bounds provider-requested fresh scan restarts', function (): void {
+    $account = importAccount('bounded-restart-account');
+    $reader = new DeterministicImportReader;
+    $reader->onInventory = function (): never {
+        throw new InventoryRestartRequired('fresh-provider-cursor');
+    };
+
+    try {
+        importEngine($reader)->sync($account);
+        throw new RuntimeException('Repeated provider scan restarts were not bounded.');
+    } catch (MailImportFailure $failure) {
+        expect($failure->safeCode)->toBe(MailImportCode::StateMismatch);
+    }
+
+    expect($reader->requestedCursors)->toBe([null, 'fresh-provider-cursor'])
+        ->and(MailSyncCheckpoint::query()->forAccount($account)->value('provider_cursor'))->toBe('fresh-provider-cursor')
+        ->and(MailSyncCheckpoint::query()->forAccount($account)->value('version'))->toBe(1);
+});
 
 it('imports paginated duplicate delivery idempotently and converges on a second unchanged scan', function (): void {
     $account = importAccount();

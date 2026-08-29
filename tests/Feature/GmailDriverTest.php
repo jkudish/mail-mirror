@@ -18,6 +18,7 @@ use Jkudish\MailMirror\Import\MailImportEngine;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAttachment;
 use Jkudish\MailMirror\Models\MailIdentity;
+use Jkudish\MailMirror\Models\MailInventoryItem;
 use Jkudish\MailMirror\Models\MailMessage;
 use Jkudish\MailMirror\Models\MailProviderDeletionEvidence;
 use Jkudish\MailMirror\Models\MailRawObject;
@@ -310,6 +311,484 @@ it('refreshes a rejected access token once and revokes a grant rejected again', 
         ->and($stored->version)->toBe(3)
         ->and($stored->status)->toBe(ConnectionStatus::Revoked);
 });
+
+it('preserves a ready refresh credential when the token endpoint rejects the client or request', function (int $status, string $error): void {
+    $account = gmailAccount(expiresAt: new DateTimeImmutable('-1 minute'));
+
+    Http::fake([
+        'https://oauth2.googleapis.com/token' => Http::response([
+            'error' => $error,
+            'error_description' => 'hostile-token-endpoint-secret-3206',
+        ], $status),
+    ]);
+
+    try {
+        app(GmailMailboxReader::class)->inventoryPage($account, null);
+        throw new RuntimeException('The rejected token request unexpectedly continued.');
+    } catch (MailImportFailure $failure) {
+        expect($failure->safeCode)->toBe(MailImportCode::ProviderUnavailable)
+            ->and($failure->retryable)->toBeTrue()
+            ->and((string) $failure)->not->toContain('hostile-token-endpoint-secret', $error);
+    }
+
+    $stored = $account->credential()->firstOrFail();
+    $credential = app(MailAccountConnection::class)->credentials($account, $stored);
+    assert($credential instanceof OAuthTokenSetCredential);
+
+    expect($stored->status)->toBe(ConnectionStatus::Ready)
+        ->and($stored->version)->toBe(1)
+        ->and($credential->refreshToken())->toBe('synthetic-driver-refresh-3206');
+})->with([
+    'invalid client' => [400, 'invalid_client'],
+    'invalid request' => [400, 'invalid_request'],
+    'generic unauthorized token response' => [401, 'temporarily_unavailable'],
+]);
+
+it('keeps credentials ready when Gmail profile access is forbidden', function (): void {
+    $account = gmailAccount();
+
+    Http::fake([
+        '*users/me/profile' => Http::response([
+            'error' => ['message' => 'hostile quota or API-disabled secret 3206'],
+        ], 403),
+    ]);
+
+    try {
+        app(GmailMailboxReader::class)->inventoryPage($account, null);
+        throw new RuntimeException('The forbidden profile request unexpectedly continued.');
+    } catch (MailImportFailure $failure) {
+        expect($failure->safeCode)->toBe(MailImportCode::PermissionDenied)
+            ->and($failure->retryable)->toBeFalse()
+            ->and((string) $failure)->not->toContain('hostile quota', 'API-disabled');
+    }
+
+    expect($account->credential()->firstOrFail()->status)->toBe(ConnectionStatus::Ready)
+        ->and($account->credential()->firstOrFail()->version)->toBe(1);
+});
+
+it('keeps credentials ready for a malformed profile request response', function (): void {
+    $account = gmailAccount();
+
+    Http::fake([
+        '*users/me/profile' => Http::response(['error' => 'hostile-profile-request-secret-3206'], 400),
+    ]);
+
+    try {
+        app(GmailMailboxReader::class)->inventoryPage($account, null);
+        throw new RuntimeException('The malformed profile response unexpectedly continued.');
+    } catch (MailImportFailure $failure) {
+        expect($failure->safeCode)->toBe(MailImportCode::ProviderUnavailable)
+            ->and((string) $failure)->not->toContain('hostile-profile-request-secret');
+    }
+
+    expect($account->credential()->firstOrFail()->status)->toBe(ConnectionStatus::Ready);
+});
+
+it('keeps credentials ready when refresh client configuration is unavailable', function (): void {
+    $account = gmailAccount(expiresAt: new DateTimeImmutable('-1 minute'));
+    putenv('MAIL_MIRROR_GMAIL_CLIENT_SECRET');
+
+    try {
+        app(GmailMailboxReader::class)->inventoryPage($account, null);
+        throw new RuntimeException('Refresh continued without client configuration.');
+    } catch (MailImportFailure $failure) {
+        expect($failure->safeCode)->toBe(MailImportCode::ProviderUnavailable);
+    }
+
+    expect($account->credential()->firstOrFail()->status)->toBe(ConnectionStatus::Ready)
+        ->and($account->credential()->firstOrFail()->version)->toBe(1);
+    Http::assertNothingSent();
+});
+
+it('adopts the valid winner when two refreshes race', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount(expiresAt: new DateTimeImmutable('-1 minute'));
+    $winnerRotated = false;
+
+    Http::fake(function (Request $request) use ($account, $fixture, &$winnerRotated) {
+        if ($request->url() === 'https://oauth2.googleapis.com/token') {
+            $winnerStored = $account->credential()->firstOrFail();
+            app(MailAccountConnection::class)->rotate($account, $winnerStored, new OAuthTokenSetCredential(
+                'concurrent-winner-access-3206',
+                'concurrent-winner-refresh-3206',
+                new DateTimeImmutable('+1 hour'),
+                [GmailOAuth::SCOPE],
+            ), $winnerStored->version);
+            $winnerRotated = true;
+
+            return Http::response([
+                'access_token' => 'concurrent-loser-access-3206',
+                'refresh_token' => 'concurrent-loser-refresh-3206',
+                'expires_in' => 3600,
+                'scope' => GmailOAuth::SCOPE,
+            ]);
+        }
+
+        return match (true) {
+            str_ends_with($request->url(), '/profile') => Http::response($fixture['profile']),
+            str_ends_with($request->url(), '/labels') => Http::response($fixture['labels']),
+            str_ends_with($request->url(), '/settings/sendAs') => Http::response($fixture['identities']),
+            str_contains($request->url(), '/messages?') => Http::response([]),
+            default => Http::response([], 500),
+        };
+    });
+
+    app(MailImportEngine::class)->sync($account);
+    $stored = $account->credential()->firstOrFail();
+    $winner = app(MailAccountConnection::class)->credentials($account, $stored);
+    assert($winner instanceof OAuthTokenSetCredential);
+
+    expect($winnerRotated)->toBeTrue()
+        ->and($stored->status)->toBe(ConnectionStatus::Ready)
+        ->and($stored->version)->toBe(2)
+        ->and($winner->accessToken())->toBe('concurrent-winner-access-3206')
+        ->and($winner->refreshToken())->toBe('concurrent-winner-refresh-3206');
+});
+
+it('never revokes a concurrent refresh winner when the losing request receives invalid_grant', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount(expiresAt: new DateTimeImmutable('-1 minute'));
+
+    Http::fake(function (Request $request) use ($account, $fixture) {
+        if ($request->url() === 'https://oauth2.googleapis.com/token') {
+            $winnerStored = $account->credential()->firstOrFail();
+            app(MailAccountConnection::class)->rotate($account, $winnerStored, new OAuthTokenSetCredential(
+                'invalid-grant-winner-access-3206',
+                'invalid-grant-winner-refresh-3206',
+                new DateTimeImmutable('+1 hour'),
+                [GmailOAuth::SCOPE],
+            ), $winnerStored->version);
+
+            return Http::response([
+                'error' => 'invalid_grant',
+                'error_description' => 'hostile losing refresh secret 3206',
+            ], 400);
+        }
+
+        return match (true) {
+            str_ends_with($request->url(), '/profile') => Http::response($fixture['profile']),
+            str_ends_with($request->url(), '/labels') => Http::response($fixture['labels']),
+            str_ends_with($request->url(), '/settings/sendAs') => Http::response($fixture['identities']),
+            str_contains($request->url(), '/messages?') => Http::response([]),
+            default => Http::response([], 500),
+        };
+    });
+
+    app(MailImportEngine::class)->sync($account);
+    $stored = $account->credential()->firstOrFail();
+    $winner = app(MailAccountConnection::class)->credentials($account, $stored);
+    assert($winner instanceof OAuthTokenSetCredential);
+
+    expect($stored->status)->toBe(ConnectionStatus::Ready)
+        ->and($stored->version)->toBe(2)
+        ->and($winner->refreshToken())->toBe('invalid-grant-winner-refresh-3206');
+});
+
+it('keeps the original history start across pages and applies only each ID final history state', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $account->forceFill(['provider_metadata' => ['history_id' => 'history-original-3206']])->save();
+    foreach (['history-add-delete', 'history-delete-reappear', 'history-cross-page'] as $id) {
+        MailMessage::query()->create(['mail_account_id' => $account->id, 'provider_message_id' => $id]);
+    }
+    MailProviderDeletionEvidence::query()->create([
+        'mail_account_id' => $account->id,
+        'scan_id' => '00000000-0000-0000-0000-000000003206',
+        'provider_message_id' => 'history-delete-reappear',
+        'proof_code' => 'gmail_history_deleted',
+        'audit_reference' => 'synthetic-prior-proof-3206',
+    ]);
+    $profile = $fixture['profile'];
+    $profile['historyId'] = 'history-current-3206';
+    $historyRequests = [];
+
+    Http::fake(function (Request $request) use ($fixture, $profile, &$historyRequests) {
+        $url = $request->url();
+
+        if (str_contains($url, '/history')) {
+            $historyRequests[] = $request->data();
+
+            if (($request->data()['pageToken'] ?? null) === 'history-page-two') {
+                return Http::response(['history' => [[
+                    'id' => 'history-105',
+                    'messagesDeleted' => [['message' => ['id' => 'history-cross-page', 'threadId' => 'thread-c']]],
+                ]], 'historyId' => 'history-current-3206']);
+            }
+
+            return Http::response(['history' => [
+                [
+                    'id' => 'history-101',
+                    'messagesAdded' => [['message' => ['id' => 'history-add-delete', 'threadId' => 'thread-a']]],
+                    'messagesDeleted' => [['message' => ['id' => 'history-add-delete', 'threadId' => 'thread-a']]],
+                ],
+                [
+                    'id' => 'history-102',
+                    'messagesDeleted' => [['message' => ['id' => 'history-delete-reappear', 'threadId' => 'thread-b']]],
+                ],
+                [
+                    'id' => 'history-103',
+                    'labelsAdded' => [['message' => ['id' => 'history-delete-reappear', 'threadId' => 'thread-b']]],
+                ],
+                [
+                    'id' => 'history-104',
+                    'labelsRemoved' => [['message' => ['id' => 'history-cross-page', 'threadId' => 'thread-c']]],
+                ],
+            ], 'nextPageToken' => 'history-page-two', 'historyId' => 'history-mid-window-3206']);
+        }
+
+        return match (true) {
+            str_ends_with($url, '/profile') => Http::response($profile),
+            str_ends_with($url, '/labels') => Http::response($fixture['labels']),
+            str_ends_with($url, '/settings/sendAs') => Http::response($fixture['identities']),
+            str_contains($url, '/messages?') => Http::response([]),
+            default => Http::response([], 500),
+        };
+    });
+
+    $report = app(MailImportEngine::class)->sync($account);
+    $evidenceIds = MailProviderDeletionEvidence::query()->forAccount($account)
+        ->orderBy('provider_message_id')->pluck('provider_message_id')->all();
+
+    expect($historyRequests)->toHaveCount(2)
+        ->and($historyRequests[0]['startHistoryId'] ?? null)->toBe('history-original-3206')
+        ->and($historyRequests[1]['startHistoryId'] ?? null)->toBe('history-original-3206')
+        ->and($historyRequests[1]['pageToken'] ?? null)->toBe('history-page-two')
+        ->and($evidenceIds)->toBe(['history-add-delete', 'history-cross-page'])
+        ->and(MailInventoryItem::query()->forAccount($account)->count())->toBe(0)
+        ->and($report?->provider_deleted_count)->toBe(2)
+        ->and($report?->unexpected_active_count)->toBe(1);
+});
+
+it('atomically restarts a full scan after an invalid page token and resumes after a crash', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $unpagedRequests = 0;
+
+    Http::fake(function (Request $request) use ($fixture, &$unpagedRequests) {
+        $url = $request->url();
+
+        if (str_contains($url, '/messages?') && ($request->data()['pageToken'] ?? null) === 'rejected-full-token') {
+            return Http::response(['error' => ['message' => 'hostile rejected full cursor']], 400);
+        }
+
+        if (str_contains($url, '/messages?')) {
+            $unpagedRequests++;
+
+            return $unpagedRequests === 1
+                ? Http::response(['messages' => [['id' => 'gmail-message-a', 'threadId' => 'gmail-thread-1']], 'nextPageToken' => 'rejected-full-token'])
+                : Http::response(['messages' => [['id' => 'gmail-message-b', 'threadId' => 'gmail-thread-1']]]);
+        }
+
+        return match (true) {
+            str_ends_with($url, '/profile') => Http::response($fixture['profile']),
+            str_ends_with($url, '/labels') => Http::response($fixture['labels']),
+            str_ends_with($url, '/settings/sendAs') => Http::response($fixture['identities']),
+            str_contains($url, '/messages/gmail-message-a') && str_contains($url, 'format=full') => Http::response($fixture['message_a']),
+            str_contains($url, '/messages/gmail-message-b') && str_contains($url, 'format=full') => Http::response($fixture['message_b']),
+            str_contains($url, 'format=raw') => Http::response(['raw' => gmailRaw()]),
+            default => Http::response([], 500),
+        };
+    });
+
+    app(MailImportEngine::class)->sync($account, 1);
+    $partial = MailSyncCheckpoint::query()->forAccount($account)->firstOrFail();
+    $partialScanId = $partial->scan_id;
+
+    $report = app(MailImportEngine::class)->sync($account);
+    $restarted = MailSyncCheckpoint::query()->forAccount($account)->firstOrFail();
+
+    expect($restarted->scan_id)->not->toBe($partialScanId)
+        ->and($restarted->scan_completed_at)->not->toBeNull()
+        ->and($report?->inventory_count)->toBe(1)
+        ->and(MailInventoryItem::query()->forAccount($account)->where('scan_id', $restarted->scan_id)
+            ->pluck('provider_message_id')->all())->toBe(['gmail-message-b']);
+});
+
+it('restarts from a full scan after an invalid history page token', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $account->forceFill(['provider_metadata' => ['history_id' => 'history-original-3206']])->save();
+    $profile = $fixture['profile'];
+    $profile['historyId'] = 'history-current-3206';
+
+    Http::fake(function (Request $request) use ($fixture, $profile) {
+        $url = $request->url();
+
+        return match (true) {
+            str_ends_with($url, '/profile') => Http::response($profile),
+            str_ends_with($url, '/labels') => Http::response($fixture['labels']),
+            str_ends_with($url, '/settings/sendAs') => Http::response($fixture['identities']),
+            str_contains($url, '/history') && ($request->data()['pageToken'] ?? null) === 'rejected-history-token' => Http::response([], 400),
+            str_contains($url, '/history') => Http::response(['nextPageToken' => 'rejected-history-token']),
+            str_contains($url, '/messages?') => Http::response([]),
+            default => Http::response([], 500),
+        };
+    });
+
+    app(MailImportEngine::class)->sync($account, 1);
+    $partialScanId = MailSyncCheckpoint::query()->forAccount($account)->value('scan_id');
+    $report = app(MailImportEngine::class)->sync($account);
+
+    expect(MailSyncCheckpoint::query()->forAccount($account)->value('scan_id'))->not->toBe($partialScanId)
+        ->and($report?->inventory_count)->toBe(0);
+});
+
+it('deduplicates a high-cardinality repeated history event page by unique output ID', function (): void {
+    config()->set('mail-mirror.inventory_page_max_messages', 3);
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $account->forceFill(['provider_metadata' => ['history_id' => 'history-original-3206']])->save();
+    $profile = $fixture['profile'];
+    $profile['historyId'] = 'history-current-3206';
+    $duplicates = array_fill(0, 2000, ['message' => ['id' => 'duplicate-history-id', 'threadId' => 'duplicate-thread']]);
+
+    Http::fake(function (Request $request) use ($fixture, $profile, $duplicates) {
+        $url = $request->url();
+
+        return match (true) {
+            str_ends_with($url, '/profile') => Http::response($profile),
+            str_ends_with($url, '/labels') => Http::response($fixture['labels']),
+            str_ends_with($url, '/settings/sendAs') => Http::response($fixture['identities']),
+            str_contains($url, '/history') => Http::response(['history' => [[
+                'id' => 'history-duplicate-flood',
+                'labelsAdded' => $duplicates,
+            ]]]),
+            str_contains($url, '/messages?') => Http::response([]),
+            default => Http::response([], 500),
+        };
+    });
+
+    $report = app(MailImportEngine::class)->sync($account);
+
+    expect($report?->inventory_count)->toBe(0)
+        ->and(MailProviderDeletionEvidence::query()->forAccount($account)->count())->toBe(0);
+});
+
+it('clamps a legal full page around first-page identities', function (): void {
+    config()->set('mail-mirror.inventory_page_max_messages', 4);
+    config()->set('mail-mirror.gmail.page_size', 500);
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $observedMaxResults = null;
+
+    Http::fake(function (Request $request) use ($fixture, &$observedMaxResults) {
+        $url = $request->url();
+
+        if (str_contains($url, '/messages?')) {
+            $observedMaxResults = $request->data()['maxResults'] ?? null;
+
+            return Http::response(['messages' => [
+                ['id' => 'gmail-message-a', 'threadId' => 'gmail-thread-1'],
+                ['id' => 'gmail-message-b', 'threadId' => 'gmail-thread-1'],
+            ]]);
+        }
+
+        return match (true) {
+            str_ends_with($url, '/profile') => Http::response($fixture['profile']),
+            str_ends_with($url, '/labels') => Http::response($fixture['labels']),
+            str_ends_with($url, '/settings/sendAs') => Http::response($fixture['identities']),
+            str_contains($url, '/messages/gmail-message-a') && str_contains($url, 'format=full') => Http::response($fixture['message_a']),
+            str_contains($url, '/messages/gmail-message-b') && str_contains($url, 'format=full') => Http::response($fixture['message_b']),
+            str_contains($url, 'format=raw') => Http::response(['raw' => gmailRaw()]),
+            default => Http::response([], 500),
+        };
+    });
+
+    $report = app(MailImportEngine::class)->sync($account);
+
+    expect($observedMaxResults)->toBe(2)
+        ->and($report?->inventory_count)->toBe(2)
+        ->and(MailIdentity::query()->forAccount($account)->count())->toBe(2);
+});
+
+it('abandons an over-limit unique history page for a bounded authoritative full scan', function (): void {
+    config()->set('mail-mirror.inventory_page_max_messages', 4);
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $account->forceFill(['provider_metadata' => ['history_id' => 'history-original-3206']])->save();
+    $profile = $fixture['profile'];
+    $profile['historyId'] = 'history-current-3206';
+    $historyRequests = 0;
+
+    Http::fake(function (Request $request) use ($fixture, $profile, &$historyRequests) {
+        $url = $request->url();
+
+        if (str_contains($url, '/history')) {
+            $historyRequests++;
+
+            return Http::response(['history' => [[
+                'id' => 'history-over-limit',
+                'labelsAdded' => [
+                    ['message' => ['id' => 'unique-a', 'threadId' => 'thread-a']],
+                    ['message' => ['id' => 'unique-b', 'threadId' => 'thread-b']],
+                    ['message' => ['id' => 'unique-c', 'threadId' => 'thread-c']],
+                ],
+            ]]]);
+        }
+
+        return match (true) {
+            str_ends_with($url, '/profile') => Http::response($profile),
+            str_ends_with($url, '/labels') => Http::response($fixture['labels']),
+            str_ends_with($url, '/settings/sendAs') => Http::response($fixture['identities']),
+            str_contains($url, '/messages?') => Http::response([]),
+            default => Http::response([], 500),
+        };
+    });
+
+    $report = app(MailImportEngine::class)->sync($account);
+
+    expect($historyRequests)->toBe(1)
+        ->and($report?->inventory_count)->toBe(0)
+        ->and(MailSyncCheckpoint::query()->forAccount($account)->value('version'))->toBeGreaterThanOrEqual(2);
+});
+
+it('rejects oversized encoded raw data before base64 decoding', function (): void {
+    config()->set('mail-mirror.gmail.max_raw_bytes', 1048576);
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $encoded = str_repeat('A', 1398104);
+
+    Http::fake(function (Request $request) use ($fixture, $encoded) {
+        return str_contains($request->url(), 'format=raw')
+            ? Http::response(['raw' => $encoded])
+            : Http::response($fixture['message_a']);
+    });
+
+    $reference = new MessageReference($account->id, MailDriver::Gmail, 'gmail-message-a', 'gmail-thread-1');
+
+    try {
+        app(GmailMailboxReader::class)->retrieve($account, $reference);
+        throw new RuntimeException('The oversized encoded raw source was decoded.');
+    } catch (MailImportFailure $failure) {
+        expect($failure->safeCode)->toBe(MailImportCode::MalformedPayload);
+    }
+});
+
+it('normalizes oversized send-as identity fields to a sparse malformed-payload failure', function (string $field): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $identities = $fixture['identities'];
+    assert(is_array($identities['sendAs'] ?? null));
+    assert(is_array($identities['sendAs'][0] ?? null));
+    $identities['sendAs'][0][$field] = str_repeat('x', 256);
+
+    Http::fake(function (Request $request) use ($fixture, $identities) {
+        return match (true) {
+            str_ends_with($request->url(), '/profile') => Http::response($fixture['profile']),
+            str_ends_with($request->url(), '/labels') => Http::response($fixture['labels']),
+            str_ends_with($request->url(), '/settings/sendAs') => Http::response($identities),
+            default => Http::response([], 500),
+        };
+    });
+
+    try {
+        app(GmailMailboxReader::class)->inventoryPage($account, null);
+        throw new RuntimeException('The oversized send-as identity was accepted.');
+    } catch (MailImportFailure $failure) {
+        expect($failure->safeCode)->toBe(MailImportCode::MalformedPayload)
+            ->and((string) $failure)->not->toContain(str_repeat('x', 64));
+    }
+})->with(['sendAsEmail', 'displayName']);
 
 it('rejects malformed and cross-account payloads without stale mirror masking', function (): void {
     $first = gmailAccount('first-owner');

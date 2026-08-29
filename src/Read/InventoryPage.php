@@ -12,6 +12,7 @@ final readonly class InventoryPage
      * @param  list<MessageReference>  $messages
      * @param  list<ProviderDeletionEvidence>  $deletions
      * @param  list<MailboxIdentity>  $identities
+     * @param  list<ProviderDeletionResolution>  $deletionResolutions
      */
     public function __construct(
         public array $messages,
@@ -21,6 +22,7 @@ final readonly class InventoryPage
         public ?AccountProfile $accountProfile = null,
         public array $identities = [],
         public bool $identitiesComplete = false,
+        public array $deletionResolutions = [],
     ) {
         if (! $complete && ($nextCursor === null || $nextCursor === '')) {
             throw new InvalidArgumentException('An incomplete inventory page requires an opaque next cursor.');

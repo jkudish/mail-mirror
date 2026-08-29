@@ -27,13 +27,25 @@ afterEach(function (): void {
     putenv('MAIL_MIRROR_GMAIL_CLIENT_SECRET');
 });
 
+function gmailCodeVerifier(): string
+{
+    return str_repeat('synthetic-verifier-', 3);
+}
+
+function gmailCodeChallenge(): string
+{
+    return rtrim(strtr(base64_encode(hash('sha256', gmailCodeVerifier(), true)), '+/', '-_'), '=');
+}
+
 it('builds an authorization request with exactly gmail.modify and no other capability', function (): void {
-    $url = app(GmailOAuth::class)->authorizationUrl('opaque-state-3206');
+    $url = app(GmailOAuth::class)->authorizationUrl('opaque-state-3206', gmailCodeChallenge());
     parse_str((string) parse_url($url, PHP_URL_QUERY), $query);
 
     expect($url)->toStartWith('https://accounts.google.com/o/oauth2/v2/auth?')
         ->and($query['scope'] ?? null)->toBe(GmailOAuth::SCOPE)
         ->and($query['include_granted_scopes'] ?? null)->toBe('false')
+        ->and($query['code_challenge'] ?? null)->toBe(gmailCodeChallenge())
+        ->and($query['code_challenge_method'] ?? null)->toBe('S256')
         ->and($query)->not->toHaveKey('client_secret')
         ->and($url)->not->toContain('mail.google.com', 'gmail.settings', 'gmail.compose', 'gmail.send');
 });
@@ -57,7 +69,7 @@ it('exchanges an authorization code, validates the exact grant, and discovers th
         ]);
     });
 
-    $authorization = app(GmailOAuth::class)->exchange('synthetic-code-3206');
+    $authorization = app(GmailOAuth::class)->exchange('synthetic-code-3206', gmailCodeVerifier());
 
     expect($authorization)->toBeInstanceOf(GmailAuthorization::class)
         ->and($authorization->profile->providerAccountId)->toBe('mirror@invented.test')
@@ -66,6 +78,7 @@ it('exchanges an authorization code, validates the exact grant, and discovers th
 
     Http::assertSent(fn (Request $request): bool => $request->url() === 'https://oauth2.googleapis.com/token'
         && $request['grant_type'] === 'authorization_code'
+        && $request['code_verifier'] === gmailCodeVerifier()
         && $request['client_secret'] === 'synthetic-client-secret-3206');
 });
 
@@ -78,8 +91,12 @@ it('rejects an authorization-code exchange that cannot establish refresh integra
         ]),
     ]);
 
-    expect(fn () => app(GmailOAuth::class)->exchange('synthetic-code-3206'))
-        ->toThrow(GmailAuthorizationException::class);
+    try {
+        app(GmailOAuth::class)->exchange('synthetic-code-3206', gmailCodeVerifier());
+        throw new RuntimeException('The exchange without refresh integration was accepted.');
+    } catch (GmailAuthorizationException $failure) {
+        expect($failure->grantInvalid)->toBeTrue();
+    }
     Http::assertSentCount(1);
 });
 
@@ -94,7 +111,7 @@ it('rejects missing, narrower, broader, full-mailbox, and malformed grants witho
     ]);
 
     try {
-        app(GmailOAuth::class)->exchange('hostile-code-secret-3206');
+        app(GmailOAuth::class)->exchange('hostile-code-secret-3206', gmailCodeVerifier());
         throw new RuntimeException('The unsafe scope grant was accepted.');
     } catch (GmailAuthorizationException $exception) {
         expect($exception->getMessage())->toBe('Gmail authorization could not be completed safely.')
@@ -112,4 +129,20 @@ it('exposes no Gmail mutation, submission, deletion, draft-write, or revocation 
     $methods = array_merge(get_class_methods(GmailOAuth::class), get_class_methods(GmailMailboxReader::class));
 
     expect($methods)->not->toContain('send', 'submit', 'delete', 'trash', 'modify', 'createDraft', 'updateDraft', 'revoke');
+});
+
+it('rejects malformed PKCE values before network and redacts the verifier', function (): void {
+    $hostileVerifier = 'hostile-verifier-secret-3206';
+
+    expect(fn () => app(GmailOAuth::class)->authorizationUrl('opaque-state-3206', 'not-a-valid-challenge'))
+        ->toThrow(GmailAuthorizationException::class);
+
+    try {
+        app(GmailOAuth::class)->exchange('hostile-code-secret-3206', $hostileVerifier);
+        throw new RuntimeException('The malformed PKCE verifier was accepted.');
+    } catch (GmailAuthorizationException $failure) {
+        expect((string) $failure)->not->toContain($hostileVerifier, 'hostile-code-secret-3206');
+    }
+
+    Http::assertNothingSent();
 });
