@@ -6,6 +6,12 @@ namespace. Keep the package independent of jMail and consumer applications.
 ## Boundaries
 
 - Put package code in `src/` and package tests in `tests/`.
+- Follow the package [ownership and boundary contract](docs/architecture/ownership-and-boundaries.md).
+  Provider-derived records are scoped through a mail account; consumer
+  applications remain responsible for authorizing their own owners.
+- Add concrete same-owner and cross-owner tests in the task that introduces each
+  account-scoped record or boundary. Do not add passing architecture tests for
+  classes or tables that do not exist.
 - Do not add provider credentials, mailbox access, schema, storage, imports,
   reconciliation, queues, HTTP integrations, or UI without an approved design.
 - Never use real mailbox data or secrets in fixtures or tests.

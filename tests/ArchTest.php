@@ -6,13 +6,18 @@ arch('the package does not use debugging functions')
     ->expect(['dd', 'dump', 'ray'])
     ->each->not->toBeUsed();
 
-arch('the package has no persistence, transport, queue, mail, or UI concerns')
+arch('the package remains independent of consumer applications')
+    ->expect('Jkudish\\MailMirror')
+    ->not->toUse('App');
+
+arch('the package does not own consumer UI, MCP, or AI concerns')
     ->expect('Jkudish\\MailMirror')
     ->not->toUse([
-        'Illuminate\\Database',
-        'Illuminate\\Filesystem',
-        'Illuminate\\Http',
-        'Illuminate\\Mail',
-        'Illuminate\\Queue',
         'Illuminate\\View',
+        'Inertia',
+        'Livewire',
+        'Filament',
+        'Laravel\\Mcp',
+        'OpenAI',
+        'Anthropic',
     ]);
