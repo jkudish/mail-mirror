@@ -14,6 +14,7 @@ arch('the package does not own consumer UI, MCP, AI, policy, or approval concern
     ->expect('Jkudish\\MailMirror')
     ->not->toUse([
         'Illuminate\\Auth',
+        'Illuminate\\Contracts\\Auth',
         'Illuminate\\Foundation\\Auth',
         'Illuminate\\Support\\Facades\\Auth',
         'Illuminate\\Support\\Facades\\Gate',
