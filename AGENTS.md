@@ -30,6 +30,13 @@ namespace. Keep the package independent of jMail and consumer applications.
 
 Before creating, updating, or signing off a pull request, load the project-local
 `verifying-pull-requests` skill. GitHub Actions and enforced rulesets are
-intentionally absent. Signoff requires explicit human approval of the full
-verified SHA and a GitHub status read-back. Verification and signoff do not
-authorize merge, publication, release, deployment, or provider access.
+intentionally absent. Signoff requires either explicit human approval of the
+full verified SHA or explicit prospective delegation for the defined work and
+consequence. Under prospective delegation, the lead agent may approve only the
+exact SHA it reviewed and verified after all delegated gates pass. A commit
+change invalidates the evidence and requires review and verification of
+the new SHA; a changed objective, scope, gate, or consequence invalidates the
+delegation. Always read the GitHub status back at the exact SHA. Verification
+and signoff do not authorize merge, publication, release, deployment, or
+provider access; each consequence needs its own explicit authority, which may
+also be delegated prospectively.
