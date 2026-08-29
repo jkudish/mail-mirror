@@ -1,0 +1,12 @@
+{
+    "provider_message_id": "gmail-message-synthetic-001",
+    "provider_occurrence_id": "gmail-occurrence-synthetic-001",
+    "provider_thread_id": "gmail-thread-synthetic-001",
+    "subject": "Synthetic launch notes",
+    "headers": [{"name": "X-Gmail-Labels", "value": "SYNTHETIC"}],
+    "participants": [{"role": "from", "address": "ada@invented.test", "name": "Ada Example"}],
+    "attachments": [{"provider_id": "gmail-attachment-synthetic-001", "filename": "notes.txt", "media_type": "text/plain", "byte_size": 12, "provider_metadata": {"attachmentId": "gmail-native-attachment-001"}}],
+    "containers": [{"provider_id": "GMAIL_LABEL_SYNTHETIC", "name": "Synthetic", "provider_metadata": {"labelListVisibility": "labelShow"}}],
+    "inventory_metadata": {"historyId": "synthetic-history-101", "labelIds": ["SYNTHETIC"]},
+    "message_metadata": {"internalDate": "1700000000000", "sizeEstimate": 321}
+}

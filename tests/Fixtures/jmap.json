@@ -1,0 +1,12 @@
+{
+    "provider_message_id": "jmap-email-synthetic-001",
+    "provider_occurrence_id": "jmap-occurrence-synthetic-001",
+    "provider_thread_id": "jmap-thread-synthetic-001",
+    "subject": "Synthetic project update",
+    "headers": [{"name": "X-JMAP-Synthetic", "value": "true"}],
+    "participants": [{"role": "from", "address": "lin@invented.test", "name": "Lin Example"}],
+    "attachments": [{"provider_id": "jmap-blob-synthetic-001", "filename": "update.txt", "media_type": "text/plain", "byte_size": 14, "provider_metadata": {"blobId": "jmap-native-blob-001"}}],
+    "containers": [{"provider_id": "jmap-mailbox-synthetic-001", "name": "Synthetic", "provider_metadata": {"role": null, "sortOrder": 42}}],
+    "inventory_metadata": {"emailState": "synthetic-state-202", "keywords": {"$seen": true}},
+    "message_metadata": {"blobId": "jmap-native-message-blob-001", "receivedAt": "2024-01-01T00:00:00Z"}
+}
