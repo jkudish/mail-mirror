@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Jkudish\MailMirror\Contracts\MailboxReader;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Models\MailAccount;
+use Jkudish\MailMirror\Read\InventoryPage;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
 use Jkudish\MailMirror\Read\MailReadService;
 use Jkudish\MailMirror\Read\MessageReference;
@@ -13,7 +14,6 @@ use Jkudish\MailMirror\Read\RetrievedMessage;
 /**
  * @phpstan-type Fixture array{
  *     provider_message_id: string,
- *     provider_occurrence_id: string,
  *     provider_thread_id: string,
  *     subject: string,
  *     headers: list<array{name: string, value: string}>,
@@ -46,16 +46,15 @@ final class SyntheticFixtureReader implements MailboxReader
         return $this->mailDriver;
     }
 
-    public function inventory(MailAccount $account): iterable
+    public function inventoryPage(MailAccount $account, ?string $cursor): InventoryPage
     {
-        yield new MessageReference(
+        return new InventoryPage([new MessageReference(
             mailAccountId: $account->id,
             driver: $this->mailDriver,
             providerMessageId: $this->fixture['provider_message_id'],
-            providerOccurrenceId: $this->fixture['provider_occurrence_id'],
             providerThreadId: $this->fixture['provider_thread_id'],
             providerMetadata: $this->fixture['inventory_metadata'],
-        );
+        )], null, true);
     }
 
     public function retrieve(MailAccount $account, MessageReference $message): RetrievedMessage
@@ -82,7 +81,7 @@ it('uses enum-keyed Gmail and JMAP readers without erasing native semantics', fu
     $registry->register($driver, new SyntheticFixtureReader($driver, $fixture));
     $reads = new MailReadService($registry);
 
-    $reference = $reads->inventory($account)[0];
+    $reference = $reads->inventoryPage($account)->messages[0];
     $message = $reads->retrieve($account, $reference);
 
     expect($reference->driver)->toBe($driver)
@@ -112,10 +111,10 @@ it('rejects cross-account and cross-driver message references before adapter ret
     $registry = new MailDriverRegistry;
     $registry->register(MailDriver::Gmail, new SyntheticFixtureReader(MailDriver::Gmail, SyntheticFixtureReader::fixture('gmail')));
     $reads = new MailReadService($registry);
-    $reference = $reads->inventory($first)[0];
+    $reference = $reads->inventoryPage($first)->messages[0];
 
     expect(fn () => $reads->retrieve($second, $reference))->toThrow(InvalidArgumentException::class)
-        ->and(fn () => $reads->retrieve($first, new MessageReference($first->id, MailDriver::Jmap, 'id', 'occurrence')))
+        ->and(fn () => $reads->retrieve($first, new MessageReference($first->id, MailDriver::Jmap, 'id')))
         ->toThrow(InvalidArgumentException::class);
 });
 

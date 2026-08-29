@@ -84,10 +84,10 @@ final class MailAccount extends Model
         return $this->hasMany(MailContainer::class);
     }
 
-    /** @return HasMany<MailSyncRun, $this> */
-    public function syncRuns(): HasMany
+    /** @return HasOne<MailSyncCheckpoint, $this> */
+    public function syncCheckpoint(): HasOne
     {
-        return $this->hasMany(MailSyncRun::class);
+        return $this->hasOne(MailSyncCheckpoint::class);
     }
 
     /** @return HasOne<MailAccountCredential, $this> */

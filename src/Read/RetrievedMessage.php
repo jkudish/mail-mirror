@@ -16,10 +16,12 @@ final readonly class RetrievedMessage
     public function __construct(
         public MessageReference $reference,
         public ?string $subject,
+        public ?string $internetMessageId = null,
         public array $headers = [],
         public array $participants = [],
         public array $attachments = [],
         public array $containers = [],
         public array $providerMetadata = [],
+        public ?RawMessageSource $rawSource = null,
     ) {}
 }

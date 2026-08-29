@@ -1,10 +1,10 @@
 # MailMirror
 
 MailMirror is a private, standalone Laravel package foundation. It provides an
-account-rooted, provider-neutral persistence schema and read-only driver
-contracts plus immutable raw-message and materialized-attachment byte storage,
-without provider integrations, credentials, import orchestration, search, or
-provider mutation APIs.
+account-rooted, provider-neutral persistence schema, resumable inventory/import
+and reconciliation orchestration, read-only driver contracts, and immutable
+raw-message and materialized-attachment byte storage. It does not include a
+provider integration, mailbox access, search, or provider mutation API.
 
 Mail accounts may optionally belong to a consumer model through a polymorphic
 owner. Provider-derived records are isolated by account-qualified identifiers
@@ -34,6 +34,37 @@ defines mail accounts as the roots for provider-derived records while keeping
 consumer ownership optional and consumer-neutral. Future storage, credential,
 import, reconciliation, and provider work must add its concrete isolation tests
 alongside the implementation.
+
+## Resumable import and reconciliation
+
+`MailboxReader::inventoryPage()` returns account-qualified message references,
+an opaque next cursor, completion status, and any explicit provider deletion
+evidence. `MailImportEngine` processes one bounded page at a time. It retrieves
+messages sequentially, retries only explicitly retryable content-safe failures
+up to `mail-mirror.import_max_attempts`, and commits inventory rows, idempotent
+`MailMessage` records, sparse errors, deletion evidence, and the checkpoint in
+one transaction. The optimistic checkpoint version and account row lock reject
+concurrent or stale advancement. The cursor changes only in that transaction,
+after all corresponding database work is durable.
+
+`MailMessage` identity is exactly `(mail_account_id, provider_message_id)`.
+The nullable, non-unique `internet_message_id` preserves RFC Message-ID when
+available but is never provider identity. One `mail_sync_checkpoints` row per
+account holds only current resumable state: stable scan ID, opaque cursor,
+version, progress, and timestamps. There is no generic run lifecycle.
+
+On completion, `ReconciliationService` writes one immutable metadata-only
+report per account/scan. It distinguishes mirrored inventory, provider-proven
+deletions, open transient errors, explicitly waived errors, unexplained missing
+inventory, and unexpected active mirror records. Reports, errors, and thrown
+exceptions contain no message content, credentials, object keys, or provider
+error text. Deletion evidence explains a difference only; MailMirror does not
+quarantine, retain, purge, or otherwise apply deletion lifecycle policy here.
+
+Consumers may call `syncAccount()` with scalar account and owner tuple values;
+the engine reacquires the account and rejects mismatches before provider or
+database side effects. Work is deliberately sequential (bounded concurrency of
+one) until a concrete provider demonstrates a need for wider concurrency.
 
 The package automatically registers its config and migration. Applications can
 publish the config with Laravel's conventional `vendor:publish` command; the

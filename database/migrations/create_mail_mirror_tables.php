@@ -59,7 +59,7 @@ return new class extends Migration
             $table->foreignId('mail_account_id')->constrained()->cascadeOnDelete();
             $table->unsignedBigInteger('mail_thread_id')->nullable();
             $table->string('provider_message_id');
-            $table->string('provider_occurrence_id');
+            $table->string('internet_message_id')->nullable();
             $table->text('subject')->nullable();
             $table->timestampTz('sent_at')->nullable();
             $table->timestampTz('received_at')->nullable();
@@ -67,8 +67,8 @@ return new class extends Migration
             $table->timestamps();
 
             $table->unique(['mail_account_id', 'provider_message_id']);
-            $table->unique(['mail_account_id', 'provider_occurrence_id']);
             $table->unique(['mail_account_id', 'id']);
+            $table->index(['mail_account_id', 'internet_message_id']);
             $table->index('mail_thread_id');
             $table->foreign(['mail_account_id', 'mail_thread_id'])
                 ->references(['mail_account_id', 'id'])
@@ -198,33 +198,81 @@ return new class extends Migration
                 ->references(['mail_account_id', 'id'])->on('mail_messages')->noActionOnDelete();
         });
 
-        Schema::create('mail_sync_runs', function (Blueprint $table): void {
+        Schema::create('mail_inventory_items', function (Blueprint $table): void {
             $table->id();
             $table->foreignId('mail_account_id')->constrained()->cascadeOnDelete();
-            $table->enum('status', ['pending', 'running', 'completed', 'failed']);
-            $table->string('operation');
-            $table->timestampTz('started_at')->nullable();
-            $table->timestampTz('finished_at')->nullable();
-            $table->text('failure_reason')->nullable();
+            $table->uuid('scan_id');
+            $table->string('provider_message_id');
+            $table->string('provider_thread_id')->nullable();
             $table->json('provider_metadata')->nullable();
             $table->timestamps();
 
+            $table->unique(['mail_account_id', 'provider_message_id']);
             $table->unique(['mail_account_id', 'id']);
         });
 
         Schema::create('mail_sync_checkpoints', function (Blueprint $table): void {
             $table->id();
             $table->foreignId('mail_account_id')->constrained()->cascadeOnDelete();
-            $table->unsignedBigInteger('mail_sync_run_id')->nullable();
-            $table->string('checkpoint_key');
+            $table->uuid('scan_id');
             $table->text('provider_cursor')->nullable();
+            $table->unsignedBigInteger('version')->default(0);
+            $table->unsignedBigInteger('processed_count')->default(0);
+            $table->timestampTz('scan_started_at');
+            $table->timestampTz('scan_completed_at')->nullable();
+            $table->timestamps();
+
+            $table->unique('mail_account_id');
+        });
+
+        Schema::create('mail_import_errors', function (Blueprint $table): void {
+            $table->id();
+            $table->foreignId('mail_account_id')->constrained()->cascadeOnDelete();
+            $table->string('provider_message_id');
+            $table->string('stage');
+            $table->string('code');
+            $table->string('summary');
+            $table->unsignedInteger('attempt_count')->default(1);
+            $table->timestampTz('last_failed_at');
+            $table->timestampTz('resolved_at')->nullable();
+            $table->timestampTz('waived_at')->nullable();
+            $table->string('waiver_reason')->nullable();
+            $table->string('waiver_audit_reference')->nullable();
+            $table->timestamps();
+
+            $table->unique(['mail_account_id', 'provider_message_id', 'stage'], 'mail_import_error_message_stage_unique');
+            $table->unique(['mail_account_id', 'id']);
+        });
+
+        Schema::create('mail_provider_deletion_evidence', function (Blueprint $table): void {
+            $table->id();
+            $table->foreignId('mail_account_id')->constrained()->cascadeOnDelete();
+            $table->string('provider_message_id');
+            $table->string('proof_code');
+            $table->string('audit_reference');
             $table->json('provider_metadata')->nullable();
             $table->timestamps();
 
-            $table->unique(['mail_account_id', 'checkpoint_key']);
-            $table->index('mail_sync_run_id');
-            $table->foreign(['mail_account_id', 'mail_sync_run_id'])
-                ->references(['mail_account_id', 'id'])->on('mail_sync_runs')->noActionOnDelete();
+            $table->unique(['mail_account_id', 'provider_message_id']);
+            $table->unique(['mail_account_id', 'id']);
+        });
+
+        Schema::create('mail_reconciliation_reports', function (Blueprint $table): void {
+            $table->id();
+            $table->foreignId('mail_account_id')->constrained()->cascadeOnDelete();
+            $table->uuid('scan_id');
+            $table->unsignedBigInteger('inventory_count');
+            $table->unsignedBigInteger('mirrored_count');
+            $table->unsignedBigInteger('provider_deleted_count');
+            $table->unsignedBigInteger('transient_error_count');
+            $table->unsignedBigInteger('waived_error_count');
+            $table->unsignedBigInteger('unexplained_missing_count');
+            $table->unsignedBigInteger('unexpected_active_count');
+            $table->json('summary');
+            $table->timestamps();
+
+            $table->unique(['mail_account_id', 'scan_id']);
+            $table->unique(['mail_account_id', 'id']);
         });
     }
 
@@ -273,8 +321,11 @@ return new class extends Migration
 
     public function down(): void
     {
+        Schema::dropIfExists('mail_reconciliation_reports');
+        Schema::dropIfExists('mail_provider_deletion_evidence');
+        Schema::dropIfExists('mail_import_errors');
         Schema::dropIfExists('mail_sync_checkpoints');
-        Schema::dropIfExists('mail_sync_runs');
+        Schema::dropIfExists('mail_inventory_items');
         Schema::dropIfExists('mail_raw_objects');
         Schema::dropIfExists('mail_attachments');
         Schema::dropIfExists('mail_message_container_memberships');

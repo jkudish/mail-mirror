@@ -13,3 +13,11 @@ Credential lifecycle tests use only inline values prefixed with
 and are not structurally derived from a real token, credential, account, or
 person. Nested OAuth access/refresh probes and API-token probes intentionally
 exercise secret-containment behavior.
+
+Import and reconciliation tests use only inline identifiers and metadata
+prefixed with `synthetic`, `invented`, `opaque`, or generic `message-*` values.
+They were authored for task #3096 on 2026-08-29. The deterministic reader is an
+in-memory test double: pagination, duplicates, retry/rate-limit failures,
+malformed payloads, state changes, deletion evidence, crashes, stale
+checkpoints, resolution, waiver, and incomplete scans perform no network,
+provider, mailbox, queue, credential, or paid-service access.

@@ -11,7 +11,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
  * @property int $id
  * @property int|null $mail_thread_id
  * @property string $provider_message_id
- * @property string $provider_occurrence_id
+ * @property string|null $internet_message_id
  */
 final class MailMessage extends AccountScopedModel
 {

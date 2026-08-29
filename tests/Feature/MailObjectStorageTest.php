@@ -35,7 +35,6 @@ function storageMessage(string $suffix): array
     $message = MailMessage::query()->create([
         'mail_account_id' => $account->id,
         'provider_message_id' => "storage-message-{$suffix}",
-        'provider_occurrence_id' => "storage-occurrence-{$suffix}",
     ]);
 
     return [$account, $message];
@@ -95,7 +94,6 @@ it('denies cross-account reads and writes even when provider identifiers match',
     [$first, $firstMessage] = storageMessage('first-boundary');
     [$second, $secondMessage] = storageMessage('second-boundary');
     $secondMessage->provider_message_id = $firstMessage->provider_message_id;
-    $secondMessage->provider_occurrence_id = $firstMessage->provider_occurrence_id;
     $secondMessage->save();
     $source = storageStream('invented private bytes');
     $raw = app(MailObjectStorage::class)->storeRaw($first, $firstMessage, $source, 'shared-provider-object');

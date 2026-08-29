@@ -14,4 +14,7 @@ return [
      * private visibility to this Laravel Filesystem disk.
      */
     'storage_disk' => env('MAIL_MIRROR_STORAGE_DISK', 'local'),
+
+    /* Provider reads are sequential and retry only explicitly retryable failures. */
+    'import_max_attempts' => 3,
 ];

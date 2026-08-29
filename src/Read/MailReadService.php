@@ -11,18 +11,22 @@ final readonly class MailReadService
 {
     public function __construct(private MailDriverRegistry $drivers) {}
 
-    /** @return list<MessageReference> */
-    public function inventory(MailAccount $account): array
+    public function inventoryPage(MailAccount $account, ?string $cursor = null): InventoryPage
     {
         $reader = $this->drivers->reader($account->driver);
-        $references = [];
+        $page = $reader->inventoryPage($account, $cursor);
 
-        foreach ($reader->inventory($account) as $reference) {
+        foreach ($page->messages as $reference) {
             $this->assertReferenceBelongsTo($account, $reference);
-            $references[] = $reference;
         }
 
-        return $references;
+        foreach ($page->deletions as $deletion) {
+            if ($deletion->mailAccountId !== $account->getKey()) {
+                throw new InvalidArgumentException('The provider deletion evidence does not belong to the supplied mail account.');
+            }
+        }
+
+        return $page;
     }
 
     public function retrieve(MailAccount $account, MessageReference $message): RetrievedMessage

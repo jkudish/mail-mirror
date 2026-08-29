@@ -4,16 +4,14 @@ declare(strict_types=1);
 
 namespace Jkudish\MailMirror\Read;
 
-use Jkudish\MailMirror\Enums\MailDriver;
-
-final readonly class MessageReference
+final readonly class ProviderDeletionEvidence
 {
     /** @param array<string, mixed> $providerMetadata */
     public function __construct(
         public int $mailAccountId,
-        public MailDriver $driver,
         public string $providerMessageId,
-        public ?string $providerThreadId = null,
+        public string $proofCode,
+        public string $auditReference,
         public array $providerMetadata = [],
     ) {}
 }
