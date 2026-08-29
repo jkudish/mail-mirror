@@ -170,6 +170,29 @@ it('converges identical retries and rejects immutable byte or metadata changes',
     expect(fn () => $first->save())->toThrow(LogicException::class);
 });
 
+it('cleans only unreferenced rollback objects in the supplied account namespace', function (): void {
+    [$account, $message] = storageMessage('rollback-cleanup-boundary');
+    [$other] = storageMessage('rollback-cleanup-other');
+    $source = storageStream('durable rollback cleanup bytes');
+    $storage = app(MailObjectStorage::class);
+    $raw = $storage->storeRaw($account, $message, $source, 'rollback-cleanup-object');
+    fclose($source);
+    $key = $raw->object_key;
+    assert(is_string($key));
+
+    $storage->cleanupRolledBackRaw($account, $key);
+    Storage::disk('mail-mirror-test')->assertExists($key);
+
+    $orphan = "mail-mirror/accounts/{$account->id}/messages/999/raw/sha256/".str_repeat('a', 64);
+    Storage::disk('mail-mirror-test')->put($orphan, 'invented orphan bytes');
+    $storage->cleanupRolledBackRaw($account, $orphan);
+
+    Storage::disk('mail-mirror-test')->assertMissing($orphan);
+    expect(fn () => $storage->cleanupRolledBackRaw($other, $key))
+        ->toThrow(AccountResourceMismatch::class);
+    Storage::disk('mail-mirror-test')->assertExists($key);
+});
+
 it('enforces database uniqueness as the final concurrent-write guard and adopts recoverable objects', function (): void {
     [$account, $message] = storageMessage('race');
     $bytes = 'synthetic race bytes';

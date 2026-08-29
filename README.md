@@ -42,10 +42,13 @@ an opaque next cursor, completion status, and any explicit provider deletion
 evidence. `MailImportEngine` processes one bounded page at a time. It retrieves
 messages sequentially, retries only explicitly retryable content-safe failures
 up to `mail-mirror.import_max_attempts`, and commits inventory rows, idempotent
-`MailMessage` records, sparse errors, deletion evidence, and the checkpoint in
-one transaction. The optimistic checkpoint version and account row lock reject
-concurrent or stale advancement. The cursor changes only in that transaction,
-after all corresponding database work is durable.
+message/thread/header/participant/attachment/container state, sparse errors,
+scan-qualified deletion evidence, and the checkpoint in one transaction. Later
+provider state replaces stale child rows and memberships while preserving
+provider-native metadata. The optimistic checkpoint version and account row
+lock reject concurrent or stale advancement. Inventory pages are rejected above
+`mail-mirror.inventory_page_max_messages`; the cursor changes only after all
+corresponding database and object work is durable.
 
 `MailMessage` identity is exactly `(mail_account_id, provider_message_id)`.
 The nullable, non-unique `internet_message_id` preserves RFC Message-ID when
@@ -58,8 +61,17 @@ report per account/scan. It distinguishes mirrored inventory, provider-proven
 deletions, open transient errors, explicitly waived errors, unexplained missing
 inventory, and unexpected active mirror records. Reports, errors, and thrown
 exceptions contain no message content, credentials, object keys, or provider
-error text. Deletion evidence explains a difference only; MailMirror does not
-quarantine, retain, purge, or otherwise apply deletion lifecycle policy here.
+error text. Each report category contains its indexed SQL count plus at most
+`mail-mirror.reconciliation_sample_limit` opaque provider IDs and a `truncated`
+flag; it never stores the full provider inventory. Deletion evidence explains a
+difference only for the completed scan that observed it and is invalidated by
+reappearance. MailMirror does not quarantine, retain, purge, or otherwise apply
+deletion lifecycle policy here.
+
+The upgrade migration refuses to replace populated legacy run/checkpoint state
+before making any schema change. Its rollback restores compatible legacy run,
+checkpoint, and provider identity schema; clean installs use only the
+simplified import foundation.
 
 Consumers may call `syncAccount()` with scalar account and owner tuple values;
 the engine reacquires the account and rejects mismatches before provider or
@@ -87,11 +99,11 @@ they lock the message row, reject any different immutable record, create the
 uniquely constrained record, stream an account/message/content-addressed object
 with private visibility, and verify it. A failed write is removed; a partial
 object left by process interruption is repaired by an identical retry. If
-object finalization succeeds but the database commit fails, the unreferenced
-content-addressed object is left for an identical retry to adopt safely; it
-cannot collide with different bytes. Missing materialized attachments can be
-regenerated from the verified, unchanged RFC 822 raw source using stable MIME
-part paths.
+object finalization succeeds inside an import page that later rolls back, the
+engine calls an account-qualified cleanup boundary after the root rollback. It
+deletes the key only when no durable raw-object row references it, preserving
+previously committed bytes. Missing materialized attachments can be regenerated
+from the verified, unchanged RFC 822 raw source using stable MIME part paths.
 
 No lifecycle events are emitted by this foundation: no concrete downstream
 consumer requires one yet. A later import or projection task should add only

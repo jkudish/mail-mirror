@@ -15,6 +15,15 @@ final readonly class MailReadService
     {
         $reader = $this->drivers->reader($account->driver);
         $page = $reader->inventoryPage($account, $cursor);
+        $maximum = config('mail-mirror.inventory_page_max_messages', 500);
+
+        if (! is_int($maximum) || $maximum < 1) {
+            $maximum = 500;
+        }
+
+        if (count($page->messages) + count($page->deletions) > $maximum) {
+            throw new InvalidArgumentException('The provider inventory page exceeds the configured resource limit.');
+        }
 
         foreach ($page->messages as $reference) {
             $this->assertReferenceBelongsTo($account, $reference);

@@ -21,5 +21,9 @@ final readonly class InventoryPage
         if (! $complete && ($nextCursor === null || $nextCursor === '')) {
             throw new InvalidArgumentException('An incomplete inventory page requires an opaque next cursor.');
         }
+
+        if ($complete && $nextCursor !== null) {
+            throw new InvalidArgumentException('A complete inventory page cannot include a next cursor.');
+        }
     }
 }

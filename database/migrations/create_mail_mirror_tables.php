@@ -209,6 +209,7 @@ return new class extends Migration
 
             $table->unique(['mail_account_id', 'provider_message_id']);
             $table->unique(['mail_account_id', 'id']);
+            $table->index(['mail_account_id', 'scan_id']);
         });
 
         Schema::create('mail_sync_checkpoints', function (Blueprint $table): void {
@@ -247,6 +248,7 @@ return new class extends Migration
         Schema::create('mail_provider_deletion_evidence', function (Blueprint $table): void {
             $table->id();
             $table->foreignId('mail_account_id')->constrained()->cascadeOnDelete();
+            $table->uuid('scan_id');
             $table->string('provider_message_id');
             $table->string('proof_code');
             $table->string('audit_reference');
@@ -255,6 +257,7 @@ return new class extends Migration
 
             $table->unique(['mail_account_id', 'provider_message_id']);
             $table->unique(['mail_account_id', 'id']);
+            $table->index(['mail_account_id', 'scan_id']);
         });
 
         Schema::create('mail_reconciliation_reports', function (Blueprint $table): void {

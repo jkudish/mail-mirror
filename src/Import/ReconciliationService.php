@@ -4,12 +4,10 @@ declare(strict_types=1);
 
 namespace Jkudish\MailMirror\Import;
 
+use Illuminate\Database\Query\Builder;
+use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Models\MailAccount;
-use Jkudish\MailMirror\Models\MailImportError;
-use Jkudish\MailMirror\Models\MailInventoryItem;
-use Jkudish\MailMirror\Models\MailMessage;
-use Jkudish\MailMirror\Models\MailProviderDeletionEvidence;
 use Jkudish\MailMirror\Models\MailReconciliationReport;
 
 final class ReconciliationService
@@ -22,72 +20,114 @@ final class ReconciliationService
             throw new InvalidArgumentException('Only a completed full inventory scan may be reconciled.');
         }
 
-        $inventory = MailInventoryItem::query()->forAccount($account)->where('scan_id', $scanId)
-            ->pluck('provider_message_id')->all();
-        $mirrored = MailMessage::query()->forAccount($account)->pluck('provider_message_id')->all();
-        $deleted = MailProviderDeletionEvidence::query()->forAccount($account)->pluck('provider_message_id')->all();
-        $openErrors = MailImportError::query()->forAccount($account)->whereNull('resolved_at')->whereNull('waived_at')
-            ->pluck('provider_message_id')->all();
-        $waivedErrors = MailImportError::query()->forAccount($account)->whereNull('resolved_at')->whereNotNull('waived_at')
-            ->pluck('provider_message_id')->all();
+        $existing = MailReconciliationReport::query()->forAccount($account)->where('scan_id', $scanId)->first();
 
-        /** @var list<string> $inventory */
-        /** @var list<string> $mirrored */
-        /** @var list<string> $deleted */
-        /** @var list<string> $openErrors */
-        /** @var list<string> $waivedErrors */
-        $mirroredInventory = $this->intersection($inventory, $mirrored);
-        $missing = $this->difference($inventory, $mirrored);
-        $transient = $this->intersection($missing, $openErrors);
-        $waived = $this->intersection($missing, $waivedErrors);
-        $unexplained = $this->difference($missing, [...$transient, ...$waived]);
-        $providerDeleted = $this->intersection($this->difference($mirrored, $inventory), $deleted);
-        $unexpected = $this->difference($this->difference($mirrored, $inventory), $deleted);
-        $summary = [
-            'mirrored' => $mirroredInventory,
-            'provider_deleted' => $providerDeleted,
-            'transient_errors' => $transient,
-            'waived_errors' => $waived,
-            'unexplained_missing' => $unexplained,
-            'unexpected_active' => $unexpected,
+        if ($existing !== null) {
+            return $existing;
+        }
+
+        $accountId = $account->id;
+        $inventory = DB::table('mail_inventory_items as inventory')
+            ->where('inventory.mail_account_id', $accountId)
+            ->where('inventory.scan_id', $scanId);
+        $mirrored = (clone $inventory)->whereExists(function (Builder $query) use ($accountId): void {
+            $query->selectRaw('1')->from('mail_messages as messages')
+                ->where('messages.mail_account_id', $accountId)
+                ->whereColumn('messages.provider_message_id', 'inventory.provider_message_id');
+        });
+        $missing = (clone $inventory)->whereNotExists(function (Builder $query) use ($accountId): void {
+            $query->selectRaw('1')->from('mail_messages as messages')
+                ->where('messages.mail_account_id', $accountId)
+                ->whereColumn('messages.provider_message_id', 'inventory.provider_message_id');
+        });
+        $transient = (clone $missing)->whereExists(function (Builder $query) use ($accountId): void {
+            $query->selectRaw('1')->from('mail_import_errors as errors')
+                ->where('errors.mail_account_id', $accountId)
+                ->whereColumn('errors.provider_message_id', 'inventory.provider_message_id')
+                ->whereNull('errors.resolved_at')->whereNull('errors.waived_at');
+        });
+        $waived = (clone $missing)
+            ->whereNotExists(function (Builder $query) use ($accountId): void {
+                $query->selectRaw('1')->from('mail_import_errors as errors')
+                    ->where('errors.mail_account_id', $accountId)
+                    ->whereColumn('errors.provider_message_id', 'inventory.provider_message_id')
+                    ->whereNull('errors.resolved_at')->whereNull('errors.waived_at');
+            })
+            ->whereExists(function (Builder $query) use ($accountId): void {
+                $query->selectRaw('1')->from('mail_import_errors as errors')
+                    ->where('errors.mail_account_id', $accountId)
+                    ->whereColumn('errors.provider_message_id', 'inventory.provider_message_id')
+                    ->whereNull('errors.resolved_at')->whereNotNull('errors.waived_at');
+            });
+        $unexplained = (clone $missing)->whereNotExists(function (Builder $query) use ($accountId): void {
+            $query->selectRaw('1')->from('mail_import_errors as errors')
+                ->where('errors.mail_account_id', $accountId)
+                ->whereColumn('errors.provider_message_id', 'inventory.provider_message_id')
+                ->whereNull('errors.resolved_at');
+        });
+        $activeOutsideInventory = DB::table('mail_messages as messages')
+            ->where('messages.mail_account_id', $accountId)
+            ->whereNotExists(function (Builder $query) use ($accountId, $scanId): void {
+                $query->selectRaw('1')->from('mail_inventory_items as inventory')
+                    ->where('inventory.mail_account_id', $accountId)
+                    ->where('inventory.scan_id', $scanId)
+                    ->whereColumn('inventory.provider_message_id', 'messages.provider_message_id');
+            });
+        $providerDeleted = (clone $activeOutsideInventory)->whereExists(function (Builder $query) use ($accountId, $scanId): void {
+            $query->selectRaw('1')->from('mail_provider_deletion_evidence as deletions')
+                ->where('deletions.mail_account_id', $accountId)
+                ->where('deletions.scan_id', $scanId)
+                ->whereColumn('deletions.provider_message_id', 'messages.provider_message_id');
+        });
+        $unexpected = (clone $activeOutsideInventory)->whereNotExists(function (Builder $query) use ($accountId, $scanId): void {
+            $query->selectRaw('1')->from('mail_provider_deletion_evidence as deletions')
+                ->where('deletions.mail_account_id', $accountId)
+                ->where('deletions.scan_id', $scanId)
+                ->whereColumn('deletions.provider_message_id', 'messages.provider_message_id');
+        });
+
+        $categories = [
+            'mirrored' => $this->summarize($mirrored),
+            'provider_deleted' => $this->summarize($providerDeleted),
+            'transient_errors' => $this->summarize($transient),
+            'waived_errors' => $this->summarize($waived),
+            'unexplained_missing' => $this->summarize($unexplained),
+            'unexpected_active' => $this->summarize($unexpected),
         ];
 
-        return MailReconciliationReport::query()->firstOrCreate(
-            ['mail_account_id' => $account->id, 'scan_id' => $scanId],
-            [
-                'inventory_count' => count($inventory),
-                'mirrored_count' => count($mirroredInventory),
-                'provider_deleted_count' => count($providerDeleted),
-                'transient_error_count' => count($transient),
-                'waived_error_count' => count($waived),
-                'unexplained_missing_count' => count($unexplained),
-                'unexpected_active_count' => count($unexpected),
-                'summary' => $summary,
-            ],
-        );
+        return MailReconciliationReport::query()->create([
+            'mail_account_id' => $accountId,
+            'scan_id' => $scanId,
+            'inventory_count' => (clone $inventory)->count(),
+            'mirrored_count' => $categories['mirrored']['count'],
+            'provider_deleted_count' => $categories['provider_deleted']['count'],
+            'transient_error_count' => $categories['transient_errors']['count'],
+            'waived_error_count' => $categories['waived_errors']['count'],
+            'unexplained_missing_count' => $categories['unexplained_missing']['count'],
+            'unexpected_active_count' => $categories['unexpected_active']['count'],
+            'summary' => array_map(
+                fn (array $category): array => ['sample' => $category['sample'], 'truncated' => $category['truncated']],
+                $categories,
+            ),
+        ]);
     }
 
-    /** @param list<string> $left
-     * @param  list<string>  $right
-     * @return list<string>
-     */
-    private function intersection(array $left, array $right): array
+    /** @return array{count: int, sample: list<string>, truncated: bool} */
+    private function summarize(Builder $query): array
     {
-        $values = array_values(array_unique(array_intersect($left, $right)));
-        sort($values);
+        $configured = config('mail-mirror.reconciliation_sample_limit', 20);
+        $limit = is_int($configured) && $configured >= 1 && $configured <= 100 ? $configured : 20;
+        $count = (clone $query)->count();
+        $sample = (clone $query)->orderBy('provider_message_id')->limit($limit)
+            ->pluck('provider_message_id')->map(static function (mixed $id): string {
+                if (! is_string($id)) {
+                    throw new InvalidArgumentException('Reconciliation provider IDs must be strings.');
+                }
 
-        return $values;
-    }
+                return $id;
+            })->all();
 
-    /** @param list<string> $left
-     * @param  list<string>  $right
-     * @return list<string>
-     */
-    private function difference(array $left, array $right): array
-    {
-        $values = array_values(array_unique(array_diff($left, $right)));
-        sort($values);
-
-        return $values;
+        /** @var list<string> $sample */
+        return ['count' => $count, 'sample' => $sample, 'truncated' => $count > count($sample)];
     }
 }

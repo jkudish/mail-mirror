@@ -9,6 +9,7 @@ use Jkudish\MailMirror\Read\InventoryPage;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
 use Jkudish\MailMirror\Read\MailReadService;
 use Jkudish\MailMirror\Read\MessageReference;
+use Jkudish\MailMirror\Read\ProviderDeletionEvidence;
 use Jkudish\MailMirror\Read\RetrievedMessage;
 
 /**
@@ -83,13 +84,17 @@ it('uses enum-keyed Gmail and JMAP readers without erasing native semantics', fu
 
     $reference = $reads->inventoryPage($account)->messages[0];
     $message = $reads->retrieve($account, $reference);
+    /** @var array{provider_metadata: array<string, mixed>} $attachment */
+    $attachment = $message->attachments[0];
+    /** @var array{provider_metadata: array<string, mixed>} $container */
+    $container = $message->containers[0];
 
     expect($reference->driver)->toBe($driver)
         ->and($reference->providerMessageId)->toBe($fixture['provider_message_id'])
         ->and($reference->providerMetadata)->toBe($fixture['inventory_metadata'])
         ->and($message->providerMetadata)->toBe($fixture['message_metadata'])
-        ->and($message->attachments[0]['provider_metadata'])->toHaveKey($nativeKey)
-        ->and($message->containers[0]['provider_metadata'])->toBe($fixture['containers'][0]['provider_metadata']);
+        ->and($attachment['provider_metadata'])->toHaveKey($nativeKey)
+        ->and($container['provider_metadata'])->toBe($fixture['containers'][0]['provider_metadata']);
 })->with([
     'Gmail-shaped' => [MailDriver::Gmail, 'gmail', 'attachmentId'],
     'JMAP-shaped' => [MailDriver::Jmap, 'jmap', 'blobId'],
@@ -116,6 +121,79 @@ it('rejects cross-account and cross-driver message references before adapter ret
     expect(fn () => $reads->retrieve($second, $reference))->toThrow(InvalidArgumentException::class)
         ->and(fn () => $reads->retrieve($first, new MessageReference($first->id, MailDriver::Jmap, 'id')))
         ->toThrow(InvalidArgumentException::class);
+});
+
+it('rejects oversized pages before retrieval and contradictory completion cursors', function (): void {
+    $account = MailAccount::query()->create([
+        'driver' => MailDriver::Gmail,
+        'provider_account_id' => 'oversized-page-account',
+    ]);
+    config()->set('mail-mirror.inventory_page_max_messages', 1);
+    $reader = new class implements MailboxReader
+    {
+        public function driver(): MailDriver
+        {
+            return MailDriver::Gmail;
+        }
+
+        public function inventoryPage(MailAccount $account, ?string $cursor): InventoryPage
+        {
+            return new InventoryPage([
+                new MessageReference($account->id, MailDriver::Gmail, 'first'),
+                new MessageReference($account->id, MailDriver::Gmail, 'second'),
+            ], null, true);
+        }
+
+        public function retrieve(MailAccount $account, MessageReference $message): RetrievedMessage
+        {
+            throw new RuntimeException('Retrieval must not be reached for an oversized page.');
+        }
+    };
+    $registry = new MailDriverRegistry;
+    $registry->register(MailDriver::Gmail, $reader);
+
+    expect(fn () => (new MailReadService($registry))->inventoryPage($account))
+        ->toThrow(InvalidArgumentException::class, 'exceeds the configured resource limit')
+        ->and(fn () => new InventoryPage([], 'contradictory-cursor', true))
+        ->toThrow(InvalidArgumentException::class, 'complete inventory page cannot include');
+});
+
+it('validates account-qualified opaque references and deletion evidence at construction', function (): void {
+    expect(fn () => new MessageReference(0, MailDriver::Gmail, 'message'))
+        ->toThrow(InvalidArgumentException::class)
+        ->and(fn () => new MessageReference(1, MailDriver::Gmail, ''))
+        ->toThrow(InvalidArgumentException::class)
+        ->and(fn () => new MessageReference(1, MailDriver::Gmail, str_repeat('x', 256)))
+        ->toThrow(InvalidArgumentException::class)
+        ->and(fn () => new ProviderDeletionEvidence(0, 'message', 'provider_tombstone', 'opaque-audit'))
+        ->toThrow(InvalidArgumentException::class)
+        ->and(fn () => new ProviderDeletionEvidence(1, str_repeat('x', 256), 'provider_tombstone', 'opaque-audit'))
+        ->toThrow(InvalidArgumentException::class)
+        ->and(fn () => new ProviderDeletionEvidence(1, 'message', 'INVALID CODE', 'opaque-audit'))
+        ->toThrow(InvalidArgumentException::class)
+        ->and(fn () => new ProviderDeletionEvidence(1, 'message', 'provider_tombstone', ''))
+        ->toThrow(InvalidArgumentException::class);
+});
+
+it('rejects duplicate provider child identities before persistence', function (): void {
+    $reference = new MessageReference(1, MailDriver::Gmail, 'duplicate-children');
+
+    expect(fn () => new RetrievedMessage(
+        $reference,
+        null,
+        attachments: [
+            ['provider_id' => 'duplicate'],
+            ['provider_id' => 'duplicate'],
+        ],
+    ))->toThrow(InvalidArgumentException::class, 'attachment identities must be unique')
+        ->and(fn () => new RetrievedMessage(
+            $reference,
+            null,
+            containers: [
+                ['provider_id' => 'duplicate'],
+                ['provider_id' => 'duplicate'],
+            ],
+        ))->toThrow(InvalidArgumentException::class, 'container identities must be unique');
 });
 
 it('rejects a reader registered under a different enum key', function (): void {

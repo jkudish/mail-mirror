@@ -297,7 +297,7 @@ it('rejects every mismatched account and account-scoped parent tuple', function 
     }
 });
 
-it('keeps account and parent paths immutable through Eloquent', function (): void {
+it('keeps account paths immutable while allowing same-account thread state changes', function (): void {
     $first = account('first-immutable-account');
     $second = account('second-immutable-account');
     $thread = MailThread::query()->create(['mail_account_id' => $first->id, 'provider_thread_id' => 'immutable-thread']);
@@ -311,7 +311,14 @@ it('keeps account and parent paths immutable through Eloquent', function (): voi
     expect(fn () => $thread->save())->toThrow(LogicException::class);
 
     $message->mail_thread_id = null;
-    expect(fn () => $message->save())->toThrow(LogicException::class);
+    $message->save();
+    $secondThread = MailThread::query()->create([
+        'mail_account_id' => $second->id,
+        'provider_thread_id' => 'cross-account-thread',
+    ]);
+    $message->mail_thread_id = $secondThread->id;
+
+    expect(fn () => $message->save())->toThrow(QueryException::class);
 });
 
 it('fails closed for unknown drivers', function (): void {

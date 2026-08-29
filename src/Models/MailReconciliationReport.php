@@ -13,7 +13,7 @@ namespace Jkudish\MailMirror\Models;
  * @property int $waived_error_count
  * @property int $unexplained_missing_count
  * @property int $unexpected_active_count
- * @property array<string, list<string>> $summary
+ * @property array<string, array{sample: list<string>, truncated: bool}> $summary
  */
 final class MailReconciliationReport extends AccountScopedModel
 {

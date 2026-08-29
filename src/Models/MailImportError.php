@@ -15,6 +15,8 @@ use InvalidArgumentException;
  * @property int $attempt_count
  * @property CarbonImmutable|null $resolved_at
  * @property CarbonImmutable|null $waived_at
+ * @property string|null $waiver_reason
+ * @property string|null $waiver_audit_reference
  */
 final class MailImportError extends AccountScopedModel
 {

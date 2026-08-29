@@ -51,8 +51,8 @@ When a consumer owner is present:
 | Object storage | Namespace raw sources and attachments by account. MailMirror resolves an object only for an explicitly supplied mail account and rejects a key belonging to another account; the consumer separately authorizes its owner. Key secrecy is not authorization. |
 | Credentials | Credentials remain behind the provider connection boundary and never enter consumer models, job/event payloads, caches, logs, exceptions, or browser/MCP payloads. |
 | Raw sources | Preserve the original account-scoped source as immutable. Parsing, OCR, indexes, and consumer projections are separate replaceable derivations. |
-| Import state | One account-qualified checkpoint owns the current stable scan ID, opaque cursor, version, and progress. Page work commits before its cursor advances. Completed proof is an immutable metadata-only reconciliation report. |
-| Failures and deletion | Successful imports create no error row. Sparse redacted errors remain open until resolution or explicit audited waiver. Provider deletion evidence is separate and does not authorize retention, quarantine, or purge behavior. |
+| Import state | One account-qualified checkpoint owns the current stable scan ID, opaque cursor, version, and progress. Complete provider-neutral hydration and object work commit before its cursor advances. Completed proof is a database-protected immutable metadata-only report with SQL counts and bounded opaque samples. |
+| Failures and deletion | Successful imports create no error row and resolve the prior episode, including a waiver. A later episode reopens without inheriting that waiver. Provider deletion evidence is scan-qualified, invalidated by reappearance, and does not authorize retention, quarantine, or purge behavior. |
 | Consumer integration | Expose package contracts and events without importing `App` or another consumer namespace. Consumer class names do not appear as strings, config defaults, or stored morph values; consumers register aliases instead. |
 | UI, MCP, AI, policy, and approvals | Remain consumer concerns and do not enter the package. |
 
