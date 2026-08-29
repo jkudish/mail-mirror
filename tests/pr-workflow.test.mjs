@@ -25,7 +25,7 @@ function receiptPath() {
 function success(stdout = '') { return { status: 0, stdout, stderr: '' }; }
 
 function runner({
-    extension = 'gh signoff\tbasecamp/gh-signoff\tv1.0.0', heads = [SHA], localBase = BASE_SHA,
+    extension = 'gh signoff\tbasecamp/gh-signoff\t02e0cf9c', heads = [SHA], localBase = BASE_SHA,
     pullRequest = { headRefOid: SHA, state: 'OPEN' }, remoteBase = BASE_SHA, path = receiptPath(), worktree = '',
 } = {}) {
     const calls = [];
@@ -123,11 +123,13 @@ test('signoff requires exact approval and current receipt before GitHub access',
     assert.throws(() => signoff({ approvedSha: SHA, run: mock.run }), /receipt is stale/i);
 });
 
-test('signoff requires dedicated token, extension, and matching open PR', () => {
+test('signoff requires dedicated token, pinned extension, and matching open PR', () => {
     const noToken = runner(); writeReceipt(noToken.path);
     assert.throws(() => signoff({ approvedSha: SHA, environment: { GH_TOKEN: 'ambient' }, run: noToken.run }), /GH_SIGNOFF_TOKEN/);
     const noExtension = runner({ extension: '' }); writeReceipt(noExtension.path);
     assert.throws(() => signoff({ approvedSha: SHA, environment: SIGNOFF_ENV, run: noExtension.run }), /extension is not installed/i);
+    const wrongExtensionRevision = runner({ extension: 'gh signoff\tbasecamp/gh-signoff\tdeadbeef' }); writeReceipt(wrongExtensionRevision.path);
+    assert.throws(() => signoff({ approvedSha: SHA, environment: SIGNOFF_ENV, run: wrongExtensionRevision.run }), /pinned v0\.4\.1 revision/i);
     const closed = runner({ pullRequest: { headRefOid: SHA, state: 'CLOSED' } }); writeReceipt(closed.path);
     assert.throws(() => signoff({ approvedSha: SHA, environment: SIGNOFF_ENV, run: closed.run }), /open pull request/i);
     const mismatch = runner({ pullRequest: { headRefOid: OTHER_SHA, state: 'OPEN' } }); writeReceipt(mismatch.path);

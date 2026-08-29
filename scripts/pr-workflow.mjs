@@ -9,6 +9,8 @@ const SHA_PATTERN = /^[0-9a-f]{40}$/;
 const VERSION_PATTERN = /^\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?$/;
 const BASE_REF = 'origin/main';
 const REMOTE_BASE_REF = 'refs/heads/main';
+const SIGNOFF_EXTENSION = 'basecamp/gh-signoff';
+const SIGNOFF_EXTENSION_REVISION = '02e0cf9c';
 
 export const CHECK_STEPS = Object.freeze([
     { command: 'composer', args: ['install', '--no-interaction', '--prefer-dist', '--no-progress'] },
@@ -134,7 +136,11 @@ function signoffEnvironment(environment) {
 }
 function requireExtension(run, environment) {
     const extensions = output(run('gh', ['extension', 'list'], { encoding: 'utf8', env: environment }), 'gh extension list');
-    if (!/(^|\s)basecamp\/gh-signoff(\s|$)/m.test(extensions)) throw new Error('The basecamp/gh-signoff extension is not installed.');
+    const revision = extensions.split('\n')
+        .map((extension) => extension.split('\t'))
+        .find(([, repository]) => repository === SIGNOFF_EXTENSION)?.[2];
+    if (revision === undefined) throw new Error('The basecamp/gh-signoff extension is not installed.');
+    if (!revision.startsWith(SIGNOFF_EXTENSION_REVISION)) throw new Error('The basecamp/gh-signoff extension is not the pinned v0.4.1 revision.');
 }
 function pullRequest(run, environment) {
     const response = output(run('gh', ['pr', 'view', '--json', 'headRefOid,state'], { encoding: 'utf8', env: environment }), 'gh pr view');
