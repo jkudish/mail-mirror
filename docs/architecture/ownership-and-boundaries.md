@@ -18,11 +18,19 @@ standalone, closed single-owner installation to omit a consumer owner while
 allowing jMail or another consumer to attach its own owner model without making
 MailMirror depend on that model.
 
+The owner association is identified by both morph type and owner ID. Consumers
+register a stable morph alias and constrain both values; a null owner means no
+consumer owner and never satisfies a consumer-owner scope. Once attached, the
+owner association is immutable outside a future explicit transfer workflow.
+
 Every provider-derived identity, thread, occurrence, address, header,
 container, attachment, raw-source reference, sync cursor, checkpoint, and
 provider-native record must carry a direct `mail_account_id` or have an
 unambiguous account-scoped parent path. Provider IDs are never globally unique
-or sufficient authorization by themselves.
+or sufficient authorization by themselves. Records that rely on a parent path
+are queried through that path so the account constraint is applied in the query.
+The account association and any account-scoped parent association are immutable
+after creation.
 
 When a consumer owner is present:
 
@@ -38,12 +46,12 @@ When a consumer owner is present:
 | Concern | Package rule |
 | --- | --- |
 | Queries and uniqueness | Provider records, lookup keys, and uniqueness constraints are qualified by mail account. |
-| Jobs and events | Carry scalar account and resource identifiers. Never serialize consumer owner models, authenticated users, or credentials as authority. |
+| Jobs and events | Carry scalar account and resource identifiers. Never serialize credentials into a job or event payload. Serialized consumer owner models or authenticated users are never authority. |
 | Cache keys and locks | Begin with a mail-account namespace before any provider or resource identifier. |
-| Object storage | Namespace raw sources and attachments by account. Authorize before resolving a key; key secrecy is not authorization. |
-| Credentials | Credentials remain behind the provider connection boundary and never enter consumer models, events, logs, exceptions, or browser/MCP payloads. |
+| Object storage | Namespace raw sources and attachments by account. MailMirror resolves an object only for an explicitly supplied mail account and rejects a key belonging to another account; the consumer separately authorizes its owner. Key secrecy is not authorization. |
+| Credentials | Credentials remain behind the provider connection boundary and never enter consumer models, job/event payloads, caches, logs, exceptions, or browser/MCP payloads. |
 | Raw sources | Preserve the original account-scoped source as immutable. Parsing, OCR, indexes, and consumer projections are separate replaceable derivations. |
-| Consumer integration | Expose package contracts and events without importing `App` or another consumer namespace. |
+| Consumer integration | Expose package contracts and events without importing `App` or another consumer namespace. Consumer class names do not appear as strings, config defaults, or stored morph values; consumers register aliases instead. |
 | UI, MCP, AI, policy, and approvals | Remain consumer concerns and do not enter the package. |
 
 Persistence, filesystem, HTTP, mail, and queue dependencies are valid package
@@ -61,7 +69,8 @@ Using only synthetic fixtures, prove every applicable case:
 
 1. A same-account operation succeeds through the public package boundary.
 2. A second account cannot read, mutate, reconcile, or retrieve the first
-   account's resource, even when both accounts share the same provider ID.
+   account's resource or object key, even when both accounts share the same
+   provider ID.
 3. Database uniqueness, cache/lock names, and object keys do not collide across
    accounts.
 4. A job or event with a mismatched account/resource tuple fails without side
@@ -69,10 +78,26 @@ Using only synthetic fixtures, prove every applicable case:
 5. Credentials do not escape the connection boundary through serialization,
    logs, exceptions, events, or consumer-facing payloads.
 6. Raw source is immutable and derivations can be replaced without changing it.
+7. Consumer owner scope matches both morph type and owner ID, and an ownerless
+   account never matches that scope.
+8. Attempts to change a record's mail account, account-scoped parent, or attached
+   consumer owner fail without side effects.
+
+Each implementation task records which cases apply and why any remaining case
+does not. The owner-relation task also proves that package code and configuration
+do not hardcode a consumer class name.
 
 The schema and driver-contract task owns the first account and provider-record
 tests. Storage, credentials, import, reconciliation, and provider tasks own the
 additional proofs introduced by their behavior.
+
+## Current executable guards
+
+The architecture suite rejects concrete class dependencies from package code to
+consumer application classes and consumer-owned UI, MCP, AI, authorization, and
+approval layers. It cannot detect consumer class names hidden in strings or
+configuration, so the owner-relation task owns that executable source and
+configuration check when those artifacts exist.
 
 ## Non-goals
 
