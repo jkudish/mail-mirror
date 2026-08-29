@@ -19,4 +19,16 @@ final class MailAccountCredentialHistoryBuilder extends Builder
     {
         throw new LogicException('Credential lifecycle history is immutable.');
     }
+
+    /** @return never */
+    public function forceDelete()
+    {
+        throw new LogicException('Credential lifecycle history is immutable.');
+    }
+
+    /** @return never */
+    public function truncate()
+    {
+        throw new LogicException('Credential lifecycle history is immutable.');
+    }
 }

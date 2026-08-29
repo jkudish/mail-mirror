@@ -275,6 +275,10 @@ it('protects credential identity payload state and history from unsafe model upd
         ->and(fn () => $stored->delete())->toThrow(LogicException::class, 'connection lifecycle')
         ->and(fn () => MailAccountCredential::query()->whereKey($stored->id)->delete())
         ->toThrow(LogicException::class, 'connection lifecycle')
+        ->and(fn () => MailAccountCredential::query()->whereKey($stored->id)->forceDelete())
+        ->toThrow(LogicException::class, 'connection lifecycle')
+        ->and(fn () => MailAccountCredentialHistory::query()->whereKey($history->id)->forceDelete())
+        ->toThrow(LogicException::class, 'immutable')
         ->and(fn () => DB::table('mail_account_credentials')->where('id', $stored->id)->update([
             'mail_account_id' => $second->id,
         ]))->toThrow(QueryException::class)

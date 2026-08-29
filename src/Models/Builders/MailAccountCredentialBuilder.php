@@ -39,4 +39,16 @@ final class MailAccountCredentialBuilder extends Builder
     {
         throw new LogicException('Account credentials must be changed through the connection lifecycle.');
     }
+
+    /** @return never */
+    public function forceDelete()
+    {
+        throw new LogicException('Account credentials must be changed through the connection lifecycle.');
+    }
+
+    /** @return never */
+    public function truncate()
+    {
+        throw new LogicException('Account credentials must be changed through the connection lifecycle.');
+    }
 }
