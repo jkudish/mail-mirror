@@ -12,12 +12,15 @@ and composite account/parent foreign keys. Drivers are selected with the closed
 `MailDriver` enum (`gmail` and `jmap`); consumers register read adapters in
 `MailDriverRegistry` with enum keys rather than arbitrary strings.
 
-The package registers its Gmail reader under `MailDriver::Gmail`. Gmail OAuth
+The package registers its Gmail reader under `MailDriver::Gmail` and its
+Fastmail API-token JMAP reader under `MailDriver::Jmap`. Gmail OAuth
 requests exactly `gmail.modify`, validates the exact returned grant, and keeps
 token refresh, rotation, and local invalid-grant revocation inside
 `MailAccountConnection`. Provider network access is fail-closed unless
-`MAIL_MIRROR_GMAIL_ENABLED=true`; ordinary verification never enables it. See
-[the separately authorized live development lane](docs/gmail-live-development.md).
+the matching driver opt-in is true; ordinary verification never enables either
+driver. See the separately authorized
+[Gmail](docs/gmail-live-development.md) and
+[Fastmail JMAP](docs/fastmail-jmap-live-development.md) development lanes.
 
 ## Development
 

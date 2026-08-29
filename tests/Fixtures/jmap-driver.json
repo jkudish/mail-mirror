@@ -1,0 +1,81 @@
+{
+    "session": {
+        "capabilities": {
+            "urn:ietf:params:jmap:core": {},
+            "urn:ietf:params:jmap:mail": {},
+            "urn:ietf:params:jmap:submission": {}
+        },
+        "accounts": {
+            "jmap-account-synthetic-3207": {
+                "name": "Synthetic Mail",
+                "accountCapabilities": {
+                    "urn:ietf:params:jmap:mail": {},
+                    "urn:ietf:params:jmap:submission": {}
+                }
+            }
+        },
+        "primaryAccounts": {"urn:ietf:params:jmap:mail": "jmap-account-synthetic-3207"},
+        "apiUrl": "https://api.fastmail.com/jmap/api/",
+        "downloadUrl": "https://api.fastmail.com/jmap/download/{accountId}/{blobId}/{name}?type={type}",
+        "state": "jmap-session-state-3207"
+    },
+    "mailboxes": {
+        "accountId": "jmap-account-synthetic-3207",
+        "state": "jmap-mailbox-state-1",
+        "list": [
+            {"id": "jmap-mailbox-inbox", "name": "Inbox", "parentId": null, "role": "inbox", "sortOrder": 10, "isSubscribed": true},
+            {"id": "jmap-mailbox-drafts", "name": "Drafts", "parentId": null, "role": "drafts", "sortOrder": 20, "isSubscribed": true}
+        ],
+        "notFound": []
+    },
+    "identities": {
+        "accountId": "jmap-account-synthetic-3207",
+        "state": "jmap-identity-state-1",
+        "list": [
+            {"id": "jmap-identity-primary", "name": "Synthetic Sender", "email": "sender@invented.test", "replyTo": [{"name": "Synthetic Replies", "email": "reply@invented.test"}], "bcc": [], "textSignature": "Synthetic signature", "htmlSignature": "<p>Synthetic signature</p>"}
+        ],
+        "notFound": []
+    },
+    "emails": {
+        "jmap-email-a": {
+            "id": "jmap-email-a",
+            "blobId": "jmap-raw-blob-a",
+            "threadId": "jmap-thread-one",
+            "mailboxIds": {"jmap-mailbox-inbox": true},
+            "keywords": {"$seen": true, "$flagged": true},
+            "size": 640,
+            "receivedAt": "2026-08-01T10:01:00Z",
+            "sentAt": "2026-08-01T10:00:00Z",
+            "messageId": ["<jmap-a@invented.test>"],
+            "subject": "Synthetic JMAP update",
+            "preview": "Synthetic preview only.",
+            "hasAttachment": true,
+            "sender": [{"name": "Lin Example", "email": "lin@invented.test"}],
+            "from": [{"name": "Lin Example", "email": "lin@invented.test"}],
+            "to": [{"name": "Synthetic Sender", "email": "sender@invented.test"}],
+            "cc": [], "bcc": [], "replyTo": [],
+            "attachments": [{"partId": "jmap-part-2", "blobId": "jmap-attachment-blob-a", "type": "text/plain", "name": "update.txt", "size": 28, "cid": null, "disposition": "attachment"}]
+        },
+        "jmap-email-draft": {
+            "id": "jmap-email-draft",
+            "blobId": "jmap-raw-blob-draft",
+            "threadId": "jmap-thread-one",
+            "mailboxIds": {"jmap-mailbox-drafts": true},
+            "keywords": {"$draft": true},
+            "size": 402,
+            "receivedAt": "2026-08-02T11:00:00Z",
+            "sentAt": null,
+            "messageId": ["<jmap-draft@invented.test>"],
+            "subject": "Synthetic existing draft",
+            "preview": "Synthetic draft preview.",
+            "hasAttachment": false,
+            "sender": [],
+            "from": [{"name": "Synthetic Sender", "email": "sender@invented.test"}],
+            "to": [{"name": "Draft Recipient", "email": "recipient@invented.test"}],
+            "cc": [], "bcc": [], "replyTo": [], "attachments": []
+        }
+    },
+    "threads": {
+        "jmap-thread-one": {"id": "jmap-thread-one", "emailIds": ["jmap-email-a", "jmap-email-draft"]}
+    }
+}

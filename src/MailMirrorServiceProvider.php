@@ -11,6 +11,7 @@ use Jkudish\MailMirror\Gmail\GmailMailboxReader;
 use Jkudish\MailMirror\Gmail\GmailOAuth;
 use Jkudish\MailMirror\Import\MailImportEngine;
 use Jkudish\MailMirror\Import\ReconciliationService;
+use Jkudish\MailMirror\Jmap\FastmailJmapMailboxReader;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
 use Jkudish\MailMirror\Read\MailReadService;
 use Jkudish\MailMirror\Storage\MailObjectStorage;
@@ -35,9 +36,11 @@ final class MailMirrorServiceProvider extends PackageServiceProvider
     {
         $this->app->singleton(GmailOAuth::class);
         $this->app->singleton(GmailMailboxReader::class);
+        $this->app->singleton(FastmailJmapMailboxReader::class);
         $this->app->singleton(MailDriverRegistry::class, function (Application $app): MailDriverRegistry {
             $registry = new MailDriverRegistry;
             $registry->register(MailDriver::Gmail, $app->make(GmailMailboxReader::class));
+            $registry->register(MailDriver::Jmap, $app->make(FastmailJmapMailboxReader::class));
 
             return $registry;
         });

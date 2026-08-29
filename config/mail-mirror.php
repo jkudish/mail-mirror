@@ -36,4 +36,13 @@ return [
         'timeout_seconds' => 30,
         'max_raw_bytes' => 52428800,
     ],
+
+    'jmap' => [
+        /* Fail closed unless Fastmail JMAP network access is explicitly enabled by a consumer. */
+        'enabled' => env('MAIL_MIRROR_JMAP_ENABLED', false),
+        'page_size' => 100,
+        'timeout_seconds' => 30,
+        'request_max_attempts' => 3,
+        'max_raw_bytes' => 52428800,
+    ],
 ];
