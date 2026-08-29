@@ -188,10 +188,6 @@ final class FastmailJmapMailboxReader implements MailboxReader
         $parsedMailboxes = $this->parseMailboxes($mailboxResult);
         $identities = $this->parseIdentities($identityResult);
 
-        if (count($identities) > $this->resourceLimit()) {
-            throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
-        }
-
         $this->mailboxes[$account->id] = $parsedMailboxes['mailboxes'];
         $previousState = $account->provider_metadata['email_state'] ?? null;
         $next = [
@@ -304,6 +300,7 @@ final class FastmailJmapMailboxReader implements MailboxReader
             'accountId' => $account->provider_account_id,
             'position' => $cursor['position'],
             'limit' => $this->pageSize(),
+            'calculateTotal' => true,
         ], 'query', MailImportStage::Inventory);
         $ids = $this->stringList($result['ids'] ?? [], 255, MailImportStage::Inventory);
         $queryState = $this->boundedString($result['queryState'] ?? null, 255, MailImportStage::Inventory);
@@ -322,9 +319,14 @@ final class FastmailJmapMailboxReader implements MailboxReader
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
         }
 
-        $references = $this->referencesForIds($account, $session, $ids, 'full');
         $position = $cursor['position'] + count($ids);
-        $complete = $ids === [] || $position >= $total;
+
+        if ($position > $total || ($ids === [] && $position < $total)) {
+            throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::StateMismatch);
+        }
+
+        $references = $this->referencesForIds($account, $session, $ids, 'full');
+        $complete = $position === $total;
         $emailState = $this->boundedString($cursor['email_state'], 255, MailImportStage::Inventory);
         $profile = $this->profile($account, $session, ['email_state' => $emailState]);
 
@@ -710,6 +712,12 @@ final class FastmailJmapMailboxReader implements MailboxReader
      */
     private function parseIdentities(array $result): array
     {
+        $raw = $result['list'] ?? null;
+
+        if (is_array($raw) && count($raw) > $this->resourceLimit()) {
+            throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
+        }
+
         return array_map(function (array $native): MailboxIdentity {
             try {
                 return new MailboxIdentity(

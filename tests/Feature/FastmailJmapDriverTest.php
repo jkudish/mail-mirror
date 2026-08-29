@@ -42,6 +42,22 @@ final class JmapInventoryState
 
     public ?int $mutateAtPosition = null;
 
+    public ?int $mutateQueryStateAtPosition = null;
+
+    public ?int $prematureEmptyAtPosition = null;
+
+    /** @var list<string>|null */
+    public ?array $fullIds = null;
+
+    /** @var list<string> */
+    public array $updatedIds = ['jmap-email-a'];
+
+    /** @var list<string> */
+    public array $destroyedIds = ['jmap-email-gone'];
+
+    /** @var list<array<string, mixed>>|null */
+    public ?array $identityList = null;
+
     public ?string $changesOldState = null;
 
     public bool $stalledChanges = false;
@@ -159,7 +175,13 @@ function fakeJmap(
         }
 
         if ($method === 'Identity/get') {
-            return Http::response(jmapResponse($method, jmapFixturePart($fixture, 'identities'), $callId, $responseSessionState));
+            $identities = jmapFixturePart($fixture, 'identities');
+
+            if ($state->identityList !== null) {
+                $identities['list'] = $state->identityList;
+            }
+
+            return Http::response(jmapResponse($method, $identities, $callId, $responseSessionState));
         }
 
         if ($method === 'Email/changes') {
@@ -167,7 +189,7 @@ function fakeJmap(
             assert(is_string($sinceState));
             $calls['Email/changes:since:'.$sinceState] = 1;
             $result = $state->changes
-                ? ['accountId' => 'jmap-account-synthetic-3207', 'oldState' => $state->changesOldState ?? $sinceState, 'newState' => $state->stalledChanges ? $sinceState : 'jmap-email-state-2', 'hasMoreChanges' => $state->stalledChanges, 'created' => [], 'updated' => ['jmap-email-a'], 'destroyed' => ['jmap-email-gone']]
+                ? ['accountId' => 'jmap-account-synthetic-3207', 'oldState' => $state->changesOldState ?? $sinceState, 'newState' => $state->stalledChanges ? $sinceState : 'jmap-email-state-2', 'hasMoreChanges' => $state->stalledChanges, 'created' => [], 'updated' => $state->updatedIds, 'destroyed' => $state->destroyedIds]
                 : ['accountId' => 'jmap-account-synthetic-3207', 'oldState' => $arguments['sinceState'], 'newState' => 'jmap-email-state-1', 'hasMoreChanges' => false, 'created' => [], 'updated' => [], 'destroyed' => []];
 
             return Http::response(jmapResponse($method, $result, $callId, $responseSessionState));
@@ -175,26 +197,32 @@ function fakeJmap(
 
         if ($method === 'Email/query') {
             $position = $arguments['position'] ?? 0;
-            assert(is_int($position));
+            assert(is_int($position) && ($arguments['calculateTotal'] ?? null) === true);
+            $calls['Email/query:calculate-total'] = ($calls['Email/query:calculate-total'] ?? 0) + 1;
             if ($state->mutateAtPosition === $position) {
                 $state->emailState = 'jmap-email-state-during-full';
             }
             $exclude = $state->excludeChangedFromFull;
-            $ids = $exclude
-                ? ($position === 0 ? ['jmap-email-draft'] : [])
-                : match ($position) {
-                    0 => ['jmap-email-a'],
-                    1 => ['jmap-email-a'],
-                    default => ['jmap-email-draft'],
-                };
+            $fullIds = $state->fullIds ?? ($exclude
+                ? ['jmap-email-draft']
+                : ['jmap-email-a', 'jmap-email-a', 'jmap-email-draft']);
+            $ids = $state->prematureEmptyAtPosition === $position
+                ? []
+                : array_slice($fullIds, $position, 1);
+            $queryState = 'jmap-query-state-1';
+
+            if ($state->mutateQueryStateAtPosition === $position) {
+                $queryState = 'jmap-query-state-mutated';
+                $state->mutateQueryStateAtPosition = null;
+            }
 
             return Http::response(jmapResponse($method, [
                 'accountId' => 'jmap-account-synthetic-3207',
-                'queryState' => 'jmap-query-state-1',
+                'queryState' => $queryState,
                 'canCalculateChanges' => true,
                 'position' => $position + $state->queryPositionOffset,
                 'ids' => $ids,
-                'total' => $exclude ? 1 : 3,
+                'total' => count($fullIds),
             ], $callId, $responseSessionState));
         }
 
@@ -387,6 +415,7 @@ it('imports complete paginated JMAP state and converges duplicate delivery after
             'identity_state' => 'jmap-identity-state-1',
         ])
         ->and($calls['Session/get'])->toBeGreaterThanOrEqual(4)
+        ->and($calls['Email/query:calculate-total'])->toBeGreaterThanOrEqual(3)
         ->and($calls['Blob/download'])->toBeGreaterThanOrEqual(2);
 });
 
@@ -454,6 +483,44 @@ it('keeps the pre-full Email state baseline so changes during pagination replay 
         ->and(jmapCallCount($calls, 'Email/changes:since:jmap-email-state-before-full'))->toBe(1);
 });
 
+it('carries deletion evidence through a query-state restart and clears it on reappearance', function (): void {
+    $fixture = jmapFixture();
+    $account = jmapAccount();
+    $calls = [];
+    $state = new JmapInventoryState;
+    fakeJmap($fixture, $calls, inventoryState: $state);
+    $engine = app(MailImportEngine::class);
+    $engine->sync($account);
+
+    $state->changes = true;
+    $state->updatedIds = [];
+    $state->destroyedIds = ['jmap-email-a'];
+    $state->fullIds = ['jmap-email-draft', 'jmap-email-rfc-null'];
+    $state->mutateQueryStateAtPosition = 1;
+    $durableScanIds = [];
+    $report = $engine->sync($account, afterDurablePage: function (MailSyncCheckpoint $checkpoint) use (&$durableScanIds): void {
+        $durableScanIds[] = $checkpoint->scan_id;
+    });
+    $evidenceScanId = MailProviderDeletionEvidence::query()->forAccount($account)
+        ->where('provider_message_id', 'jmap-email-a')->value('scan_id');
+
+    expect($report?->provider_deleted_count)->toBe(1)
+        ->and($report?->unexpected_active_count)->toBe(0)
+        ->and(array_values(array_unique($durableScanIds)))->toHaveCount(2)
+        ->and($durableScanIds[0])->not->toBe($report?->scan_id)
+        ->and(MailSyncCheckpoint::query()->forAccount($account)->value('scan_id'))->toBe($report?->scan_id);
+    expect($evidenceScanId)->toBe($report?->scan_id);
+
+    $state->changes = false;
+    $state->fullIds = ['jmap-email-a', 'jmap-email-draft', 'jmap-email-rfc-null'];
+    $reappeared = $engine->sync($account);
+
+    expect($reappeared?->provider_deleted_count)->toBe(0)
+        ->and($reappeared?->unexpected_active_count)->toBe(0)
+        ->and(MailProviderDeletionEvidence::query()->forAccount($account)
+            ->where('provider_message_id', 'jmap-email-a')->exists())->toBeFalse();
+});
+
 it('rejects malformed Email changes and query progression', function (string $malformation): void {
     $fixture = jmapFixture();
     $account = jmapAccount();
@@ -468,6 +535,8 @@ it('rejects malformed Email changes and query progression', function (string $ma
         $account->forceFill(['provider_metadata' => ['email_state' => 'jmap-email-state-old']])->save();
         $state->changes = true;
         $state->stalledChanges = true;
+    } elseif ($malformation === 'premature-empty-query') {
+        $state->prematureEmptyAtPosition = 0;
     } else {
         $state->queryPositionOffset = 1;
     }
@@ -480,7 +549,30 @@ it('rejects malformed Email changes and query progression', function (string $ma
     } catch (MailImportFailure $failure) {
         expect($failure->safeCode)->toBe(MailImportCode::StateMismatch);
     }
-})->with(['old-state', 'stalled-changes', 'query-position']);
+})->with(['old-state', 'stalled-changes', 'query-position', 'premature-empty-query']);
+
+it('rejects an oversized Identity list before parsing nested identity fields', function (): void {
+    $fixture = jmapFixture();
+    $account = jmapAccount();
+    $calls = [];
+    $state = new JmapInventoryState;
+    $state->identityList = [
+        ['id' => 'bounded-identity', 'email' => 'bounded@invented.test'],
+        ['id' => ['malformed-before-bound'], 'email' => ['malformed-before-bound']],
+    ];
+    config()->set('mail-mirror.inventory_page_max_messages', 1);
+    fakeJmap($fixture, $calls, inventoryState: $state);
+
+    try {
+        app(FastmailJmapMailboxReader::class)->inventoryPage($account, null);
+        throw new RuntimeException('An oversized JMAP Identity list was accepted.');
+    } catch (MailImportFailure $failure) {
+        expect($failure->safeCode)->toBe(MailImportCode::MalformedPayload);
+    }
+
+    expect($calls['Identity/get'])->toBe(1)
+        ->and($calls['Email/query'] ?? 0)->toBe(0);
+});
 
 it('refreshes changed Session state in the same reader and restarts without stale inventory effects', function (): void {
     $fixture = jmapFixture();
@@ -559,11 +651,16 @@ it('recovers from changed query state with one fresh scan and resumes its durabl
         if ($method === 'Email/query') {
             $queryCalls++;
             $position = $arguments['position'] ?? 0;
+            assert(($arguments['calculateTotal'] ?? null) === true);
 
             return Http::response(jmapResponse($method, [
                 'accountId' => 'jmap-account-synthetic-3207',
                 'queryState' => $queryCalls === 2 ? 'changed-query-state' : 'stable-query-state',
-                'ids' => $position === 0 ? ['jmap-email-a'] : [],
+                'ids' => match ($position) {
+                    0 => ['jmap-email-a'],
+                    1 => ['jmap-email-draft'],
+                    default => [],
+                },
                 'position' => $position,
                 'total' => 2,
             ], $callId));
