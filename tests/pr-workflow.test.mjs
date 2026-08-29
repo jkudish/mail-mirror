@@ -73,7 +73,11 @@ test('owns stable, lowest, Laravel 12/13, quality, setup, and clean-diff checks'
         ['bash', ['scripts/test-prefer-lowest.sh']],
         ['bash', ['scripts/test-consumer-install.sh', '12']],
         ['node', ['--test', 'tests/pr-workflow.test.mjs']],
-        ['bash', ['-n', '.agents/setup', '.agents/resume', 'scripts/test-laravel-13-suite.sh', 'scripts/test-prefer-lowest.sh', 'scripts/test-consumer-install.sh']],
+        ['bash', ['-n', '.agents/setup']],
+        ['bash', ['-n', '.agents/resume']],
+        ['bash', ['-n', 'scripts/test-laravel-13-suite.sh']],
+        ['bash', ['-n', 'scripts/test-prefer-lowest.sh']],
+        ['bash', ['-n', 'scripts/test-consumer-install.sh']],
         ['git', ['diff', '--exit-code']],
     ]);
 });
@@ -82,9 +86,11 @@ test('guards setup and least-privilege signoff foundation configuration', () => 
     const setup = readFileSync(new URL('../.agents/setup', import.meta.url), 'utf8');
     const guidance = readFileSync(new URL('../.agents/skills/verifying-pull-requests/references/setup.md', import.meta.url), 'utf8');
     assert.match(setup, /composer\.github\.io\/installer\.sig/);
-    assert.match(setup, /hash_file\('sha384'/);
-    assert.match(setup, /02e0cf9c/);
-    assert.match(setup, /gh extension install basecamp\/gh-signoff --pin v0\.4\.1/);
+    assert.match(setup, /hash_file\("sha384", \$argv\[1\]\)/);
+    assert.match(setup, /\[ "\$expected_checksum" = "\$actual_checksum" \] \|\| fail/);
+    assert.match(setup, /Composer version 2\\\./);
+    assert.match(setup, /gh extension install basecamp\/gh-signoff --force --pin v0\.4\.1/);
+    assert.match(setup, /"\$signoff_revision" == 02e0cf9c\*/);
     assert.match(guidance, /Pull requests read and Commit\s+statuses read\/write/);
     assert.match(guidance, /Contents access is not needed/);
 });

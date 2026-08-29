@@ -21,7 +21,11 @@ export const CHECK_STEPS = Object.freeze([
     { command: 'bash', args: ['scripts/test-prefer-lowest.sh'] },
     { command: 'bash', args: ['scripts/test-consumer-install.sh', '12'] },
     { command: 'node', args: ['--test', 'tests/pr-workflow.test.mjs'] },
-    { command: 'bash', args: ['-n', '.agents/setup', '.agents/resume', 'scripts/test-laravel-13-suite.sh', 'scripts/test-prefer-lowest.sh', 'scripts/test-consumer-install.sh'] },
+    { command: 'bash', args: ['-n', '.agents/setup'] },
+    { command: 'bash', args: ['-n', '.agents/resume'] },
+    { command: 'bash', args: ['-n', 'scripts/test-laravel-13-suite.sh'] },
+    { command: 'bash', args: ['-n', 'scripts/test-prefer-lowest.sh'] },
+    { command: 'bash', args: ['-n', 'scripts/test-consumer-install.sh'] },
     { command: 'git', args: ['diff', '--exit-code'] },
 ]);
 

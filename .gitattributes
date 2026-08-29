@@ -3,5 +3,6 @@
 /tests export-ignore
 /AGENTS.md export-ignore
 /CLAUDE.md export-ignore
+/phpunit.xml export-ignore
 /phpstan.neon export-ignore
 /pint.json export-ignore
