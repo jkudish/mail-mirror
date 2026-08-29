@@ -1,6 +1,5 @@
 {
     "provider_message_id": "gmail-message-synthetic-001",
-    "provider_occurrence_id": "gmail-occurrence-synthetic-001",
     "provider_thread_id": "gmail-thread-synthetic-001",
     "subject": "Synthetic launch notes",
     "headers": [{"name": "X-Gmail-Labels", "value": "SYNTHETIC"}],

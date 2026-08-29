@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Jkudish\MailMirror;
 
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
+use Jkudish\MailMirror\Import\MailImportEngine;
+use Jkudish\MailMirror\Import\ReconciliationService;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
 use Jkudish\MailMirror\Read\MailReadService;
 use Jkudish\MailMirror\Storage\MailObjectStorage;
@@ -31,5 +33,7 @@ final class MailMirrorServiceProvider extends PackageServiceProvider
         $this->app->singleton(MailReadService::class);
         $this->app->singleton(MailObjectStorage::class);
         $this->app->singleton(MailAccountConnection::class);
+        $this->app->singleton(ReconciliationService::class);
+        $this->app->singleton(MailImportEngine::class);
     }
 }

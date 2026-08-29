@@ -35,7 +35,6 @@ function storageMessage(string $suffix): array
     $message = MailMessage::query()->create([
         'mail_account_id' => $account->id,
         'provider_message_id' => "storage-message-{$suffix}",
-        'provider_occurrence_id' => "storage-occurrence-{$suffix}",
     ]);
 
     return [$account, $message];
@@ -95,7 +94,6 @@ it('denies cross-account reads and writes even when provider identifiers match',
     [$first, $firstMessage] = storageMessage('first-boundary');
     [$second, $secondMessage] = storageMessage('second-boundary');
     $secondMessage->provider_message_id = $firstMessage->provider_message_id;
-    $secondMessage->provider_occurrence_id = $firstMessage->provider_occurrence_id;
     $secondMessage->save();
     $source = storageStream('invented private bytes');
     $raw = app(MailObjectStorage::class)->storeRaw($first, $firstMessage, $source, 'shared-provider-object');
@@ -170,6 +168,29 @@ it('converges identical retries and rejects immutable byte or metadata changes',
     $first->refresh();
     $first->provider_metadata = ['native' => 'changed'];
     expect(fn () => $first->save())->toThrow(LogicException::class);
+});
+
+it('cleans only unreferenced rollback objects in the supplied account namespace', function (): void {
+    [$account, $message] = storageMessage('rollback-cleanup-boundary');
+    [$other] = storageMessage('rollback-cleanup-other');
+    $source = storageStream('durable rollback cleanup bytes');
+    $storage = app(MailObjectStorage::class);
+    $raw = $storage->storeRaw($account, $message, $source, 'rollback-cleanup-object');
+    fclose($source);
+    $key = $raw->object_key;
+    assert(is_string($key));
+
+    $storage->cleanupRolledBackRaw($account, $key);
+    Storage::disk('mail-mirror-test')->assertExists($key);
+
+    $orphan = "mail-mirror/accounts/{$account->id}/messages/999/raw/sha256/".str_repeat('a', 64);
+    Storage::disk('mail-mirror-test')->put($orphan, 'invented orphan bytes');
+    $storage->cleanupRolledBackRaw($account, $orphan);
+
+    Storage::disk('mail-mirror-test')->assertMissing($orphan);
+    expect(fn () => $storage->cleanupRolledBackRaw($other, $key))
+        ->toThrow(AccountResourceMismatch::class);
+    Storage::disk('mail-mirror-test')->assertExists($key);
 });
 
 it('enforces database uniqueness as the final concurrent-write guard and adopts recoverable objects', function (): void {

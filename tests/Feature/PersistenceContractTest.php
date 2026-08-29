@@ -9,7 +9,6 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Jkudish\MailMirror\Enums\MailDriver;
-use Jkudish\MailMirror\Enums\SyncRunStatus;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAddress;
 use Jkudish\MailMirror\Models\MailAttachment;
@@ -21,7 +20,6 @@ use Jkudish\MailMirror\Models\MailMessageHeader;
 use Jkudish\MailMirror\Models\MailMessageParticipant;
 use Jkudish\MailMirror\Models\MailRawObject;
 use Jkudish\MailMirror\Models\MailSyncCheckpoint;
-use Jkudish\MailMirror\Models\MailSyncRun;
 use Jkudish\MailMirror\Models\MailThread;
 
 /** @property int $id */
@@ -67,7 +65,7 @@ it('persists the minimal account-rooted record graph and provider metadata', fun
         'mail_account_id' => $account->id,
         'mail_thread_id' => $thread->id,
         'provider_message_id' => 'message-synthetic-001',
-        'provider_occurrence_id' => 'occurrence-synthetic-001',
+        'internet_message_id' => '<synthetic-001@invented.test>',
         'provider_metadata' => ['historyId' => 'synthetic-history-1'],
     ]);
     $address = MailAddress::query()->create([
@@ -116,16 +114,11 @@ it('persists the minimal account-rooted record graph and provider metadata', fun
         'byte_size' => 128,
         'checksum' => 'synthetic-checksum-not-content',
     ]);
-    $run = MailSyncRun::query()->create([
-        'mail_account_id' => $account->id,
-        'status' => SyncRunStatus::Pending,
-        'operation' => 'inventory',
-    ]);
     $checkpoint = MailSyncCheckpoint::query()->create([
         'mail_account_id' => $account->id,
-        'mail_sync_run_id' => $run->id,
-        'checkpoint_key' => 'inventory',
+        'scan_id' => '10000000-0000-4000-8000-000000000001',
         'provider_cursor' => 'synthetic-cursor-001',
+        'scan_started_at' => now(),
     ]);
 
     expect($account->refresh()->driver)->toBe(MailDriver::Gmail)
@@ -150,7 +143,6 @@ it('persists the minimal account-rooted record graph and provider metadata', fun
         MailMessageContainerMembership::query()->count(),
         MailAttachment::query()->count(),
         MailRawObject::query()->count(),
-        MailSyncRun::query()->count(),
         MailSyncCheckpoint::query()->count(),
     ])->each->toBe(0);
 });
@@ -213,7 +205,7 @@ it('rejects invalid owner tuples and changes to attached owners or provider iden
     expect(fn () => $account->save())->toThrow(LogicException::class);
 });
 
-it('qualifies provider identifiers and occurrences by account', function (): void {
+it('qualifies provider message identifiers by account without treating RFC Message-ID as identity', function (): void {
     $first = account('first-account');
     $second = account('second-account');
 
@@ -223,30 +215,29 @@ it('qualifies provider identifiers and occurrences by account', function (): voi
         $message = MailMessage::query()->create([
             'mail_account_id' => $account->id,
             'provider_message_id' => 'shared-message',
-            'provider_occurrence_id' => 'shared-occurrence',
+            'internet_message_id' => '<shared@invented.test>',
         ]);
         MailContainer::query()->create(['mail_account_id' => $account->id, 'provider_container_id' => 'shared-container', 'name' => 'Synthetic']);
         MailAttachment::query()->create(['mail_account_id' => $account->id, 'mail_message_id' => $message->id, 'provider_attachment_id' => 'shared-attachment']);
         MailRawObject::query()->create(['mail_account_id' => $account->id, 'mail_message_id' => $message->id, 'provider_object_id' => 'shared-raw', 'kind' => 'rfc822']);
     }
 
-    expect(MailMessage::query()->where('provider_occurrence_id', 'shared-occurrence')->count())->toBe(2)
+    expect(MailMessage::query()->where('internet_message_id', '<shared@invented.test>')->count())->toBe(2)
         ->and(MailMessage::query()->forAccount($first)->count())->toBe(1)
         ->and(fn () => MailMessage::query()->create([
             'mail_account_id' => $first->id,
-            'provider_message_id' => 'another-message',
-            'provider_occurrence_id' => 'shared-occurrence',
+            'provider_message_id' => 'shared-message',
+            'internet_message_id' => '<different@invented.test>',
         ]))->toThrow(QueryException::class);
 });
 
-it('qualifies attachment and raw object identifiers by message occurrence', function (): void {
+it('qualifies attachment and raw object identifiers by provider message', function (): void {
     $account = account('reused-child-provider-identifiers');
 
     foreach (['first', 'second'] as $position) {
         $message = MailMessage::query()->create([
             'mail_account_id' => $account->id,
             'provider_message_id' => $position.'-message',
-            'provider_occurrence_id' => $position.'-occurrence',
         ]);
 
         MailAttachment::query()->create([
@@ -286,22 +277,19 @@ it('rejects every mismatched account and account-scoped parent tuple', function 
     $first = account('first-parent-account');
     $second = account('second-parent-account');
     $firstThread = MailThread::query()->create(['mail_account_id' => $first->id, 'provider_thread_id' => 'first-thread']);
-    $firstMessage = MailMessage::query()->create(['mail_account_id' => $first->id, 'provider_message_id' => 'first-message', 'provider_occurrence_id' => 'first-occurrence']);
+    $firstMessage = MailMessage::query()->create(['mail_account_id' => $first->id, 'provider_message_id' => 'first-message']);
     $firstAddress = MailAddress::query()->create(['mail_account_id' => $first->id, 'address' => 'first@invented.test']);
     $secondAddress = MailAddress::query()->create(['mail_account_id' => $second->id, 'address' => 'second@invented.test']);
     $secondIdentity = MailIdentity::query()->create(['mail_account_id' => $second->id, 'provider_identity_id' => 'second-identity']);
     $secondContainer = MailContainer::query()->create(['mail_account_id' => $second->id, 'provider_container_id' => 'second-container', 'name' => 'Second']);
-    $firstRun = MailSyncRun::query()->create(['mail_account_id' => $first->id, 'status' => SyncRunStatus::Pending, 'operation' => 'inventory']);
-
     $invalidCreates = [
-        fn () => MailMessage::query()->create(['mail_account_id' => $second->id, 'mail_thread_id' => $firstThread->id, 'provider_message_id' => 'cross-thread', 'provider_occurrence_id' => 'cross-thread']),
+        fn () => MailMessage::query()->create(['mail_account_id' => $second->id, 'mail_thread_id' => $firstThread->id, 'provider_message_id' => 'cross-thread']),
         fn () => MailMessageParticipant::query()->create(['mail_account_id' => $first->id, 'mail_message_id' => $firstMessage->id, 'mail_address_id' => $secondAddress->id, 'role' => 'from']),
         fn () => MailMessageParticipant::query()->create(['mail_account_id' => $first->id, 'mail_message_id' => $firstMessage->id, 'mail_address_id' => $firstAddress->id, 'mail_identity_id' => $secondIdentity->id, 'role' => 'to']),
         fn () => MailMessageHeader::query()->create(['mail_account_id' => $second->id, 'mail_message_id' => $firstMessage->id, 'name' => 'X-Cross', 'value' => 'invalid']),
         fn () => MailMessageContainerMembership::query()->create(['mail_account_id' => $first->id, 'mail_message_id' => $firstMessage->id, 'mail_container_id' => $secondContainer->id]),
         fn () => MailAttachment::query()->create(['mail_account_id' => $second->id, 'mail_message_id' => $firstMessage->id, 'provider_attachment_id' => 'cross-attachment']),
         fn () => MailRawObject::query()->create(['mail_account_id' => $second->id, 'mail_message_id' => $firstMessage->id, 'provider_object_id' => 'cross-raw', 'kind' => 'rfc822']),
-        fn () => MailSyncCheckpoint::query()->create(['mail_account_id' => $second->id, 'mail_sync_run_id' => $firstRun->id, 'checkpoint_key' => 'cross-run']),
     ];
 
     foreach ($invalidCreates as $invalidCreate) {
@@ -309,7 +297,7 @@ it('rejects every mismatched account and account-scoped parent tuple', function 
     }
 });
 
-it('keeps account and parent paths immutable through Eloquent', function (): void {
+it('keeps account paths immutable while allowing same-account thread state changes', function (): void {
     $first = account('first-immutable-account');
     $second = account('second-immutable-account');
     $thread = MailThread::query()->create(['mail_account_id' => $first->id, 'provider_thread_id' => 'immutable-thread']);
@@ -317,17 +305,23 @@ it('keeps account and parent paths immutable through Eloquent', function (): voi
         'mail_account_id' => $first->id,
         'mail_thread_id' => $thread->id,
         'provider_message_id' => 'immutable-message',
-        'provider_occurrence_id' => 'immutable-occurrence',
     ]);
 
     $thread->mail_account_id = $second->id;
     expect(fn () => $thread->save())->toThrow(LogicException::class);
 
     $message->mail_thread_id = null;
-    expect(fn () => $message->save())->toThrow(LogicException::class);
+    $message->save();
+    $secondThread = MailThread::query()->create([
+        'mail_account_id' => $second->id,
+        'provider_thread_id' => 'cross-account-thread',
+    ]);
+    $message->mail_thread_id = $secondThread->id;
+
+    expect(fn () => $message->save())->toThrow(QueryException::class);
 });
 
-it('fails closed for unknown drivers and invalid sync lifecycle transitions', function (): void {
+it('fails closed for unknown drivers', function (): void {
     expect(fn () => DB::table('mail_accounts')->insert([
         'driver' => 'imap',
         'provider_account_id' => 'unknown-driver-account',
@@ -335,43 +329,4 @@ it('fails closed for unknown drivers and invalid sync lifecycle transitions', fu
         'updated_at' => now(),
     ]))->toThrow(QueryException::class);
 
-    $account = account('lifecycle-account');
-    expect(fn () => MailSyncRun::query()->create([
-        'mail_account_id' => $account->id,
-        'status' => SyncRunStatus::Running,
-        'operation' => 'inventory',
-    ]))->toThrow(LogicException::class);
-
-    $run = MailSyncRun::query()->create([
-        'mail_account_id' => $account->id,
-        'status' => SyncRunStatus::Pending,
-        'operation' => 'inventory',
-    ]);
-    expect(fn () => $run->transitionTo(SyncRunStatus::Completed))->toThrow(LogicException::class);
-
-    $run->status = SyncRunStatus::Running;
-    expect(fn () => $run->save())->toThrow(LogicException::class, 'transitionTo');
-
-    $run->refresh();
-    $run->transitionTo(SyncRunStatus::Running);
-    $run->transitionTo(SyncRunStatus::Completed);
-
-    expect($run->refresh()->status)->toBe(SyncRunStatus::Completed)
-        ->and(fn () => $run->transitionTo(SyncRunStatus::Running))->toThrow(LogicException::class);
-});
-
-it('rejects a stale sync lifecycle transition', function (): void {
-    $account = account('concurrent-lifecycle-account');
-    $run = MailSyncRun::query()->create([
-        'mail_account_id' => $account->id,
-        'status' => SyncRunStatus::Pending,
-        'operation' => 'inventory',
-    ]);
-    $first = MailSyncRun::query()->findOrFail($run->id);
-    $stale = MailSyncRun::query()->findOrFail($run->id);
-
-    $first->transitionTo(SyncRunStatus::Running);
-
-    expect(fn () => $stale->transitionTo(SyncRunStatus::Running))
-        ->toThrow(LogicException::class, 'changed before this transition');
 });

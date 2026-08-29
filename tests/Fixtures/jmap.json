@@ -1,6 +1,5 @@
 {
     "provider_message_id": "jmap-email-synthetic-001",
-    "provider_occurrence_id": "jmap-occurrence-synthetic-001",
     "provider_thread_id": "jmap-thread-synthetic-001",
     "subject": "Synthetic project update",
     "headers": [{"name": "X-JMAP-Synthetic", "value": "true"}],

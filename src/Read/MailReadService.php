@@ -11,18 +11,31 @@ final readonly class MailReadService
 {
     public function __construct(private MailDriverRegistry $drivers) {}
 
-    /** @return list<MessageReference> */
-    public function inventory(MailAccount $account): array
+    public function inventoryPage(MailAccount $account, ?string $cursor = null): InventoryPage
     {
         $reader = $this->drivers->reader($account->driver);
-        $references = [];
+        $page = $reader->inventoryPage($account, $cursor);
+        $maximum = config('mail-mirror.inventory_page_max_messages', 500);
 
-        foreach ($reader->inventory($account) as $reference) {
-            $this->assertReferenceBelongsTo($account, $reference);
-            $references[] = $reference;
+        if (! is_int($maximum) || $maximum < 1) {
+            $maximum = 500;
         }
 
-        return $references;
+        if (count($page->messages) + count($page->deletions) > $maximum) {
+            throw new InvalidArgumentException('The provider inventory page exceeds the configured resource limit.');
+        }
+
+        foreach ($page->messages as $reference) {
+            $this->assertReferenceBelongsTo($account, $reference);
+        }
+
+        foreach ($page->deletions as $deletion) {
+            if ($deletion->mailAccountId !== $account->getKey()) {
+                throw new InvalidArgumentException('The provider deletion evidence does not belong to the supplied mail account.');
+            }
+        }
+
+        return $page;
     }
 
     public function retrieve(MailAccount $account, MessageReference $message): RetrievedMessage

@@ -173,6 +173,26 @@ final class MailObjectStorage
                     return $existing;
                 }
 
+                $placeholder = MailAttachment::query()
+                    ->forAccount($account)
+                    ->where('mail_message_id', $message->id)
+                    ->where('provider_attachment_id', $attributes['provider_attachment_id'])
+                    ->whereNull('source_part_id')
+                    ->first();
+
+                if ($placeholder !== null) {
+                    MailAttachment::query()->whereKey($placeholder->id)->update($attributes);
+                    $attachment = $placeholder->fresh();
+
+                    if (! $attachment instanceof MailAttachment) {
+                        throw new MailObjectException('Attachment storage could not be persisted.');
+                    }
+
+                    $this->placeCanonicalObject($disk, $staged['stream'], $key, $staged['checksum'], $staged['byte_size']);
+
+                    return $attachment;
+                }
+
                 $attachment = MailAttachment::query()->create($attributes + [
                     'mail_account_id' => $account->id,
                     'mail_message_id' => $message->id,
@@ -209,6 +229,22 @@ final class MailObjectStorage
         $raw = $this->matchedRaw($account, $raw);
 
         return $this->verifiedStream($raw);
+    }
+
+    public function cleanupRolledBackRaw(MailAccount $account, string $objectKey): void
+    {
+        $prefix = "mail-mirror/accounts/{$account->id}/messages/";
+
+        if (! str_starts_with($objectKey, $prefix)) {
+            throw new AccountResourceMismatch('The rollback object does not belong to the supplied account.');
+        }
+
+        $referenced = MailRawObject::query()->forAccount($account)
+            ->where('object_key', $objectKey)->exists();
+
+        if (! $referenced) {
+            $this->filesystems->disk($this->diskName())->delete($objectKey);
+        }
     }
 
     /** @return resource */
