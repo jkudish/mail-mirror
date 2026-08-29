@@ -137,8 +137,14 @@ final readonly class MailImportEngine
                 throw new StaleCheckpoint;
             }
 
+            $previousScanId = $checkpoint->scan_id;
+            $nextScanId = (string) Str::uuid();
+            MailProviderDeletionEvidence::query()->forAccount($account)
+                ->where('scan_id', $previousScanId)
+                ->update(['scan_id' => $nextScanId]);
+
             $checkpoint->forceFill([
-                'scan_id' => (string) Str::uuid(),
+                'scan_id' => $nextScanId,
                 'provider_cursor' => $cursor,
                 'version' => $checkpoint->version + 1,
                 'processed_count' => 0,

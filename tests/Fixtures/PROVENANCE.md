@@ -33,3 +33,14 @@ IDs, pagination token, and timestamps are fictional; all addresses use reserved
 `.test` domains. Tests combine it with the already synthetic RFC822 fixture and
 Laravel HTTP fakes. No fixture contains an OAuth code, client secret, access
 token, refresh token, personal data, or provider-derived mailbox content.
+
+`jmap-driver.json` and the JMAP driver test responses were invented for task
+#3207 on 2026-08-29. They are compact synthetic JMAP-shaped data, not recorded,
+downloaded, transformed, or structurally copied mailbox responses. All account,
+session, state, query, message, thread, mailbox, identity, blob, part, and
+pagination IDs are fictional. Tests combine them with the synthetic RFC822
+fixture and Laravel HTTP fakes while stray requests are prohibited. No fixture
+contains an API token, provider-derived mailbox content, or personal data.
+The RFC 8621 null-array, empty-keyword, and empty-content cases are original
+minimal examples written from the public field contracts; they are not copied
+from a provider response or mailbox.
