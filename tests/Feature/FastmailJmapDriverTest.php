@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Sleep;
 use Jkudish\MailMirror\Credentials\ApiTokenCredential;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
+use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
 use Jkudish\MailMirror\Enums\ConnectionStatus;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
@@ -16,6 +17,7 @@ use Jkudish\MailMirror\Jmap\FastmailJmapMailboxReader;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAttachment;
 use Jkudish\MailMirror\Models\MailIdentity;
+use Jkudish\MailMirror\Models\MailInventoryItem;
 use Jkudish\MailMirror\Models\MailMessage;
 use Jkudish\MailMirror\Models\MailMessageContainerMembership;
 use Jkudish\MailMirror\Models\MailProviderDeletionEvidence;
@@ -28,6 +30,27 @@ use Jkudish\MailMirror\Read\MessageReference;
 final class JmapRequestState
 {
     public bool $reject = false;
+}
+
+final class JmapInventoryState
+{
+    public bool $changes = false;
+
+    public bool $excludeChangedFromFull = false;
+
+    public ?string $emailState = null;
+
+    public ?int $mutateAtPosition = null;
+
+    public ?string $changesOldState = null;
+
+    public bool $stalledChanges = false;
+
+    public int $queryPositionOffset = 0;
+
+    public string $sessionState = 'jmap-session-state-3207';
+
+    public ?string $nextResponseSessionState = null;
 }
 
 /** @return array<string, mixed> */
@@ -57,9 +80,9 @@ function jmapAccount(string $owner = 'owner-one'): MailAccount
  * @param  array<string, mixed>  $result
  * @return array<string, mixed>
  */
-function jmapResponse(string $method, array $result, string $callId): array
+function jmapResponse(string $method, array $result, string $callId, string $sessionState = 'jmap-session-state-3207'): array
 {
-    return ['methodResponses' => [[$method, $result, $callId]], 'sessionState' => 'jmap-session-state-3207'];
+    return ['methodResponses' => [[$method, $result, $callId]], 'sessionState' => $sessionState];
 }
 
 /**
@@ -75,19 +98,37 @@ function jmapFixturePart(array $fixture, string $key): array
     return $part;
 }
 
+/** @param array<string, int> $calls */
+function jmapCallCount(array $calls, string $key): int
+{
+    return $calls[$key] ?? 0;
+}
+
 /**
  * @param  array<string, mixed>  $fixture
  * @param  array<string, int>  $calls
  */
-function fakeJmap(array $fixture, array &$calls, bool $changes = false): void
-{
+function fakeJmap(
+    array $fixture,
+    array &$calls,
+    bool $changes = false,
+    ?JmapInventoryState $inventoryState = null,
+): void {
     $raw = (string) file_get_contents(__DIR__.'/../Fixtures/synthetic-message.eml');
+    $state = $inventoryState ?? new JmapInventoryState;
 
-    Http::fake(function (Request $request) use ($fixture, &$calls, $changes, $raw) {
+    if ($inventoryState === null) {
+        $state->changes = $changes;
+    }
+
+    Http::fake(function (Request $request) use ($fixture, &$calls, $state, $raw) {
         if ($request->method() === 'GET' && $request->url() === 'https://api.fastmail.com/jmap/session') {
             $calls['Session/get'] = ($calls['Session/get'] ?? 0) + 1;
 
-            return Http::response(jmapFixturePart($fixture, 'session'));
+            $session = jmapFixturePart($fixture, 'session');
+            $session['state'] = $state->sessionState;
+
+            return Http::response($session);
         }
 
         if ($request->method() === 'GET' && str_contains($request->url(), '/jmap/download/')) {
@@ -106,39 +147,55 @@ function fakeJmap(array $fixture, array &$calls, bool $changes = false): void
         $callId = $nativeCall[2] ?? null;
         assert(is_string($method) && is_array($arguments) && is_string($callId));
         $calls[$method] = ($calls[$method] ?? 0) + 1;
+        $responseSessionState = $state->nextResponseSessionState ?? $state->sessionState;
+
+        if ($state->nextResponseSessionState !== null) {
+            $state->sessionState = $state->nextResponseSessionState;
+            $state->nextResponseSessionState = null;
+        }
 
         if ($method === 'Mailbox/get') {
-            return Http::response(jmapResponse($method, jmapFixturePart($fixture, 'mailboxes'), $callId));
+            return Http::response(jmapResponse($method, jmapFixturePart($fixture, 'mailboxes'), $callId, $responseSessionState));
         }
 
         if ($method === 'Identity/get') {
-            return Http::response(jmapResponse($method, jmapFixturePart($fixture, 'identities'), $callId));
+            return Http::response(jmapResponse($method, jmapFixturePart($fixture, 'identities'), $callId, $responseSessionState));
         }
 
         if ($method === 'Email/changes') {
-            $result = $changes
-                ? ['accountId' => 'jmap-account-synthetic-3207', 'oldState' => $arguments['sinceState'], 'newState' => 'jmap-email-state-2', 'hasMoreChanges' => false, 'created' => [], 'updated' => ['jmap-email-a'], 'destroyed' => ['jmap-email-gone']]
+            $sinceState = $arguments['sinceState'] ?? null;
+            assert(is_string($sinceState));
+            $calls['Email/changes:since:'.$sinceState] = 1;
+            $result = $state->changes
+                ? ['accountId' => 'jmap-account-synthetic-3207', 'oldState' => $state->changesOldState ?? $sinceState, 'newState' => $state->stalledChanges ? $sinceState : 'jmap-email-state-2', 'hasMoreChanges' => $state->stalledChanges, 'created' => [], 'updated' => ['jmap-email-a'], 'destroyed' => ['jmap-email-gone']]
                 : ['accountId' => 'jmap-account-synthetic-3207', 'oldState' => $arguments['sinceState'], 'newState' => 'jmap-email-state-1', 'hasMoreChanges' => false, 'created' => [], 'updated' => [], 'destroyed' => []];
 
-            return Http::response(jmapResponse($method, $result, $callId));
+            return Http::response(jmapResponse($method, $result, $callId, $responseSessionState));
         }
 
         if ($method === 'Email/query') {
             $position = $arguments['position'] ?? 0;
-            $ids = match ($position) {
-                0 => ['jmap-email-a'],
-                1 => ['jmap-email-a'],
-                default => ['jmap-email-draft'],
-            };
+            assert(is_int($position));
+            if ($state->mutateAtPosition === $position) {
+                $state->emailState = 'jmap-email-state-during-full';
+            }
+            $exclude = $state->excludeChangedFromFull;
+            $ids = $exclude
+                ? ($position === 0 ? ['jmap-email-draft'] : [])
+                : match ($position) {
+                    0 => ['jmap-email-a'],
+                    1 => ['jmap-email-a'],
+                    default => ['jmap-email-draft'],
+                };
 
             return Http::response(jmapResponse($method, [
                 'accountId' => 'jmap-account-synthetic-3207',
                 'queryState' => 'jmap-query-state-1',
                 'canCalculateChanges' => true,
-                'position' => $position,
+                'position' => $position + $state->queryPositionOffset,
                 'ids' => $ids,
-                'total' => 3,
-            ], $callId));
+                'total' => $exclude ? 1 : 3,
+            ], $callId, $responseSessionState));
         }
 
         if ($method === 'Email/get') {
@@ -146,6 +203,10 @@ function fakeJmap(array $fixture, array &$calls, bool $changes = false): void
             assert(is_array($ids) && array_filter($ids, fn (mixed $id): bool => ! is_string($id)) === []);
             $properties = $arguments['properties'] ?? [];
             assert(is_array($properties));
+            $exclude = $state->excludeChangedFromFull;
+            if ($exclude && $properties === ['id', 'threadId'] && $ids === ['jmap-email-a']) {
+                $calls['delta-candidate-get'] = ($calls['delta-candidate-get'] ?? 0) + 1;
+            }
             $emails = jmapFixturePart($fixture, 'emails');
             $list = [];
 
@@ -174,10 +235,11 @@ function fakeJmap(array $fixture, array &$calls, bool $changes = false): void
 
             return Http::response(jmapResponse($method, [
                 'accountId' => 'jmap-account-synthetic-3207',
-                'state' => $changes ? 'jmap-email-state-2' : 'jmap-email-state-1',
+                'state' => $state->emailState
+                    ?? ($state->changes ? 'jmap-email-state-2' : 'jmap-email-state-1'),
                 'list' => $list,
                 'notFound' => array_values(array_diff($ids, $foundIds)),
-            ], $callId));
+            ], $callId, $responseSessionState));
         }
 
         if ($method === 'Thread/get') {
@@ -192,7 +254,7 @@ function fakeJmap(array $fixture, array &$calls, bool $changes = false): void
                 'state' => 'jmap-thread-state-1',
                 'list' => $list,
                 'notFound' => [],
-            ], $callId));
+            ], $callId, $responseSessionState));
         }
 
         return Http::response(['synthetic' => 'unexpected'], 500);
@@ -226,14 +288,65 @@ it('registers the production JMAP reader and cannot contact Fastmail unless expl
 });
 
 it('keeps the direct-only live lane unreachable without its explicit opt-in', function (): void {
+    $docs = (string) file_get_contents(__DIR__.'/../../docs/fastmail-jmap-live-development.md');
+    putenv('MAIL_MIRROR_JMAP_ENABLED=1');
+    $packageConfig = require __DIR__.'/../../config/mail-mirror.php';
+    assert(is_array($packageConfig));
+    $jmapConfig = $packageConfig['jmap'] ?? null;
+    assert(is_array($jmapConfig));
+    putenv('MAIL_MIRROR_JMAP_ENABLED');
     $command = sprintf('env -u MAIL_MIRROR_JMAP_LIVE_OPT_IN %s %s 2>&1',
         escapeshellarg(PHP_BINARY),
         escapeshellarg(__DIR__.'/../../scripts/fastmail-jmap-live-development-check.php'),
     );
     exec($command, $output, $exitCode);
 
-    expect($exitCode)->toBe(2)
+    expect($jmapConfig['enabled'] ?? null)->toBeTrue()
+        ->and($docs)->toContain('APP_ENV=local \\')
+        ->and($docs)->toContain('MAIL_MIRROR_JMAP_ENABLED=1 \\')
+        ->and($docs)->toContain('MAIL_MIRROR_JMAP_LIVE_'.'OPT_IN='."'I_UNDERSTAND_THIS_CONTACTS_FASTMAIL'".' \\')
+        ->and($exitCode)->toBe(2)
         ->and(implode("\n", $output))->toContain('explicit live-provider opt-in is required');
+});
+
+it('accepts RFC 8621 nullable arrays, empty keyword maps, and empty content strings', function (): void {
+    $fixture = jmapFixture();
+    $account = jmapAccount();
+    $calls = [];
+    fakeJmap($fixture, $calls);
+    $reader = app(FastmailJmapMailboxReader::class);
+
+    $resources = $reader->inventoryPage($account, null);
+    $identity = collect($resources->identities)
+        ->firstWhere('providerIdentityId', 'jmap-identity-rfc-empty');
+    $message = $reader->retrieve($account, new MessageReference(
+        $account->id,
+        MailDriver::Jmap,
+        'jmap-email-rfc-null',
+        'jmap-thread-rfc-null',
+    ));
+
+    try {
+        expect($identity)->not->toBeNull()
+            ->and($identity?->displayName)->toBe('')
+            ->and($identity?->providerMetadata)->toMatchArray([
+                'reply_to' => [],
+                'bcc' => [],
+                'text_signature' => '',
+                'html_signature' => '',
+            ])
+            ->and($message->subject)->toBe('')
+            ->and($message->internetMessageId)->toBeNull()
+            ->and($message->participants)->toBe([])
+            ->and($message->providerMetadata)->toMatchArray([
+                'keywords' => [],
+                'preview' => '',
+            ]);
+    } finally {
+        if (is_resource($message->rawSource?->stream)) {
+            fclose($message->rawSource->stream);
+        }
+    }
 });
 
 it('imports complete paginated JMAP state and converges duplicate delivery after crash resume', function (): void {
@@ -246,7 +359,7 @@ it('imports complete paginated JMAP state and converges duplicate delivery after
     $durable = MailSyncCheckpoint::query()->forAccount($account)->firstOrFail();
     expect($durable->provider_cursor)->not->toBeNull()
         ->and($durable->processed_count)->toBe(0)
-        ->and(MailIdentity::query()->forAccount($account)->count())->toBe(1);
+        ->and(MailIdentity::query()->forAccount($account)->count())->toBe(2);
 
     $report = app(MailImportEngine::class)->sync($account);
     $draft = MailMessage::query()->forAccount($account)->where('provider_message_id', 'jmap-email-draft')->firstOrFail();
@@ -273,7 +386,7 @@ it('imports complete paginated JMAP state and converges duplicate delivery after
             'mailbox_state' => 'jmap-mailbox-state-1',
             'identity_state' => 'jmap-identity-state-1',
         ])
-        ->and($calls['Session/get'])->toBe(1)
+        ->and($calls['Session/get'])->toBeGreaterThanOrEqual(4)
         ->and($calls['Blob/download'])->toBeGreaterThanOrEqual(2);
 });
 
@@ -291,6 +404,130 @@ it('uses opaque Email changes for deletion evidence then performs an authoritati
         ->and(MailProviderDeletionEvidence::query()->forAccount($account)->where('provider_message_id', 'jmap-email-gone')->value('proof_code'))
         ->toBe('jmap_email_destroyed')
         ->and($account->refresh()->provider_metadata['email_state'] ?? null)->toBe('jmap-email-state-2');
+});
+
+it('uses Email changes only for evidence and excludes a changed message absent from full inventory', function (): void {
+    $fixture = jmapFixture();
+    $account = jmapAccount();
+    $calls = [];
+    $state = new JmapInventoryState;
+    fakeJmap($fixture, $calls, inventoryState: $state);
+    app(MailImportEngine::class)->sync($account);
+
+    $calls = [];
+    $state->changes = true;
+    $state->excludeChangedFromFull = true;
+    $report = app(MailImportEngine::class)->sync($account);
+
+    expect(jmapCallCount($calls, 'Email/changes:since:jmap-email-state-1'))->toBe(1)
+        ->and(jmapCallCount($calls, 'delta-candidate-get'))->toBe(0)
+        ->and($report?->inventory_count)->toBe(1)
+        ->and($report?->mirrored_count)->toBe(1)
+        ->and($report?->unexpected_active_count)->toBe(1)
+        ->and($report?->summary['unexpected_active'])->toBe([
+            'sample' => ['jmap-email-a'],
+            'truncated' => false,
+        ])
+        ->and(MailInventoryItem::query()->forAccount($account)
+            ->where('provider_message_id', 'jmap-email-a')
+            ->value('scan_id'))->not->toBe($report?->scan_id);
+});
+
+it('keeps the pre-full Email state baseline so changes during pagination replay next sync', function (): void {
+    $fixture = jmapFixture();
+    $account = jmapAccount();
+    $calls = [];
+    $state = new JmapInventoryState;
+    $state->emailState = 'jmap-email-state-before-full';
+    $state->mutateAtPosition = 2;
+    fakeJmap($fixture, $calls, inventoryState: $state);
+
+    app(MailImportEngine::class)->sync($account);
+
+    expect($account->refresh()->provider_metadata['email_state'] ?? null)
+        ->toBe('jmap-email-state-before-full');
+
+    $calls = [];
+    $state->changes = true;
+    $state->mutateAtPosition = null;
+    expect(app(MailImportEngine::class)->sync($account, 2))->toBeNull()
+        ->and(jmapCallCount($calls, 'Email/changes:since:jmap-email-state-before-full'))->toBe(1);
+});
+
+it('rejects malformed Email changes and query progression', function (string $malformation): void {
+    $fixture = jmapFixture();
+    $account = jmapAccount();
+    $calls = [];
+    $state = new JmapInventoryState;
+
+    if ($malformation === 'old-state') {
+        $account->forceFill(['provider_metadata' => ['email_state' => 'jmap-email-state-old']])->save();
+        $state->changes = true;
+        $state->changesOldState = 'jmap-email-state-wrong';
+    } elseif ($malformation === 'stalled-changes') {
+        $account->forceFill(['provider_metadata' => ['email_state' => 'jmap-email-state-old']])->save();
+        $state->changes = true;
+        $state->stalledChanges = true;
+    } else {
+        $state->queryPositionOffset = 1;
+    }
+
+    fakeJmap($fixture, $calls, inventoryState: $state);
+
+    try {
+        app(MailImportEngine::class)->sync($account);
+        throw new RuntimeException('Malformed JMAP progression was accepted.');
+    } catch (MailImportFailure $failure) {
+        expect($failure->safeCode)->toBe(MailImportCode::StateMismatch);
+    }
+})->with(['old-state', 'stalled-changes', 'query-position']);
+
+it('refreshes changed Session state in the same reader and restarts without stale inventory effects', function (): void {
+    $fixture = jmapFixture();
+    $account = jmapAccount();
+    $calls = [];
+    $state = new JmapInventoryState;
+    fakeJmap($fixture, $calls, inventoryState: $state);
+    $engine = app(MailImportEngine::class);
+
+    expect($engine->sync($account, 1))->toBeNull();
+    $firstCheckpoint = MailSyncCheckpoint::query()->forAccount($account)->firstOrFail();
+    $firstScan = $firstCheckpoint->scan_id;
+
+    $state->nextResponseSessionState = 'jmap-session-state-refreshed';
+    expect($engine->sync($account, 1))->toBeNull();
+    $restarted = MailSyncCheckpoint::query()->forAccount($account)->firstOrFail();
+
+    expect($restarted->scan_id)->not->toBe($firstScan)
+        ->and($restarted->provider_cursor)->not->toBeNull()
+        ->and(MailInventoryItem::query()->forAccount($account)->count())->toBe(0)
+        ->and(MailMessage::query()->forAccount($account)->count())->toBe(0)
+        ->and($account->refresh()->provider_metadata['session_state'] ?? null)->toBe('jmap-session-state-refreshed')
+        ->and($calls['Session/get'] ?? 0)->toBeGreaterThanOrEqual(4);
+});
+
+it('preserves a wrong local credential type without destructive revocation', function (): void {
+    $account = MailAccount::query()->create([
+        'owner_type' => 'synthetic-workspace',
+        'owner_id' => 'wrong-credential-owner',
+        'driver' => MailDriver::Jmap,
+        'provider_account_id' => 'jmap-account-synthetic-3207',
+    ]);
+    $stored = app(MailAccountConnection::class)->store(
+        $account,
+        new OAuthTokenSetCredential('synthetic-oauth-token-3207'),
+    );
+    $before = $stored->only(['encrypted_payload', 'status', 'version']);
+
+    try {
+        app(FastmailJmapMailboxReader::class)->inventoryPage($account, null);
+        throw new RuntimeException('A wrong local credential type was accepted.');
+    } catch (MailImportFailure $failure) {
+        expect($failure->safeCode)->toBe(MailImportCode::PermissionDenied);
+    }
+
+    expect($stored->refresh()->only(['encrypted_payload', 'status', 'version']))->toBe($before);
+    Http::assertNothingSent();
 });
 
 it('recovers from changed query state with one fresh scan and resumes its durable cursor', function (): void {
@@ -388,6 +625,12 @@ it('bounds Retry-After retries and revokes a rejected API token without exposing
         return match ($method) {
             'Mailbox/get' => Http::response(jmapResponse($method, jmapFixturePart($fixture, 'mailboxes'), $callId)),
             'Identity/get' => Http::response(jmapResponse($method, jmapFixturePart($fixture, 'identities'), $callId)),
+            'Email/get' => Http::response(jmapResponse($method, [
+                'accountId' => 'jmap-account-synthetic-3207',
+                'state' => 'jmap-email-state-1',
+                'list' => [],
+                'notFound' => [],
+            ], $callId)),
             default => Http::response([], 500),
         };
     });

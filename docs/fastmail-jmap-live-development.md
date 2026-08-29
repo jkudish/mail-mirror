@@ -22,6 +22,9 @@ enable the JMAP driver, set the live opt-in environment variable to the exact
 acknowledgement required by the script, and supply these non-secret locators:
 
 ```bash
+APP_ENV=local \
+MAIL_MIRROR_JMAP_ENABLED=1 \
+MAIL_MIRROR_JMAP_LIVE_OPT_IN='I_UNDERSTAND_THIS_CONTACTS_FASTMAIL' \
 MAIL_MIRROR_JMAP_CONSUMER_ROOT=/absolute/path/to/disposable-consumer \
 MAIL_MIRROR_JMAP_ACCOUNT_ID='<non-secret database ID>' \
 MAIL_MIRROR_JMAP_OWNER_TYPE='<consumer morph type>' \

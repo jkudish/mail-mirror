@@ -61,7 +61,7 @@ final class FastmailJmapMailboxReader implements MailboxReader
     public function inventoryPage(MailAccount $account, ?string $cursor): InventoryPage
     {
         $this->assertAccount($account);
-        $session = $this->session($account);
+        $session = $this->session($account, true);
         $state = $cursor === null ? null : $this->decodeCursor($cursor);
 
         if ($state === null || $state['phase'] === 'resources') {
@@ -144,7 +144,7 @@ final class FastmailJmapMailboxReader implements MailboxReader
                 $threadId,
                 $message->providerMetadata,
             ),
-            subject: $this->optionalBoundedString($email['subject'] ?? null, 255, MailImportStage::Retrieve),
+            subject: $this->optionalBoundedContentString($email['subject'] ?? null, 255, MailImportStage::Retrieve),
             internetMessageId: $messageIds[0] ?? null,
             headers: $headers,
             participants: $this->participants($email),
@@ -156,7 +156,7 @@ final class FastmailJmapMailboxReader implements MailboxReader
                 'keywords' => $keywords,
                 'mailbox_ids' => $mailboxIds,
                 'has_attachment' => ($email['hasAttachment'] ?? false) === true,
-                'preview' => $this->optionalBoundedString($email['preview'] ?? null, 1024, MailImportStage::Retrieve),
+                'preview' => $this->optionalBoundedContentString($email['preview'] ?? null, 1024, MailImportStage::Retrieve),
                 'draft' => isset($keywords['$draft']),
                 'email_state' => $emailState,
             ],
@@ -198,7 +198,10 @@ final class FastmailJmapMailboxReader implements MailboxReader
             'phase' => is_string($previousState) && $previousState !== '' ? 'changes' : 'full',
             'account_id' => $account->provider_account_id,
             'session_state' => $session['session_state'],
-            'state' => is_string($previousState) ? $previousState : null,
+            'email_state' => is_string($previousState) && $previousState !== ''
+                ? $previousState
+                : $this->currentEmailState($account, $session),
+            'query_state' => null,
             'position' => 0,
         ];
 
@@ -217,19 +220,19 @@ final class FastmailJmapMailboxReader implements MailboxReader
 
     /**
      * @param  array{api_url: string, download_url: string, session_state: string}  $session
-     * @param  array{phase: string, account_id: string, session_state: string, state: string|null, position: int}  $cursor
+     * @param  array{phase: string, account_id: string, session_state: string, email_state: string|null, query_state: string|null, position: int}  $cursor
      */
     private function changesPage(MailAccount $account, array $session, array $cursor): InventoryPage
     {
         try {
             $result = $this->call($account, $session, 'Email/changes', [
                 'accountId' => $account->provider_account_id,
-                'sinceState' => $cursor['state'],
+                'sinceState' => $cursor['email_state'],
                 'maxChanges' => $this->resourceLimit(),
             ], 'changes', MailImportStage::Inventory);
         } catch (MailImportFailure $failure) {
             if (in_array($failure->safeCode, [MailImportCode::HistoryExpired, MailImportCode::StateMismatch], true)) {
-                return new InventoryPage([], $this->fullCursor($account, $session), false);
+                return new InventoryPage([], $this->freshFullCursor($account, $session), false);
             }
 
             throw $failure;
@@ -238,19 +241,27 @@ final class FastmailJmapMailboxReader implements MailboxReader
         $created = $this->stringList($result['created'] ?? [], 255, MailImportStage::Inventory);
         $updated = $this->stringList($result['updated'] ?? [], 255, MailImportStage::Inventory);
         $destroyed = $this->stringList($result['destroyed'] ?? [], 255, MailImportStage::Inventory);
+        $oldState = $this->boundedString($result['oldState'] ?? null, 255, MailImportStage::Inventory);
         $changedIds = array_values(array_unique(array_merge($created, $updated)));
         $destroyed = array_values(array_diff(array_unique($destroyed), $changedIds));
 
-        if (count($changedIds) + count($destroyed) > $this->resourceLimit()) {
-            throw new InventoryRestartRequired($this->fullCursor($account, $session));
+        if ($oldState !== $cursor['email_state']) {
+            throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::StateMismatch);
         }
 
-        $references = $this->referencesForIds($account, $session, $changedIds, 'changed');
+        if (count($changedIds) + count($destroyed) > $this->resourceLimit()) {
+            throw new InventoryRestartRequired($this->freshFullCursor($account, $session));
+        }
+
         $newState = $this->boundedString($result['newState'] ?? null, 255, MailImportStage::Inventory);
         $hasMore = $result['hasMoreChanges'] ?? null;
 
         if (! is_bool($hasMore)) {
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
+        }
+
+        if ($hasMore && $newState === $oldState) {
+            throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::StateMismatch);
         }
 
         $deletions = array_map(fn (string $id): ProviderDeletionEvidence => new ProviderDeletionEvidence(
@@ -268,12 +279,13 @@ final class FastmailJmapMailboxReader implements MailboxReader
             'phase' => 'changes',
             'account_id' => $account->provider_account_id,
             'session_state' => $session['session_state'],
-            'state' => $newState,
+            'email_state' => $newState,
+            'query_state' => null,
             'position' => 0,
-        ] : $this->fullState($account, $session);
+        ] : $this->fullState($account, $session, $newState);
 
         return new InventoryPage(
-            $references,
+            [],
             $this->encodeCursor($next),
             false,
             $deletions,
@@ -284,7 +296,7 @@ final class FastmailJmapMailboxReader implements MailboxReader
 
     /**
      * @param  array{api_url: string, download_url: string, session_state: string}  $session
-     * @param  array{phase: string, account_id: string, session_state: string, state: string|null, position: int}  $cursor
+     * @param  array{phase: string, account_id: string, session_state: string, email_state: string|null, query_state: string|null, position: int}  $cursor
      */
     private function fullPage(MailAccount $account, array $session, array $cursor): InventoryPage
     {
@@ -296,9 +308,14 @@ final class FastmailJmapMailboxReader implements MailboxReader
         $ids = $this->stringList($result['ids'] ?? [], 255, MailImportStage::Inventory);
         $queryState = $this->boundedString($result['queryState'] ?? null, 255, MailImportStage::Inventory);
         $total = $this->nonNegativeInteger($result['total'] ?? null, MailImportStage::Inventory);
+        $responsePosition = $this->nonNegativeInteger($result['position'] ?? null, MailImportStage::Inventory);
 
-        if ($cursor['state'] !== null && $cursor['state'] !== $queryState) {
-            throw new InventoryRestartRequired($this->fullCursor($account, $session));
+        if ($responsePosition !== $cursor['position']) {
+            throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::StateMismatch);
+        }
+
+        if ($cursor['query_state'] !== null && $cursor['query_state'] !== $queryState) {
+            throw new InventoryRestartRequired($this->freshFullCursor($account, $session));
         }
 
         if (count($ids) > $this->pageSize()) {
@@ -308,7 +325,7 @@ final class FastmailJmapMailboxReader implements MailboxReader
         $references = $this->referencesForIds($account, $session, $ids, 'full');
         $position = $cursor['position'] + count($ids);
         $complete = $ids === [] || $position >= $total;
-        $emailState = $this->lastEmailState($account, $session, $ids);
+        $emailState = $this->boundedString($cursor['email_state'], 255, MailImportStage::Inventory);
         $profile = $this->profile($account, $session, ['email_state' => $emailState]);
 
         return new InventoryPage(
@@ -317,7 +334,8 @@ final class FastmailJmapMailboxReader implements MailboxReader
                 'phase' => 'full',
                 'account_id' => $account->provider_account_id,
                 'session_state' => $session['session_state'],
-                'state' => $queryState,
+                'email_state' => $emailState,
+                'query_state' => $queryState,
                 'position' => $position,
             ]),
             $complete,
@@ -364,31 +382,22 @@ final class FastmailJmapMailboxReader implements MailboxReader
 
     /**
      * @param  array{api_url: string, download_url: string, session_state: string}  $session
-     * @param  list<string>  $ids
      */
-    private function lastEmailState(MailAccount $account, array $session, array $ids): string
+    private function currentEmailState(MailAccount $account, array $session): string
     {
-        if ($ids === []) {
-            $result = $this->call($account, $session, 'Email/get', [
-                'accountId' => $account->provider_account_id,
-                'ids' => [],
-                'properties' => ['id'],
-            ], 'state', MailImportStage::Inventory);
-        } else {
-            $result = $this->call($account, $session, 'Email/get', [
-                'accountId' => $account->provider_account_id,
-                'ids' => [$ids[0]],
-                'properties' => ['id'],
-            ], 'state', MailImportStage::Inventory);
-        }
+        $result = $this->call($account, $session, 'Email/get', [
+            'accountId' => $account->provider_account_id,
+            'ids' => [],
+            'properties' => ['id'],
+        ], 'state', MailImportStage::Inventory);
 
         return $this->boundedString($result['state'] ?? null, 255, MailImportStage::Inventory);
     }
 
     /** @return array{api_url: string, download_url: string, session_state: string} */
-    private function session(MailAccount $account): array
+    private function session(MailAccount $account, bool $refresh = false): array
     {
-        if (isset($this->sessions[$account->id])) {
+        if (! $refresh && isset($this->sessions[$account->id])) {
             return $this->sessions[$account->id];
         }
 
@@ -416,11 +425,17 @@ final class FastmailJmapMailboxReader implements MailboxReader
         $this->assertFastmailUrl($apiUrl);
         $this->assertFastmailUrl($downloadUrl);
 
-        return $this->sessions[$account->id] = [
+        $session = [
             'api_url' => $apiUrl,
             'download_url' => $downloadUrl,
             'session_state' => $state,
         ];
+
+        if (($this->sessions[$account->id] ?? null) !== $session) {
+            unset($this->mailboxes[$account->id], $this->profileMetadata[$account->id]);
+        }
+
+        return $this->sessions[$account->id] = $session;
     }
 
     /**
@@ -434,6 +449,18 @@ final class FastmailJmapMailboxReader implements MailboxReader
             'using' => [self::CORE, self::MAIL, self::SUBMISSION],
             'methodCalls' => [[$method, $arguments, $callId]],
         ], $stage);
+        $responseSessionState = $this->boundedString($payload['sessionState'] ?? null, 255, $stage);
+
+        if ($responseSessionState !== $session['session_state']) {
+            $freshSession = $this->session($account, true);
+
+            if ($stage === MailImportStage::Inventory) {
+                throw new InventoryRestartRequired($this->resourceRestartCursor($account, $freshSession));
+            }
+
+            throw new MailImportFailure($stage, MailImportCode::StateMismatch, true);
+        }
+
         $responses = $payload['methodResponses'] ?? null;
         $response = is_array($responses) ? ($responses[0] ?? null) : null;
 
@@ -586,7 +613,6 @@ final class FastmailJmapMailboxReader implements MailboxReader
         }
 
         if (! $credential instanceof ApiTokenCredential) {
-            $this->revoke($account, $stored, $stage);
             throw new MailImportFailure($stage, MailImportCode::PermissionDenied);
         }
 
@@ -689,12 +715,12 @@ final class FastmailJmapMailboxReader implements MailboxReader
                 return new MailboxIdentity(
                     $this->boundedString($native['id'] ?? null, 255, MailImportStage::Inventory),
                     $this->boundedString($native['email'] ?? null, 255, MailImportStage::Inventory),
-                    $this->optionalBoundedString($native['name'] ?? null, 255, MailImportStage::Inventory),
+                    $this->optionalBoundedContentString($native['name'] ?? null, 255, MailImportStage::Inventory),
                     [
                         'reply_to' => $this->addressList($native['replyTo'] ?? [], MailImportStage::Inventory),
                         'bcc' => $this->addressList($native['bcc'] ?? [], MailImportStage::Inventory),
-                        'text_signature' => $this->optionalBoundedString($native['textSignature'] ?? null, 100000, MailImportStage::Inventory),
-                        'html_signature' => $this->optionalBoundedString($native['htmlSignature'] ?? null, 100000, MailImportStage::Inventory),
+                        'text_signature' => $this->optionalBoundedContentString($native['textSignature'] ?? null, 100000, MailImportStage::Inventory),
+                        'html_signature' => $this->optionalBoundedContentString($native['htmlSignature'] ?? null, 100000, MailImportStage::Inventory),
                     ],
                 );
             } catch (InvalidArgumentException) {
@@ -744,10 +770,10 @@ final class FastmailJmapMailboxReader implements MailboxReader
             $disposition = $this->optionalBoundedString($native['disposition'] ?? null, 255, MailImportStage::Retrieve);
             $attachments[] = array_filter([
                 'provider_id' => $partId,
-                'filename' => $this->optionalBoundedString($native['name'] ?? null, 255, MailImportStage::Retrieve),
+                'filename' => $this->optionalBoundedContentString($native['name'] ?? null, 255, MailImportStage::Retrieve),
                 'media_type' => $this->optionalBoundedString($native['type'] ?? null, 255, MailImportStage::Retrieve),
                 'byte_size' => $this->nonNegativeInteger($native['size'] ?? null, MailImportStage::Retrieve),
-                'content_id' => $this->optionalBoundedString($native['cid'] ?? null, 255, MailImportStage::Retrieve),
+                'content_id' => $this->optionalBoundedContentString($native['cid'] ?? null, 255, MailImportStage::Retrieve),
                 'is_inline' => $disposition === 'inline',
                 'provider_metadata' => ['blob_id' => $blobId, 'part_id' => $partId, 'disposition' => $disposition],
             ], fn (mixed $entry, string $key): bool => $key === 'provider_metadata' || $entry !== null, ARRAY_FILTER_USE_BOTH);
@@ -812,14 +838,14 @@ final class FastmailJmapMailboxReader implements MailboxReader
 
         return array_map(fn (mixed $address): array => is_array($address) ? [
             'email' => $this->boundedString($address['email'] ?? null, 255, $stage),
-            'name' => $this->optionalBoundedString($address['name'] ?? null, 255, $stage),
+            'name' => $this->optionalBoundedContentString($address['name'] ?? null, 255, $stage),
         ] : throw new MailImportFailure($stage, MailImportCode::MalformedPayload), $value);
     }
 
     /** @return array<string, true> */
     private function truthMap(mixed $value, MailImportStage $stage): array
     {
-        if (! is_array($value) || array_is_list($value) || count($value) > 10000) {
+        if (! is_array($value) || ($value !== [] && array_is_list($value)) || count($value) > 10000) {
             throw new MailImportFailure($stage, MailImportCode::MalformedPayload);
         }
 
@@ -900,6 +926,19 @@ final class FastmailJmapMailboxReader implements MailboxReader
         return $this->boundedString($value, $maximum, $stage);
     }
 
+    private function optionalBoundedContentString(mixed $value, int $maximum, MailImportStage $stage): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        if (! is_string($value) || mb_strlen($value) > $maximum) {
+            throw new MailImportFailure($stage, MailImportCode::MalformedPayload);
+        }
+
+        return $value;
+    }
+
     private function nonNegativeInteger(mixed $value, MailImportStage $stage): int
     {
         if (! is_int($value) || $value < 0) {
@@ -955,7 +994,7 @@ final class FastmailJmapMailboxReader implements MailboxReader
         );
     }
 
-    /** @return array{phase: string, account_id: string, session_state: string, state: string|null, position: int} */
+    /** @return array{phase: string, account_id: string, session_state: string, email_state: string|null, query_state: string|null, position: int} */
     private function decodeCursor(string $cursor): array
     {
         if (strlen($cursor) > 8192 || ! preg_match('/^[A-Za-z0-9_-]+$/', $cursor)) {
@@ -966,20 +1005,27 @@ final class FastmailJmapMailboxReader implements MailboxReader
         $state = is_string($decoded) ? json_decode($decoded, true) : null;
 
         if (! is_array($state) || ! in_array($state['phase'] ?? null, ['resources', 'changes', 'full'], true)
-            || ! is_string($state['account_id'] ?? null) || ! is_string($state['session_state'] ?? null)
-            || (! is_string($state['state'] ?? null) && ($state['state'] ?? null) !== null)
-            || ! is_int($state['position'] ?? null) || $state['position'] < 0) {
+            || ! is_string($state['account_id'] ?? null) || $state['account_id'] === ''
+            || ! is_string($state['session_state'] ?? null) || $state['session_state'] === ''
+            || (! is_string($state['email_state'] ?? null) && ($state['email_state'] ?? null) !== null)
+            || (! is_string($state['query_state'] ?? null) && ($state['query_state'] ?? null) !== null)
+            || ! is_int($state['position'] ?? null) || $state['position'] < 0
+            || ($state['phase'] === 'resources' && ($state['email_state'] !== null || $state['query_state'] !== null || $state['position'] !== 0))
+            || ($state['phase'] === 'changes' && (($state['email_state'] ?? '') === '' || $state['query_state'] !== null || $state['position'] !== 0))
+            || ($state['phase'] === 'full' && (($state['email_state'] ?? '') === ''
+                || ($state['position'] === 0 && $state['query_state'] !== null)
+                || ($state['position'] > 0 && ($state['query_state'] ?? '') === '')))) {
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::StateMismatch);
         }
 
-        /** @var array{phase: string, account_id: string, session_state: string, state: string|null, position: int} $state */
+        /** @var array{phase: string, account_id: string, session_state: string, email_state: string|null, query_state: string|null, position: int} $state */
         return $state;
     }
 
-    /** @param array{phase: string, account_id: string, session_state: string, state: string|null, position: int} $state */
+    /** @param array{phase: string, account_id: string, session_state: string, email_state: string|null, query_state: string|null, position: int} $state */
     private function encodeCursor(array $state): string
     {
-        foreach ([$state['account_id'], $state['session_state'], $state['state']] as $value) {
+        foreach ([$state['account_id'], $state['session_state'], $state['email_state'], $state['query_state']] as $value) {
             if ($value !== null && mb_strlen($value) > 255) {
                 throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
             }
@@ -990,23 +1036,24 @@ final class FastmailJmapMailboxReader implements MailboxReader
 
     /**
      * @param  array{api_url: string, download_url: string, session_state: string}  $session
-     * @return array{phase: string, account_id: string, session_state: string, state: null, position: int}
+     * @return array{phase: string, account_id: string, session_state: string, email_state: string, query_state: null, position: int}
      */
-    private function fullState(MailAccount $account, array $session): array
+    private function fullState(MailAccount $account, array $session, string $emailState): array
     {
         return [
             'phase' => 'full',
             'account_id' => $account->provider_account_id,
             'session_state' => $session['session_state'],
-            'state' => null,
+            'email_state' => $emailState,
+            'query_state' => null,
             'position' => 0,
         ];
     }
 
     /** @param array{api_url: string, download_url: string, session_state: string} $session */
-    private function fullCursor(MailAccount $account, array $session): string
+    private function freshFullCursor(MailAccount $account, array $session): string
     {
-        return $this->encodeCursor($this->fullState($account, $session));
+        return $this->encodeCursor($this->fullState($account, $session, $this->currentEmailState($account, $session)));
     }
 
     /** @param array{api_url: string, download_url: string, session_state: string} $session */
@@ -1016,7 +1063,8 @@ final class FastmailJmapMailboxReader implements MailboxReader
             'phase' => 'resources',
             'account_id' => $account->provider_account_id,
             'session_state' => $session['session_state'],
-            'state' => null,
+            'email_state' => null,
+            'query_state' => null,
             'position' => 0,
         ]);
     }

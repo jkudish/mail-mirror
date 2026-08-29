@@ -32,7 +32,8 @@
         "accountId": "jmap-account-synthetic-3207",
         "state": "jmap-identity-state-1",
         "list": [
-            {"id": "jmap-identity-primary", "name": "Synthetic Sender", "email": "sender@invented.test", "replyTo": [{"name": "Synthetic Replies", "email": "reply@invented.test"}], "bcc": [], "textSignature": "Synthetic signature", "htmlSignature": "<p>Synthetic signature</p>"}
+            {"id": "jmap-identity-primary", "name": "Synthetic Sender", "email": "sender@invented.test", "replyTo": [{"name": "Synthetic Replies", "email": "reply@invented.test"}], "bcc": [], "textSignature": "Synthetic signature", "htmlSignature": "<p>Synthetic signature</p>"},
+            {"id": "jmap-identity-rfc-empty", "name": "", "email": "empty@invented.test", "replyTo": null, "bcc": null, "textSignature": "", "htmlSignature": ""}
         ],
         "notFound": []
     },
@@ -73,9 +74,31 @@
             "from": [{"name": "Synthetic Sender", "email": "sender@invented.test"}],
             "to": [{"name": "Draft Recipient", "email": "recipient@invented.test"}],
             "cc": [], "bcc": [], "replyTo": [], "attachments": []
+        },
+        "jmap-email-rfc-null": {
+            "id": "jmap-email-rfc-null",
+            "blobId": "jmap-raw-blob-rfc-null",
+            "threadId": "jmap-thread-rfc-null",
+            "mailboxIds": {"jmap-mailbox-inbox": true},
+            "keywords": {},
+            "size": 128,
+            "receivedAt": "2026-08-03T12:00:00Z",
+            "sentAt": null,
+            "messageId": null,
+            "subject": "",
+            "preview": "",
+            "hasAttachment": false,
+            "sender": null,
+            "from": null,
+            "to": null,
+            "cc": null,
+            "bcc": null,
+            "replyTo": null,
+            "attachments": []
         }
     },
     "threads": {
-        "jmap-thread-one": {"id": "jmap-thread-one", "emailIds": ["jmap-email-a", "jmap-email-draft"]}
+        "jmap-thread-one": {"id": "jmap-thread-one", "emailIds": ["jmap-email-a", "jmap-email-draft"]},
+        "jmap-thread-rfc-null": {"id": "jmap-thread-rfc-null", "emailIds": ["jmap-email-rfc-null"]}
     }
 }

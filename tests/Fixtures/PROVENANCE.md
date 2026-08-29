@@ -41,3 +41,6 @@ session, state, query, message, thread, mailbox, identity, blob, part, and
 pagination IDs are fictional. Tests combine them with the synthetic RFC822
 fixture and Laravel HTTP fakes while stray requests are prohibited. No fixture
 contains an API token, provider-derived mailbox content, or personal data.
+The RFC 8621 null-array, empty-keyword, and empty-content cases are original
+minimal examples written from the public field contracts; they are not copied
+from a provider response or mailbox.
