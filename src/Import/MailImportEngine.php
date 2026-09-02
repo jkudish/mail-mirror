@@ -6,6 +6,7 @@ namespace Jkudish\MailMirror\Import;
 
 use Closure;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Sleep;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
@@ -63,6 +64,92 @@ final readonly class MailImportEngine
         }
 
         return $this->sync($account, $pageLimit, $afterDurablePage);
+    }
+
+    public function retryOpenFailures(
+        int $mailAccountId,
+        ?string $ownerType,
+        string|int|null $ownerId,
+        int $limit = 100,
+    ): int {
+        if ($limit < 1 || $limit > 500) {
+            throw new InvalidArgumentException('The retry limit must be between one and 500.');
+        }
+
+        try {
+            $account = MailAccount::query()->whereKey($mailAccountId)
+                ->where('owner_type', $ownerType)
+                ->where('owner_id', $ownerId === null ? null : (string) $ownerId)
+                ->firstOrFail();
+        } catch (ModelNotFoundException) {
+            throw new AccountResourceMismatch('The requested account does not match the supplied owner tuple.');
+        }
+
+        /** @var array<string, RetrievedMessage|MailImportFailure> $outcomes */
+        $outcomes = [];
+        /** @var list<string> $rollbackObjectKeys */
+        $rollbackObjectKeys = [];
+
+        try {
+            return $account->getConnection()->transaction(function () use ($account, $limit, &$outcomes, &$rollbackObjectKeys): int {
+                MailAccount::query()->whereKey($account->id)->lockForUpdate()->firstOrFail();
+                $checkpoint = MailSyncCheckpoint::query()->forAccount($account)
+                    ->lockForUpdate()
+                    ->first();
+
+                if ($checkpoint === null) {
+                    return 0;
+                }
+
+                if ($checkpoint->scan_completed_at !== null) {
+                    throw new InvalidArgumentException('Open failures may only be retried during an incomplete inventory scan.');
+                }
+
+                $checkpoint->forceFill(['version' => $checkpoint->version + 1])->save();
+
+                /** @var list<MessageReference> $references */
+                $references = MailInventoryItem::query()->forAccount($account)
+                    ->where('scan_id', $checkpoint->scan_id)
+                    ->whereExists(function (Builder $query): void {
+                        $query->selectRaw('1')
+                            ->from('mail_import_errors as errors')
+                            ->whereColumn('errors.mail_account_id', 'mail_inventory_items.mail_account_id')
+                            ->whereColumn('errors.provider_message_id', 'mail_inventory_items.provider_message_id')
+                            ->whereNull('errors.resolved_at');
+                    })
+                    ->orderBy('id')
+                    ->limit($limit)
+                    ->get()
+                    ->map(fn (MailInventoryItem $item): MessageReference => new MessageReference(
+                        $account->id,
+                        $account->driver,
+                        $item->provider_message_id,
+                        $item->provider_thread_id,
+                        $item->provider_metadata ?? [],
+                    ))
+                    ->values()
+                    ->all();
+
+                $outcomes = $this->retrieveReferences($account, $references);
+                $successful = 0;
+
+                foreach ($references as $reference) {
+                    $outcome = $outcomes[$reference->providerMessageId];
+                    $this->persistOutcome($account, $reference, $outcome, $rollbackObjectKeys);
+                    $successful += $outcome instanceof RetrievedMessage ? 1 : 0;
+                }
+
+                return $successful;
+            }, 1);
+        } catch (Throwable $failure) {
+            foreach ($rollbackObjectKeys as $objectKey) {
+                $this->objects->cleanupRolledBackRaw($account, $objectKey);
+            }
+
+            throw $failure;
+        } finally {
+            $this->closeRawSources($outcomes);
+        }
     }
 
     public function sync(
@@ -203,11 +290,20 @@ final readonly class MailImportEngine
     /** @return array<string, RetrievedMessage|MailImportFailure> */
     private function retrieve(MailAccount $account, InventoryPage $page): array
     {
+        return $this->retrieveReferences($account, $page->messages);
+    }
+
+    /**
+     * @param  list<MessageReference>  $references
+     * @return array<string, RetrievedMessage|MailImportFailure>
+     */
+    private function retrieveReferences(MailAccount $account, array $references): array
+    {
         $outcomes = [];
         $maxAttempts = config('mail-mirror.import_max_attempts', 3);
         $maxAttempts = is_int($maxAttempts) && $maxAttempts > 0 ? $maxAttempts : 3;
 
-        foreach ($page->messages as $reference) {
+        foreach ($references as $reference) {
             $attempt = 0;
 
             do {
@@ -274,6 +370,7 @@ final readonly class MailImportEngine
 
         try {
             return $account->getConnection()->transaction(function () use ($account, $expected, $page, $outcomes, &$rollbackObjectKeys): MailSyncCheckpoint {
+                $durableAccount = MailAccount::query()->whereKey($account->id)->lockForUpdate()->firstOrFail();
                 $checkpoint = MailSyncCheckpoint::query()->forAccount($account)
                     ->where('scan_id', $expected->scan_id)
                     ->where('version', $expected->version)
@@ -285,8 +382,6 @@ final readonly class MailImportEngine
                 }
 
                 if ($page->accountProfile !== null) {
-                    $durableAccount = MailAccount::query()->whereKey($account->id)->lockForUpdate()->firstOrFail();
-
                     if ($page->accountProfile->providerAccountId !== $durableAccount->provider_account_id) {
                         throw new AccountResourceMismatch('The provider profile does not match the durable account identity.');
                     }
@@ -327,38 +422,7 @@ final readonly class MailImportEngine
                     );
 
                     $outcome = $outcomes[$reference->providerMessageId];
-
-                    if ($outcome instanceof MailImportFailure) {
-                        $this->recordFailure($account, $reference->providerMessageId, $outcome);
-                    } else {
-                        $message = $this->hydrate($account, $reference, $outcome);
-
-                        if ($outcome->rawSource !== null) {
-                            $rawExisted = MailRawObject::query()->forAccount($account)
-                                ->where('mail_message_id', $message->id)->exists();
-                            $raw = $this->objects->storeRaw(
-                                $account,
-                                $message,
-                                $outcome->rawSource->stream,
-                                $outcome->rawSource->providerObjectId,
-                                $outcome->rawSource->mediaType,
-                                $outcome->rawSource->providerMetadata,
-                            );
-
-                            if (! $rawExisted && is_string($raw->object_key)) {
-                                $rollbackObjectKeys[] = $raw->object_key;
-                            }
-                        }
-
-                        MailImportError::query()->forAccount($account)
-                            ->where('provider_message_id', $reference->providerMessageId)
-                            ->whereNull('resolved_at')
-                            ->update(['resolved_at' => now()]);
-
-                        MailProviderDeletionEvidence::query()->forAccount($account)
-                            ->where('provider_message_id', $reference->providerMessageId)
-                            ->delete();
-                    }
+                    $this->persistOutcome($account, $reference, $outcome, $rollbackObjectKeys);
                 }
 
                 foreach ($page->deletions as $deletion) {
@@ -398,6 +462,48 @@ final readonly class MailImportEngine
 
             throw $failure;
         }
+    }
+
+    /** @param list<string> $rollbackObjectKeys */
+    private function persistOutcome(
+        MailAccount $account,
+        MessageReference $reference,
+        RetrievedMessage|MailImportFailure $outcome,
+        array &$rollbackObjectKeys,
+    ): void {
+        if ($outcome instanceof MailImportFailure) {
+            $this->recordFailure($account, $reference->providerMessageId, $outcome);
+
+            return;
+        }
+
+        $message = $this->hydrate($account, $reference, $outcome);
+
+        if ($outcome->rawSource !== null) {
+            $rawExisted = MailRawObject::query()->forAccount($account)
+                ->where('mail_message_id', $message->id)->exists();
+            $raw = $this->objects->storeRaw(
+                $account,
+                $message,
+                $outcome->rawSource->stream,
+                $outcome->rawSource->providerObjectId,
+                $outcome->rawSource->mediaType,
+                $outcome->rawSource->providerMetadata,
+            );
+
+            if (! $rawExisted && is_string($raw->object_key)) {
+                $rollbackObjectKeys[] = $raw->object_key;
+            }
+        }
+
+        MailImportError::query()->forAccount($account)
+            ->where('provider_message_id', $reference->providerMessageId)
+            ->whereNull('resolved_at')
+            ->update(['resolved_at' => now()]);
+
+        MailProviderDeletionEvidence::query()->forAccount($account)
+            ->where('provider_message_id', $reference->providerMessageId)
+            ->delete();
     }
 
     private function recordFailure(MailAccount $account, string $providerMessageId, MailImportFailure $failure): void
