@@ -790,6 +790,50 @@ it('accepts Gmail raw data with valid trailing base64url padding', function (): 
     fclose($source);
 });
 
+it('accepts padded Gmail raw data at the configured decoded-byte limit', function (): void {
+    config()->set('mail-mirror.gmail.max_raw_bytes', 1048576);
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $prefix = "From: sender@invented.test\r\nTo: recipient@invented.test\r\nSubject: Exact limit\r\n\r\n";
+    $rawBytes = $prefix.str_repeat('A', 1048576 - strlen($prefix));
+    $encoded = strtr(base64_encode($rawBytes), '+/', '-_');
+
+    Http::fake(function (Request $request) use ($fixture, $encoded) {
+        return str_contains($request->url(), 'format=raw')
+            ? Http::response(['raw' => $encoded])
+            : Http::response($fixture['message_a']);
+    });
+
+    $reference = new MessageReference($account->id, MailDriver::Gmail, 'gmail-message-a', 'gmail-thread-1');
+    $message = app(GmailMailboxReader::class)->retrieve($account, $reference);
+    $source = $message->rawSource?->stream;
+    assert(is_resource($source));
+
+    expect(strlen((string) stream_get_contents($source)))->toBe(1048576);
+
+    fclose($source);
+});
+
+it('rejects non-canonical Gmail raw base64url padding', function (string $encoded): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+
+    Http::fake(function (Request $request) use ($fixture, $encoded) {
+        return str_contains($request->url(), 'format=raw')
+            ? Http::response(['raw' => $encoded])
+            : Http::response($fixture['message_a']);
+    });
+
+    $reference = new MessageReference($account->id, MailDriver::Gmail, 'gmail-message-a', 'gmail-thread-1');
+
+    try {
+        app(GmailMailboxReader::class)->retrieve($account, $reference);
+        throw new RuntimeException('The non-canonical raw encoding was accepted.');
+    } catch (MailImportFailure $failure) {
+        expect($failure->safeCode)->toBe(MailImportCode::MalformedPayload);
+    }
+})->with(['YQ=', 'YQ===', 'Y=Q=', 'AB==']);
+
 it('normalizes oversized send-as identity fields to a sparse malformed-payload failure', function (string $field): void {
     $fixture = gmailFixture();
     $account = gmailAccount();

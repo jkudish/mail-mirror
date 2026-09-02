@@ -901,13 +901,22 @@ final class GmailMailboxReader implements MailboxReader
             throw new MailImportFailure($stage, MailImportCode::MalformedPayload);
         }
 
-        if ($maximumDecodedBytes !== null && intdiv(strlen($encoded) * 3, 4) > $maximumDecodedBytes) {
+        $unpadded = rtrim($encoded, '=');
+        $padding = strlen($encoded) - strlen($unpadded);
+        $remainder = strlen($unpadded) % 4;
+
+        if ($remainder === 1 || ($padding > 0 && $padding !== 4 - $remainder)) {
             throw new MailImportFailure($stage, MailImportCode::MalformedPayload);
         }
 
-        $decoded = base64_decode(strtr($encoded, '-_', '+/'), true);
+        if ($maximumDecodedBytes !== null && intdiv(strlen($unpadded) * 3, 4) > $maximumDecodedBytes) {
+            throw new MailImportFailure($stage, MailImportCode::MalformedPayload);
+        }
 
-        if (! is_string($decoded)) {
+        $decoded = base64_decode(strtr($unpadded, '-_', '+/'), true);
+
+        if (! is_string($decoded)
+            || rtrim(strtr(base64_encode($decoded), '+/', '-_'), '=') !== $unpadded) {
             throw new MailImportFailure($stage, MailImportCode::MalformedPayload);
         }
 
