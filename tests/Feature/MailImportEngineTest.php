@@ -244,6 +244,103 @@ it('classifies malformed payloads without persisting provider content or secrets
         ->and(json_encode([$report?->toArray(), $error->toArray()]))->not->toContain('Secret-like');
 });
 
+it('retries current scan failures without advancing inventory and enforces the owner tuple', function (): void {
+    Storage::fake('import-objects');
+    config()->set('mail-mirror.storage_disk', 'import-objects');
+    $account = importAccount('retry-open-failures');
+    $reader = new DeterministicImportReader;
+    $reader->pages = ['start' => new InventoryPage([
+        reference($account, 'recoverable-message'),
+        reference($account, 'still-failing-message'),
+    ], 'opaque-next-page', false)];
+    $reader->retrievers['recoverable-message'] = $reader->retrievers['still-failing-message'] = fn (): RetrievedMessage => throw new MailImportFailure(
+        MailImportStage::Retrieve,
+        MailImportCode::SyntheticFailure,
+    );
+    $engine = importEngine($reader);
+    $engine->sync($account, pageLimit: 1);
+    $checkpoint = MailSyncCheckpoint::query()->forAccount($account)->firstOrFail();
+
+    $reader->retrievers['recoverable-message'] = function (MessageReference $message): RetrievedMessage {
+        $stream = fopen('php://temp', 'w+b');
+        assert(is_resource($stream));
+        fwrite($stream, "From: retry@invented.test\r\nMessage-ID: <retry@invented.test>\r\n\r\nInvented body.");
+        rewind($stream);
+
+        return new RetrievedMessage(
+            $message,
+            'Invented recovered message',
+            rawSource: new RawMessageSource($stream, 'provider-retry-raw-synthetic-001'),
+        );
+    };
+
+    $originalCheckpoint = $checkpoint->only(['scan_id', 'version', 'processed_count', 'provider_cursor']);
+    $expectedCheckpoint = $originalCheckpoint;
+    $expectedCheckpoint['version']++;
+
+    expect(fn () => $engine->retryOpenFailures($account->id, 'synthetic-owner', 'wrong-owner'))
+        ->toThrow(AccountResourceMismatch::class)
+        ->and($engine->retryOpenFailures($account->id, 'synthetic-owner', 'owner-one'))->toBe(1)
+        ->and($reader->requestedCursors)->toBe([null])
+        ->and($checkpoint->fresh()?->only(['scan_id', 'version', 'processed_count', 'provider_cursor']))
+        ->toBe($expectedCheckpoint)
+        ->and(MailMessage::query()->forAccount($account)->pluck('provider_message_id')->all())
+        ->toBe(['recoverable-message'])
+        ->and(MailRawObject::query()->forAccount($account)->count())->toBe(1)
+        ->and(MailImportError::query()->forAccount($account)->whereNull('resolved_at')->pluck('provider_message_id')->all())
+        ->toBe(['still-failing-message']);
+});
+
+it('does not retry a completed scan after its immutable report is created', function (): void {
+    $account = importAccount('completed-retry');
+    $reader = new DeterministicImportReader;
+    $reader->pages = ['start' => new InventoryPage([reference($account, 'failed-message')], null, true)];
+    $reader->retrievers['failed-message'] = fn (): RetrievedMessage => throw new MailImportFailure(
+        MailImportStage::Retrieve,
+        MailImportCode::SyntheticFailure,
+    );
+    $engine = importEngine($reader);
+    $report = $engine->sync($account);
+
+    unset($reader->retrievers['failed-message']);
+
+    expect(fn () => $engine->retryOpenFailures($account->id, 'synthetic-owner', 'owner-one'))
+        ->toThrow(InvalidArgumentException::class, 'incomplete inventory scan')
+        ->and($report?->transient_error_count)->toBe(1)
+        ->and(MailMessage::query()->forAccount($account)->count())->toBe(0)
+        ->and(MailImportError::query()->forAccount($account)->whereNull('resolved_at')->count())->toBe(1);
+});
+
+it('fences a normal sync outcome retrieved before a successful failure retry', function (): void {
+    $account = importAccount('retry-generation-fence');
+    $reader = new DeterministicImportReader;
+    $reader->pages = [
+        'start' => new InventoryPage([reference($account, 'raced-message')], 'opaque-raced-page', false),
+        'opaque-raced-page' => new InventoryPage([reference($account, 'raced-message')], 'opaque-after-race', false),
+    ];
+    $reader->retrievers['raced-message'] = fn (): RetrievedMessage => throw new MailImportFailure(
+        MailImportStage::Retrieve,
+        MailImportCode::SyntheticFailure,
+    );
+    $engine = importEngine($reader);
+    $engine->sync($account, pageLimit: 1);
+
+    $reader->retrievers['raced-message'] = function (MessageReference $message) use ($account, $engine, $reader): RetrievedMessage {
+        $reader->retrievers['raced-message'] = fn (MessageReference $retryMessage): RetrievedMessage => new RetrievedMessage(
+            $retryMessage,
+            'Invented recovered race message',
+        );
+        expect($engine->retryOpenFailures($account->id, 'synthetic-owner', 'owner-one'))->toBe(1);
+
+        throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::SyntheticFailure);
+    };
+
+    expect(fn () => $engine->sync($account, pageLimit: 1))->toThrow(StaleCheckpoint::class)
+        ->and(MailMessage::query()->forAccount($account)->pluck('provider_message_id')->all())
+        ->toBe(['raced-message'])
+        ->and(MailImportError::query()->forAccount($account)->whereNull('resolved_at')->count())->toBe(0);
+});
+
 it('keeps deletion evidence distinct and reports an unexplained active message without proof', function (): void {
     $account = importAccount('deletion-state');
     $reader = new DeterministicImportReader;
