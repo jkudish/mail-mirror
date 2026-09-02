@@ -897,7 +897,7 @@ final class GmailMailboxReader implements MailboxReader
 
     private function base64UrlDecode(string $encoded, MailImportStage $stage, ?int $maximumDecodedBytes = null): string
     {
-        if (! preg_match('/^[A-Za-z0-9_-]+$/', $encoded)) {
+        if (! preg_match('/^[A-Za-z0-9_-]+={0,2}$/', $encoded)) {
             throw new MailImportFailure($stage, MailImportCode::MalformedPayload);
         }
 
