@@ -67,7 +67,7 @@ final readonly class RetrievedMessage
             if (! is_array($attachment)
                 || ! isset($attachment['provider_id']) || ! is_string($attachment['provider_id'])
                 || trim($attachment['provider_id']) === ''
-                || mb_strlen($attachment['provider_id']) > 255
+                || mb_strlen($attachment['provider_id']) > 512
                 || (isset($attachment['filename']) && (! is_string($attachment['filename']) || mb_strlen($attachment['filename']) > 255))
                 || (isset($attachment['media_type']) && (! is_string($attachment['media_type']) || mb_strlen($attachment['media_type']) > 255))
                 || (isset($attachment['byte_size']) && (! is_int($attachment['byte_size']) || $attachment['byte_size'] < 0))

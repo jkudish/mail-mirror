@@ -790,6 +790,45 @@ it('accepts Gmail raw data with valid trailing base64url padding', function (): 
     fclose($source);
 });
 
+it('accepts bounded native Gmail attachment IDs longer than 255 characters', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $nativeAttachmentId = str_repeat('a', 404);
+    $nativeMessage = $fixture['message_a'];
+    $payload = $nativeMessage['payload'] ?? null;
+    assert(is_array($payload));
+    $parts = $payload['parts'] ?? null;
+    assert(is_array($parts));
+    $part = $parts[0] ?? null;
+    assert(is_array($part));
+    $body = $part['body'] ?? null;
+    assert(is_array($body));
+    $body['attachmentId'] = $nativeAttachmentId;
+    $part['body'] = $body;
+    $parts[0] = $part;
+    $payload['parts'] = $parts;
+    $nativeMessage['payload'] = $payload;
+    $fixture['message_a'] = $nativeMessage;
+
+    Http::fake(function (Request $request) use ($fixture) {
+        return str_contains($request->url(), 'format=raw')
+            ? Http::response(['raw' => gmailPaddedRaw()])
+            : Http::response($fixture['message_a']);
+    });
+
+    $reference = new MessageReference($account->id, MailDriver::Gmail, 'gmail-message-a', 'gmail-thread-1');
+    $message = app(GmailMailboxReader::class)->retrieve($account, $reference);
+    $attachment = $message->attachments[0] ?? null;
+    assert(is_array($attachment));
+    $source = $message->rawSource?->stream;
+    assert(is_resource($source));
+
+    expect($message->attachments)->toHaveCount(1)
+        ->and($attachment['provider_id'])->toBe($nativeAttachmentId);
+
+    fclose($source);
+});
+
 it('accepts padded Gmail raw data at the configured decoded-byte limit', function (): void {
     config()->set('mail-mirror.gmail.max_raw_bytes', 1048576);
     $fixture = gmailFixture();
