@@ -315,6 +315,49 @@ it('registers the production JMAP reader and cannot contact Fastmail unless expl
     Http::assertNothingSent();
 });
 
+it('accepts Fastmail regional API and content hosts', function (): void {
+    $fixture = jmapFixture();
+    $session = jmapFixturePart($fixture, 'session');
+    $session['apiUrl'] = 'https://phl.api.fastmail.com/jmap/api/';
+    $session['downloadUrl'] = 'https://phl-www.fastmailusercontent.com/jmap/download/{accountId}/{blobId}/{name}?type={type}';
+    $fixture['session'] = $session;
+    $account = jmapAccount();
+    $calls = [];
+    fakeJmap($fixture, $calls);
+    $reader = app(FastmailJmapMailboxReader::class);
+
+    $reader->inventoryPage($account, null);
+    $message = $reader->retrieve($account, new MessageReference(
+        $account->id,
+        MailDriver::Jmap,
+        'jmap-email-a',
+        'jmap-thread-a',
+    ));
+
+    if (is_resource($message->rawSource?->stream)) {
+        fclose($message->rawSource->stream);
+    }
+
+    Http::assertSent(fn (Request $request): bool => str_starts_with($request->url(), 'https://phl.api.fastmail.com/'));
+    Http::assertSent(fn (Request $request): bool => str_starts_with($request->url(), 'https://phl-www.fastmailusercontent.com/'));
+});
+
+it('rejects Fastmail lookalike endpoint hosts', function (string $field, string $url): void {
+    $hostile = jmapFixture();
+    $hostileSession = jmapFixturePart($hostile, 'session');
+    $hostileSession[$field] = $url;
+    $hostile['session'] = $hostileSession;
+    $hostileAccount = jmapAccount();
+    $hostileCalls = [];
+    fakeJmap($hostile, $hostileCalls);
+
+    expect(fn () => app(FastmailJmapMailboxReader::class)->inventoryPage($hostileAccount, null))
+        ->toThrow(MailImportFailure::class);
+})->with([
+    'api' => ['apiUrl', 'https://phl.api.fastmail.com.hostile.test/jmap/api/'],
+    'download' => ['downloadUrl', 'https://phl-www.fastmailusercontent.com.hostile.test/jmap/download/{accountId}/{blobId}/{name}'],
+]);
+
 it('keeps the direct-only live lane unreachable without its explicit opt-in', function (): void {
     $docs = (string) file_get_contents(__DIR__.'/../../docs/fastmail-jmap-live-development.md');
     putenv('MAIL_MIRROR_JMAP_ENABLED=1');

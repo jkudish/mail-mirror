@@ -16,7 +16,7 @@
         },
         "primaryAccounts": {"urn:ietf:params:jmap:mail": "jmap-account-synthetic-3207"},
         "apiUrl": "https://api.fastmail.com/jmap/api/",
-        "downloadUrl": "https://api.fastmail.com/jmap/download/{accountId}/{blobId}/{name}?type={type}",
+        "downloadUrl": "https://phl-www.fastmailusercontent.com/jmap/download/{accountId}/{blobId}/{name}?type={type}",
         "state": "jmap-session-state-3207"
     },
     "mailboxes": {

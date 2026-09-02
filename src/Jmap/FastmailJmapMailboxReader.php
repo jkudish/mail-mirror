@@ -424,8 +424,8 @@ final class FastmailJmapMailboxReader implements MailboxReader
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::StateMismatch);
         }
 
-        $this->assertFastmailUrl($apiUrl);
-        $this->assertFastmailUrl($downloadUrl);
+        $this->assertFastmailApiUrl($apiUrl);
+        $this->assertFastmailDownloadUrl($downloadUrl);
 
         $session = [
             'api_url' => $apiUrl,
@@ -509,7 +509,7 @@ final class FastmailJmapMailboxReader implements MailboxReader
             throw new MailImportFailure($stage, MailImportCode::ProviderUnavailable);
         }
 
-        $this->assertFastmailUrl($url);
+        $this->assertFastmailApiUrl($url);
         [$credential, $stored] = $this->credential($account, $stage);
         $response = $this->sendWithRetries($credential, $method, $url, $body, $stage);
 
@@ -577,7 +577,7 @@ final class FastmailJmapMailboxReader implements MailboxReader
             throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
         }
 
-        $this->assertFastmailUrl($url);
+        $this->assertFastmailDownloadUrl($url);
         [$credential, $stored] = $this->credential($account, MailImportStage::Retrieve);
         $response = $this->sendWithRetries($credential, 'GET', $url, null, MailImportStage::Retrieve);
 
@@ -1111,13 +1111,29 @@ final class FastmailJmapMailboxReader implements MailboxReader
         }
     }
 
-    private function assertFastmailUrl(string $url): void
+    private function assertFastmailApiUrl(string $url): void
     {
         $parts = parse_url($url);
+        $host = is_array($parts) && is_string($parts['host'] ?? null) ? strtolower($parts['host']) : '';
 
-        if (! is_array($parts) || ($parts['scheme'] ?? null) !== 'https' || ($parts['host'] ?? null) !== 'api.fastmail.com'
-            || isset($parts['user']) || isset($parts['pass']) || isset($parts['fragment'])) {
+        if (! is_array($parts) || ($parts['scheme'] ?? null) !== 'https'
+            || ($host !== 'api.fastmail.com' && ! str_ends_with($host, '.api.fastmail.com'))
+            || isset($parts['user']) || isset($parts['pass']) || isset($parts['fragment'])
+            || (isset($parts['port']) && $parts['port'] !== 443)) {
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::StateMismatch);
+        }
+    }
+
+    private function assertFastmailDownloadUrl(string $url): void
+    {
+        $parts = parse_url($url);
+        $host = is_array($parts) && is_string($parts['host'] ?? null) ? strtolower($parts['host']) : '';
+
+        if (! is_array($parts) || ($parts['scheme'] ?? null) !== 'https'
+            || ($host !== 'fastmailusercontent.com' && ! str_ends_with($host, '.fastmailusercontent.com'))
+            || isset($parts['user']) || isset($parts['pass']) || isset($parts['fragment'])
+            || (isset($parts['port']) && $parts['port'] !== 443)) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::StateMismatch);
         }
     }
 
