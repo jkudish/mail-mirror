@@ -165,7 +165,7 @@ return new class extends Migration
             $table->id();
             $table->foreignId('mail_account_id')->constrained()->cascadeOnDelete();
             $table->unsignedBigInteger('mail_message_id');
-            $table->string('provider_attachment_id');
+            $table->string('provider_attachment_id', 512);
             $table->string('filename')->nullable();
             $table->string('media_type')->nullable();
             $table->unsignedBigInteger('byte_size')->nullable();
