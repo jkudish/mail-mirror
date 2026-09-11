@@ -160,8 +160,14 @@ it('drives paginated duplicate Gmail inventory and complete retrieval through th
         ->and($report?->mirrored_count)->toBe(2)
         ->and(MailMessage::query()->forAccount($account)->count())->toBe(2)
         ->and($draftMetadata['draft'] ?? null)->toBeTrue()
-        ->and($mailboxState['spam'] ?? null)->toBeTrue()
-        ->and($mailboxState['trash'] ?? null)->toBeTrue()
+        ->and($mailboxState)->toBe([
+            'unread' => false,
+            'flagged' => false,
+            'draft' => true,
+            'sent' => false,
+            'spam' => true,
+            'trash' => true,
+        ])
         ->and(MailAttachment::query()->forAccount($account)->where('provider_attachment_id', 'attachment-a')->exists())->toBeTrue()
         ->and(MailRawObject::query()->forAccount($account)->count())->toBe(2)
         ->and($retrievalAttempts['a'])->toBeGreaterThanOrEqual(2);

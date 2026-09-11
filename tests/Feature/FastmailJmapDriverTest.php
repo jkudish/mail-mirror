@@ -411,6 +411,14 @@ it('accepts RFC 8621 nullable arrays, empty keyword maps, and empty content stri
             ->and($message->participants)->toBe([])
             ->and($message->providerMetadata)->toMatchArray([
                 'keywords' => [],
+                'mailbox_state' => [
+                    'unread' => true,
+                    'flagged' => false,
+                    'draft' => false,
+                    'sent' => false,
+                    'spam' => false,
+                    'trash' => false,
+                ],
                 'preview' => '',
             ]);
     } finally {
@@ -446,11 +454,30 @@ it('imports complete paginated JMAP state and converges duplicate delivery after
         ->and(MailMessageContainerMembership::query()->forAccount($account)->where('mail_message_id', $message->id)->value('provider_membership_id'))->toBeNull()
         ->and($message->provider_metadata)->toMatchArray([
             'keywords' => ['$seen' => true, '$flagged' => true],
+            'mailbox_state' => [
+                'unread' => false,
+                'flagged' => true,
+                'draft' => false,
+                'sent' => false,
+                'spam' => false,
+                'trash' => false,
+            ],
             'draft' => false,
             'email_state' => 'jmap-email-state-1',
         ])
         ->and($message->thread?->provider_metadata)->toMatchArray(['thread_state' => 'jmap-thread-state-1'])
-        ->and($draft->provider_metadata)->toMatchArray(['keywords' => ['$draft' => true], 'draft' => true])
+        ->and($draft->provider_metadata)->toMatchArray([
+            'keywords' => ['$draft' => true],
+            'mailbox_state' => [
+                'unread' => true,
+                'flagged' => false,
+                'draft' => true,
+                'sent' => false,
+                'spam' => false,
+                'trash' => false,
+            ],
+            'draft' => true,
+        ])
         ->and($account->refresh()->provider_metadata)->toMatchArray([
             'session_state' => 'jmap-session-state-3207',
             'email_state' => 'jmap-email-state-1',

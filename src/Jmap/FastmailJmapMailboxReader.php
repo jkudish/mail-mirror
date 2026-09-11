@@ -155,6 +155,7 @@ final class FastmailJmapMailboxReader implements MailboxReader
                 'size' => $this->nonNegativeInteger($email['size'] ?? null, MailImportStage::Retrieve),
                 'keywords' => $keywords,
                 'mailbox_ids' => $mailboxIds,
+                'mailbox_state' => $this->mailboxState($keywords, $containers),
                 'has_attachment' => ($email['hasAttachment'] ?? false) === true,
                 'preview' => $this->optionalBoundedContentString($email['preview'] ?? null, 1024, MailImportStage::Retrieve),
                 'draft' => isset($keywords['$draft']),
@@ -172,6 +173,30 @@ final class FastmailJmapMailboxReader implements MailboxReader
             sentAt: $this->date($email['sentAt'] ?? null, MailImportStage::Retrieve),
             receivedAt: $this->date($email['receivedAt'] ?? null, MailImportStage::Retrieve),
         );
+    }
+
+    /**
+     * @param  array<string, true>  $keywords
+     * @param  list<array<string, mixed>>  $containers
+     * @return array{unread: bool, flagged: bool, draft: bool, sent: bool, spam: bool, trash: bool}
+     */
+    private function mailboxState(array $keywords, array $containers): array
+    {
+        $roles = array_map(
+            fn (array $container): string => is_string($container['kind'] ?? null)
+                ? strtolower($container['kind'])
+                : '',
+            $containers,
+        );
+
+        return [
+            'unread' => ! isset($keywords['$seen']),
+            'flagged' => isset($keywords['$flagged']),
+            'draft' => isset($keywords['$draft']) || in_array('drafts', $roles, true),
+            'sent' => in_array('sent', $roles, true),
+            'spam' => array_intersect(['junk', 'spam'], $roles) !== [],
+            'trash' => in_array('trash', $roles, true),
+        ];
     }
 
     /** @param array{api_url: string, download_url: string, session_state: string} $session */
