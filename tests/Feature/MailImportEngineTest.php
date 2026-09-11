@@ -2,14 +2,17 @@
 
 declare(strict_types=1);
 
+use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Storage;
 use Jkudish\MailMirror\Contracts\MailboxReader;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
+use Jkudish\MailMirror\Events\ProviderDeletionStateChanged;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
@@ -22,10 +25,12 @@ use Jkudish\MailMirror\Models\MailAttachment;
 use Jkudish\MailMirror\Models\MailContainer;
 use Jkudish\MailMirror\Models\MailImportError;
 use Jkudish\MailMirror\Models\MailInventoryItem;
+use Jkudish\MailMirror\Models\MailLocalMessagePurge;
 use Jkudish\MailMirror\Models\MailMessage;
 use Jkudish\MailMirror\Models\MailMessageContainerMembership;
 use Jkudish\MailMirror\Models\MailMessageHeader;
 use Jkudish\MailMirror\Models\MailMessageParticipant;
+use Jkudish\MailMirror\Models\MailProviderDeletionEvidence;
 use Jkudish\MailMirror\Models\MailRawObject;
 use Jkudish\MailMirror\Models\MailReconciliationReport;
 use Jkudish\MailMirror\Models\MailSyncCheckpoint;
@@ -109,7 +114,12 @@ function importEngine(DeterministicImportReader $reader): MailImportEngine
     $registry = new MailDriverRegistry;
     $registry->register(MailDriver::Gmail, $reader);
 
-    return new MailImportEngine(new MailReadService($registry), new ReconciliationService, app(MailObjectStorage::class));
+    return new MailImportEngine(
+        new MailReadService($registry),
+        new ReconciliationService,
+        app(MailObjectStorage::class),
+        app(Dispatcher::class),
+    );
 }
 
 it('bounds provider-requested fresh scan restarts', function (): void {
@@ -565,6 +575,133 @@ it('expires deletion proof on reappearance and requires fresh proof for a later 
 
     expect($report?->provider_deleted_count)->toBe(0)
         ->and($report?->unexpected_active_count)->toBe(1);
+});
+
+it('dispatches deletion and reappearance hooks only after their transaction commits', function (): void {
+    Event::fake([ProviderDeletionStateChanged::class]);
+    $account = importAccount('committed-deletion-hooks');
+    $reader = new DeterministicImportReader;
+    $reader->pages = ['start' => new InventoryPage([reference($account, 'hook-message')], null, true)];
+    $engine = importEngine($reader);
+    $engine->sync($account);
+
+    $reader->pages = ['start' => new InventoryPage([], null, true, [
+        new ProviderDeletionEvidence($account->id, 'hook-message', 'provider_tombstone', 'opaque-hook-delete'),
+    ])];
+    $engine->sync($account);
+
+    Event::assertDispatched(fn (ProviderDeletionStateChanged $event): bool => $event->mailAccountId === $account->id
+        && $event->providerMessageId === 'hook-message'
+        && $event->hasEvidence);
+
+    $reader->pages = ['start' => new InventoryPage([reference($account, 'hook-message')], null, true)];
+    $engine->sync($account);
+
+    Event::assertDispatched(fn (ProviderDeletionStateChanged $event): bool => $event->mailAccountId === $account->id
+        && $event->providerMessageId === 'hook-message'
+        && ! $event->hasEvidence);
+});
+
+it('does not dispatch a deletion hook when later page persistence rolls back', function (): void {
+    Event::fake([ProviderDeletionStateChanged::class]);
+    $account = importAccount('rolled-back-deletion-hook');
+    $reader = new DeterministicImportReader;
+    $reader->pages = ['start' => new InventoryPage([], null, true, [
+        new ProviderDeletionEvidence($account->id, 'rolled-back-message', 'provider_tombstone', 'opaque-rollback-delete'),
+    ])];
+    $engine = importEngine($reader);
+    $engine->sync($account, pageLimit: 1);
+    Event::fake([ProviderDeletionStateChanged::class]);
+    MailSyncCheckpoint::query()->forAccount($account)->update(['scan_completed_at' => null]);
+    $reader->pages = ['start' => new InventoryPage([], null, true, [
+        new ProviderDeletionEvidence($account->id, 'rolled-back-message', 'provider_tombstone', 'opaque-rollback-delete-changed'),
+    ])];
+    $postgres = DB::connection()->getDriverName() === 'pgsql';
+
+    if ($postgres) {
+        DB::unprepared(<<<'SQL'
+            CREATE FUNCTION reject_deletion_hook_checkpoint_function() RETURNS trigger AS $$
+            BEGIN RAISE EXCEPTION 'forced deletion hook rollback'; END; $$ LANGUAGE plpgsql;
+            CREATE TRIGGER reject_deletion_hook_checkpoint BEFORE UPDATE ON mail_sync_checkpoints
+            FOR EACH ROW EXECUTE FUNCTION reject_deletion_hook_checkpoint_function();
+            SQL);
+    } else {
+        DB::unprepared("CREATE TRIGGER reject_deletion_hook_checkpoint BEFORE UPDATE ON mail_sync_checkpoints BEGIN SELECT RAISE(ABORT, 'forced deletion hook rollback'); END");
+    }
+
+    try {
+        expect(fn () => $engine->sync($account, pageLimit: 1))->toThrow(QueryException::class);
+        Event::assertNotDispatched(ProviderDeletionStateChanged::class);
+        expect(MailProviderDeletionEvidence::query()->forAccount($account)->value('audit_reference'))
+            ->toBe('opaque-rollback-delete');
+    } finally {
+        if ($postgres) {
+            DB::statement('DROP TRIGGER reject_deletion_hook_checkpoint ON mail_sync_checkpoints');
+            DB::statement('DROP FUNCTION reject_deletion_hook_checkpoint_function');
+        } else {
+            DB::statement('DROP TRIGGER reject_deletion_hook_checkpoint');
+        }
+    }
+});
+
+it('fences stale reappearance work during purge and permits a fresh import to restore local objects', function (): void {
+    Storage::fake('import-objects');
+    config()->set('mail-mirror.storage_disk', 'import-objects');
+    $account = importAccount('purge-generation-fence');
+    $reader = new DeterministicImportReader;
+    $rawResult = function (MessageReference $reference, string $contents): RetrievedMessage {
+        $stream = fopen('php://temp', 'w+b');
+        assert(is_resource($stream));
+        fwrite($stream, $contents);
+        rewind($stream);
+
+        return new RetrievedMessage(
+            $reference,
+            'Invented purge generation message',
+            rawSource: new RawMessageSource($stream, 'purge-generation-raw'),
+        );
+    };
+    $reader->pages = ['start' => new InventoryPage([reference($account, 'purge-generation-message')], null, true)];
+    $reader->retrievers['purge-generation-message'] = fn (MessageReference $reference): RetrievedMessage => $rawResult($reference, 'first invented raw generation');
+    $engine = importEngine($reader);
+    $engine->sync($account);
+
+    $reader->pages = ['start' => new InventoryPage([], null, true, [
+        new ProviderDeletionEvidence($account->id, 'purge-generation-message', 'provider_tombstone', 'opaque-purge-generation'),
+    ])];
+    $engine->sync($account);
+
+    $reader->pages = ['start' => new InventoryPage([reference($account, 'purge-generation-message')], null, true)];
+    $reader->retrievers['purge-generation-message'] = fn (MessageReference $reference): RetrievedMessage => $rawResult($reference, 'second invented raw generation');
+    $reader->onInventory = function () use ($account): void {
+        $version = MailSyncCheckpoint::query()->forAccount($account)->value('version');
+        assert(is_int($version));
+        expect(app(MailObjectStorage::class)->purgeMessage(
+            $account->id,
+            'synthetic-owner',
+            'owner-one',
+            'purge-generation-message',
+            $version,
+        ))->toBeTrue();
+    };
+
+    expect(fn () => $engine->sync($account))->toThrow(StaleCheckpoint::class)
+        ->and(MailMessage::query()->forAccount($account)->count())->toBe(0)
+        ->and(MailLocalMessagePurge::query()->forAccount($account)->count())->toBe(1)
+        ->and(MailRawObject::query()->forAccount($account)->count())->toBe(0);
+
+    $reader->pages = ['start' => new InventoryPage([], null, true, [
+        new ProviderDeletionEvidence($account->id, 'purge-generation-message', 'provider_tombstone', 'opaque-purge-generation-current'),
+    ])];
+    expect($engine->sync($account)?->provider_deleted_count)->toBe(1);
+
+    $reader->pages = ['start' => new InventoryPage([reference($account, 'purge-generation-message')], null, true)];
+    $engine->sync($account);
+
+    expect(MailMessage::query()->forAccount($account)->count())->toBe(1)
+        ->and(MailLocalMessagePurge::query()->forAccount($account)->count())->toBe(0)
+        ->and(MailRawObject::query()->forAccount($account)->count())->toBe(1)
+        ->and(MailProviderDeletionEvidence::query()->forAccount($account)->count())->toBe(0);
 });
 
 it('closes a waived episode on success and requires a new waiver after failure reopens', function (): void {

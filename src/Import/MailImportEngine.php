@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Jkudish\MailMirror\Import;
 
 use Closure;
+use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Sleep;
@@ -12,6 +13,7 @@ use Illuminate\Support\Str;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
+use Jkudish\MailMirror\Events\ProviderDeletionStateChanged;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
@@ -23,6 +25,7 @@ use Jkudish\MailMirror\Models\MailContainer;
 use Jkudish\MailMirror\Models\MailIdentity;
 use Jkudish\MailMirror\Models\MailImportError;
 use Jkudish\MailMirror\Models\MailInventoryItem;
+use Jkudish\MailMirror\Models\MailLocalMessagePurge;
 use Jkudish\MailMirror\Models\MailMessage;
 use Jkudish\MailMirror\Models\MailMessageContainerMembership;
 use Jkudish\MailMirror\Models\MailMessageHeader;
@@ -45,6 +48,7 @@ final readonly class MailImportEngine
         private MailReadService $reads,
         private ReconciliationService $reconciliation,
         private MailObjectStorage $objects,
+        private Dispatcher $events,
     ) {}
 
     public function syncAccount(
@@ -426,7 +430,7 @@ final readonly class MailImportEngine
                 }
 
                 foreach ($page->deletions as $deletion) {
-                    MailProviderDeletionEvidence::query()->updateOrCreate(
+                    $evidence = MailProviderDeletionEvidence::query()->updateOrCreate(
                         ['mail_account_id' => $account->id, 'provider_message_id' => $deletion->providerMessageId],
                         [
                             'scan_id' => $checkpoint->scan_id,
@@ -435,15 +439,24 @@ final readonly class MailImportEngine
                             'provider_metadata' => $deletion->providerMetadata,
                         ],
                     );
+
+                    if ($evidence->wasRecentlyCreated || $evidence->wasChanged()) {
+                        $this->events->dispatch(new ProviderDeletionStateChanged(
+                            $account->id,
+                            $deletion->providerMessageId,
+                            true,
+                        ));
+                    }
                 }
 
                 if ($page->deletionResolutions !== []) {
-                    MailProviderDeletionEvidence::query()->forAccount($account)
-                        ->whereIn('provider_message_id', array_map(
+                    $this->clearDeletionEvidence(
+                        $account,
+                        array_map(
                             fn ($resolution): string => $resolution->providerMessageId,
                             $page->deletionResolutions,
-                        ))
-                        ->delete();
+                        ),
+                    );
                 }
 
                 $checkpoint->forceFill([
@@ -501,9 +514,7 @@ final readonly class MailImportEngine
             ->whereNull('resolved_at')
             ->update(['resolved_at' => now()]);
 
-        MailProviderDeletionEvidence::query()->forAccount($account)
-            ->where('provider_message_id', $reference->providerMessageId)
-            ->delete();
+        $this->clearDeletionEvidence($account, [$reference->providerMessageId]);
     }
 
     private function recordFailure(MailAccount $account, string $providerMessageId, MailImportFailure $failure): void
@@ -542,6 +553,10 @@ final readonly class MailImportEngine
 
     private function hydrate(MailAccount $account, MessageReference $reference, RetrievedMessage $retrieved): MailMessage
     {
+        MailLocalMessagePurge::query()->forAccount($account)
+            ->where('provider_message_id', $reference->providerMessageId)
+            ->delete();
+
         $thread = null;
 
         if ($reference->providerThreadId !== null) {
@@ -649,6 +664,33 @@ final readonly class MailImportEngine
         }
 
         return $message;
+    }
+
+    /** @param list<string> $providerMessageIds */
+    private function clearDeletionEvidence(MailAccount $account, array $providerMessageIds): void
+    {
+        $cleared = MailProviderDeletionEvidence::query()->forAccount($account)
+            ->whereIn('provider_message_id', $providerMessageIds)
+            ->pluck('provider_message_id')
+            ->all();
+
+        if ($cleared === []) {
+            return;
+        }
+
+        MailProviderDeletionEvidence::query()->forAccount($account)
+            ->whereIn('provider_message_id', $cleared)
+            ->delete();
+
+        foreach ($cleared as $providerMessageId) {
+            if (is_string($providerMessageId)) {
+                $this->events->dispatch(new ProviderDeletionStateChanged(
+                    $account->id,
+                    $providerMessageId,
+                    false,
+                ));
+            }
+        }
     }
 
     /** @param array<string, RetrievedMessage|MailImportFailure> $outcomes */

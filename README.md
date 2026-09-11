@@ -84,6 +84,14 @@ explains a difference only for the completed scan that observed it and is
 invalidated by reappearance. MailMirror does not quarantine, retain, purge, or
 otherwise apply deletion lifecycle policy here.
 
+Committed deletion-evidence changes dispatch
+`ProviderDeletionStateChanged(mailAccountId, providerMessageId, hasEvidence)`.
+The event implements Laravel's `ShouldDispatchAfterCommit`; consumers can
+idempotently start or cancel their own recovery episode without observing
+rolled-back import state. The import engine dispatches it explicitly for both
+evidence upserts and query-builder removal paths rather than relying on Eloquent
+observers.
+
 The upgrade migration refuses to replace populated legacy run/checkpoint state
 before making any schema change. Its rollback restores compatible legacy run,
 checkpoint, and provider identity schema; clean installs use only the
@@ -121,9 +129,18 @@ deletes the key only when no durable raw-object row references it, preserving
 previously committed bytes. Missing materialized attachments can be regenerated
 from the verified, unchanged RFC 822 raw source using stable MIME part paths.
 
-No lifecycle events are emitted by this foundation: no concrete downstream
-consumer requires one yet. A later import or projection task should add only
-the scalar event boundary that its implemented consumer needs.
+Consumers that have independently authorized a local retention purge may call
+`MailObjectStorage::purgeMessage()` with the account/owner tuple, provider
+message ID, and current checkpoint version. It locks the account, message, and
+checkpoint; removes every account-qualified raw and materialized attachment
+object before deleting the normalized occurrence and its object references;
+and advances the checkpoint version to fence stale import work. A partial
+filesystem failure leaves every reference available for a convergent retry.
+A minimal account/provider tombstone blocks stale materialization and preserves
+reconciliation meaning until fresh provider hydration replaces it. Shared
+threads and addresses are retained while referenced by another occurrence.
+MailMirror never calls this method automatically, chooses a retention period,
+or performs a provider write.
 
 The setup is independent and idempotent. In the combined Amp project, jMail's
 primary setup invokes it from `../repos/mail-mirror` relative to jMail because
