@@ -12,6 +12,7 @@ use Jkudish\MailMirror\Contracts\MailboxReader;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
+use Jkudish\MailMirror\Events\MailContainerStateChanged;
 use Jkudish\MailMirror\Events\ProviderDeletionStateChanged;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
@@ -553,6 +554,44 @@ it('keeps identical provider graph IDs account-qualified', function (): void {
         ->and(MailAddress::query()->where('address', 'shared@invented.test')->count())->toBe(2)
         ->and(MailAttachment::query()->where('provider_attachment_id', 'shared-attachment')->count())->toBe(2)
         ->and(MailContainer::query()->where('provider_container_id', 'shared-container')->count())->toBe(2);
+});
+
+it('dispatches an after-commit hook when imported shared container state changes', function (): void {
+    Event::fake([MailContainerStateChanged::class]);
+    $account = importAccount('changed-shared-container');
+    $shared = MailContainer::query()->create([
+        'mail_account_id' => $account->id,
+        'provider_container_id' => 'shared-container',
+        'name' => 'Old name',
+        'kind' => 'label',
+    ]);
+    $otherMessage = MailMessage::query()->create([
+        'mail_account_id' => $account->id,
+        'provider_message_id' => 'other-shared-message',
+    ]);
+    MailMessageContainerMembership::query()->create([
+        'mail_account_id' => $account->id,
+        'mail_message_id' => $otherMessage->id,
+        'mail_container_id' => $shared->id,
+    ]);
+    $reader = new DeterministicImportReader;
+    $reader->pages = ['start' => new InventoryPage([reference($account, 'changed-shared-message')], null, true)];
+    $reader->retrievers['changed-shared-message'] = fn (MessageReference $reference): RetrievedMessage => new RetrievedMessage(
+        reference: $reference,
+        subject: 'Changed shared container',
+        containers: [[
+            'provider_id' => 'shared-container',
+            'name' => 'New name',
+            'kind' => 'label',
+        ]],
+    );
+
+    importEngine($reader)->sync($account);
+
+    expect($shared->refresh()->name)->toBe('New name');
+    Event::assertDispatchedTimes(MailContainerStateChanged::class, 1);
+    Event::assertDispatched(fn (MailContainerStateChanged $event): bool => $event->mailAccountId === $account->id
+        && $event->mailContainerId === $shared->id);
 });
 
 it('expires deletion proof on reappearance and requires fresh proof for a later disappearance', function (): void {

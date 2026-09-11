@@ -7,6 +7,7 @@ namespace Jkudish\MailMirror\Read;
 use DateTimeImmutable;
 use DateTimeInterface;
 use InvalidArgumentException;
+use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailContainer;
 use Jkudish\MailMirror\Models\MailMessage;
@@ -53,6 +54,7 @@ final readonly class MailMessageStateReader
         $metadata = is_array($message->provider_metadata) ? $message->provider_metadata : [];
         $keywords = $this->keywords($metadata['keywords'] ?? null);
         $flags = $this->flags(
+            $account->driver,
             $metadata['mailbox_state'] ?? null,
             $keywords,
             array_key_exists('keywords', $metadata),
@@ -118,7 +120,7 @@ final readonly class MailMessageStateReader
      * @param  list<array{id: int, provider_id: string, name: string, kind: string|null}>  $containers
      * @return array{unread: bool, flagged: bool, draft: bool, sent: bool, spam: bool, trash: bool}
      */
-    private function flags(mixed $value, array $keywords, bool $hasKeywordState, array $containers): array
+    private function flags(MailDriver $driver, mixed $value, array $keywords, bool $hasKeywordState, array $containers): array
     {
         $providerIds = array_map(fn (array $container): string => strtoupper($container['provider_id']), $containers);
         $kinds = array_map(fn (array $container): string => strtolower($container['kind'] ?? ''), $containers);
@@ -133,27 +135,41 @@ final readonly class MailMessageStateReader
                     throw new UnexpectedValueException('The normalized mailbox state is malformed.');
                 }
             }
-            if (array_key_exists('flagged', $value) && ! is_bool($value['flagged'])) {
+            if ((! array_key_exists('flagged', $value) && $driver !== MailDriver::Gmail)
+                || (array_key_exists('flagged', $value) && ! is_bool($value['flagged']))) {
                 throw new UnexpectedValueException('The normalized mailbox state is malformed.');
             }
 
+            if ($driver === MailDriver::Gmail) {
+                return [
+                    'unread' => $value['unread'],
+                    'flagged' => $value['flagged'] ?? in_array('STARRED', $providerIds, true),
+                    'draft' => $value['draft'],
+                    'sent' => $value['sent'],
+                    'spam' => $value['spam'],
+                    'trash' => $value['trash'],
+                ];
+            }
+        }
+
+        if ($driver === MailDriver::Jmap) {
             return [
-                'unread' => $value['unread'],
-                'flagged' => $value['flagged'] ?? in_array('STARRED', $providerIds, true),
-                'draft' => $value['draft'],
-                'sent' => $value['sent'],
-                'spam' => $value['spam'],
-                'trash' => $value['trash'],
+                'unread' => $hasKeywordState && ! in_array('$seen', $keywords, true),
+                'flagged' => in_array('$flagged', $keywords, true),
+                'draft' => in_array('$draft', $keywords, true) || in_array('drafts', $kinds, true),
+                'sent' => in_array('sent', $kinds, true),
+                'spam' => array_intersect(['junk', 'spam'], $kinds) !== [],
+                'trash' => in_array('trash', $kinds, true),
             ];
         }
 
         return [
-            'unread' => in_array('UNREAD', $providerIds, true) || ($hasKeywordState && ! in_array('$seen', $keywords, true)),
-            'flagged' => in_array('STARRED', $providerIds, true) || in_array('$flagged', $keywords, true),
-            'draft' => in_array('DRAFT', $providerIds, true) || in_array('drafts', $kinds, true) || in_array('$draft', $keywords, true),
-            'sent' => in_array('SENT', $providerIds, true) || in_array('sent', $kinds, true),
-            'spam' => in_array('SPAM', $providerIds, true) || array_intersect(['junk', 'spam'], $kinds) !== [],
-            'trash' => in_array('TRASH', $providerIds, true) || in_array('trash', $kinds, true),
+            'unread' => in_array('UNREAD', $providerIds, true),
+            'flagged' => in_array('STARRED', $providerIds, true),
+            'draft' => in_array('DRAFT', $providerIds, true),
+            'sent' => in_array('SENT', $providerIds, true),
+            'spam' => in_array('SPAM', $providerIds, true),
+            'trash' => in_array('TRASH', $providerIds, true),
         ];
     }
 

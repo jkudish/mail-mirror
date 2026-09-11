@@ -141,6 +141,48 @@ it('derives legacy JMAP unread state from an explicitly empty keyword map', func
     ]);
 });
 
+it('derives JMAP state from keywords and roles without interpreting opaque mailbox IDs', function (): void {
+    $account = MailAccount::query()->create([
+        'driver' => MailDriver::Jmap,
+        'provider_account_id' => 'current-jmap-native-state-account',
+    ]);
+    $message = MailMessage::query()->create([
+        'mail_account_id' => $account->id,
+        'provider_message_id' => 'current-jmap-native-state-message',
+        'provider_metadata' => [
+            'keywords' => ['$seen' => true, '$flagged' => true, '$draft' => true],
+            'mailbox_state' => [
+                'unread' => true,
+                'flagged' => false,
+                'draft' => false,
+                'sent' => false,
+                'spam' => true,
+                'trash' => true,
+            ],
+        ],
+    ]);
+    $container = MailContainer::query()->create([
+        'mail_account_id' => $account->id,
+        'provider_container_id' => 'TRASH',
+        'name' => 'Opaque JMAP mailbox',
+        'kind' => 'sent',
+    ]);
+    MailMessageContainerMembership::query()->create([
+        'mail_account_id' => $account->id,
+        'mail_message_id' => $message->id,
+        'mail_container_id' => $container->id,
+    ]);
+
+    expect(app(MailMessageStateReader::class)->read($account, $message)->flags())->toBe([
+        'unread' => false,
+        'flagged' => true,
+        'draft' => true,
+        'sent' => true,
+        'spam' => false,
+        'trash' => false,
+    ]);
+});
+
 it('derives the flag added after legacy Gmail state from its durable container', function (): void {
     $account = MailAccount::query()->create([
         'driver' => MailDriver::Gmail,

@@ -13,6 +13,7 @@ use Illuminate\Support\Str;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
+use Jkudish\MailMirror\Events\MailContainerStateChanged;
 use Jkudish\MailMirror\Events\ProviderDeletionStateChanged;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
@@ -646,14 +647,20 @@ final readonly class MailImportEngine
 
         foreach ($retrieved->containers as $containerData) {
             /** @var array{provider_id: string, name?: string, kind?: string, membership_id?: string, provider_metadata?: array<string, mixed>, membership_metadata?: array<string, mixed>} $containerData */
-            $container = MailContainer::query()->updateOrCreate(
-                ['mail_account_id' => $account->id, 'provider_container_id' => $containerData['provider_id']],
-                [
-                    'name' => $containerData['name'] ?? $containerData['provider_id'],
-                    'kind' => $containerData['kind'] ?? null,
-                    'provider_metadata' => $containerData['provider_metadata'] ?? [],
-                ],
-            );
+            $container = MailContainer::query()->firstOrNew([
+                'mail_account_id' => $account->id,
+                'provider_container_id' => $containerData['provider_id'],
+            ]);
+            $container->fill([
+                'name' => $containerData['name'] ?? $containerData['provider_id'],
+                'kind' => $containerData['kind'] ?? null,
+                'provider_metadata' => $containerData['provider_metadata'] ?? [],
+            ]);
+            $containerChanged = $container->exists && $container->isDirty(['name', 'kind', 'provider_metadata']);
+            $container->save();
+            if ($containerChanged) {
+                $this->events->dispatch(new MailContainerStateChanged($account->id, $container->id));
+            }
             MailMessageContainerMembership::query()->create([
                 'mail_account_id' => $account->id,
                 'mail_message_id' => $message->id,

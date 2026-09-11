@@ -6,6 +6,10 @@ namespace Jkudish\MailMirror\Models;
 
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
+/**
+ * @property int $id
+ * @property int $mail_message_id
+ */
 final class MailMessageContainerMembership extends AccountScopedModel
 {
     /** @return BelongsTo<MailMessage, $this> */

@@ -76,6 +76,8 @@ keywords and account-qualified container facts. It reads only durable local
 records and rejects cross-account message references. Legacy records remain
 rebuildable without provider access; provider-specific facts stay authoritative
 in MailMirror while consumers choose their own visibility and retention policy.
+When shared container state changes, MailMirror emits an account-qualified,
+after-commit event so consumers can refresh every affected local projection.
 
 On completion, `ReconciliationService` writes one immutable metadata-only
 report per account/scan. It distinguishes mirrored inventory, provider-proven
