@@ -76,12 +76,26 @@ final class ReconciliationService
                     ->where('inventory.scan_id', $scanId)
                     ->whereColumn('inventory.provider_message_id', 'messages.provider_message_id');
             });
-        $providerDeleted = (clone $activeOutsideInventory)->whereExists(function (Builder $query) use ($accountId, $scanId): void {
-            $query->selectRaw('1')->from('mail_provider_deletion_evidence as deletions')
-                ->where('deletions.mail_account_id', $accountId)
-                ->where('deletions.scan_id', $scanId)
-                ->whereColumn('deletions.provider_message_id', 'messages.provider_message_id');
-        });
+        $providerDeleted = $connection->table('mail_provider_deletion_evidence as deletions')
+            ->where('deletions.mail_account_id', $accountId)
+            ->where('deletions.scan_id', $scanId)
+            ->whereNotExists(function (Builder $inventory) use ($accountId, $scanId): void {
+                $inventory->selectRaw('1')->from('mail_inventory_items as deleted_inventory')
+                    ->where('deleted_inventory.mail_account_id', $accountId)
+                    ->where('deleted_inventory.scan_id', $scanId)
+                    ->whereColumn('deleted_inventory.provider_message_id', 'deletions.provider_message_id');
+            })
+            ->where(function (Builder $query) use ($accountId): void {
+                $query->whereExists(function (Builder $messages) use ($accountId): void {
+                    $messages->selectRaw('1')->from('mail_messages as deleted_messages')
+                        ->where('deleted_messages.mail_account_id', $accountId)
+                        ->whereColumn('deleted_messages.provider_message_id', 'deletions.provider_message_id');
+                })->orWhereExists(function (Builder $purges) use ($accountId): void {
+                    $purges->selectRaw('1')->from('mail_local_message_purges as purges')
+                        ->where('purges.mail_account_id', $accountId)
+                        ->whereColumn('purges.provider_message_id', 'deletions.provider_message_id');
+                });
+            });
         $unexpected = (clone $activeOutsideInventory)->whereNotExists(function (Builder $query) use ($accountId, $scanId): void {
             $query->selectRaw('1')->from('mail_provider_deletion_evidence as deletions')
                 ->where('deletions.mail_account_id', $accountId)

@@ -12,10 +12,17 @@ use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\ImmutableObjectConflict;
 use Jkudish\MailMirror\Exceptions\MailObjectException;
 use Jkudish\MailMirror\Exceptions\ObjectIntegrityFailure;
+use Jkudish\MailMirror\Exceptions\StaleCheckpoint;
 use Jkudish\MailMirror\Models\MailAccount;
+use Jkudish\MailMirror\Models\MailAddress;
 use Jkudish\MailMirror\Models\MailAttachment;
+use Jkudish\MailMirror\Models\MailLocalMessagePurge;
 use Jkudish\MailMirror\Models\MailMessage;
+use Jkudish\MailMirror\Models\MailMessageHeader;
+use Jkudish\MailMirror\Models\MailMessageParticipant;
 use Jkudish\MailMirror\Models\MailRawObject;
+use Jkudish\MailMirror\Models\MailSyncCheckpoint;
+use Jkudish\MailMirror\Models\MailThread;
 use Jkudish\MailMirror\Storage\MailObjectStorage;
 use Mockery\MockInterface;
 use ZBateson\MailMimeParser\MailMimeParser;
@@ -191,6 +198,242 @@ it('cleans only unreferenced rollback objects in the supplied account namespace'
     expect(fn () => $storage->cleanupRolledBackRaw($other, $key))
         ->toThrow(AccountResourceMismatch::class);
     Storage::disk('mail-mirror-test')->assertExists($key);
+});
+
+it('purges the matched normalized message and objects while preserving shared records', function (): void {
+    [$account, $message] = storageMessage('local-purge');
+    $account->forceFill(['owner_type' => 'synthetic-owner', 'owner_id' => 'owner-one'])->save();
+    $thread = MailThread::query()->create([
+        'mail_account_id' => $account->id,
+        'provider_thread_id' => 'shared-purge-thread',
+        'subject' => 'Shared invented subject',
+    ]);
+    $message->forceFill([
+        'mail_thread_id' => $thread->id,
+        'internet_message_id' => '<purged@invented.test>',
+        'subject' => 'Private invented purge subject',
+        'provider_metadata' => ['private' => 'invented normalized metadata'],
+    ])->save();
+    $remaining = MailMessage::query()->create([
+        'mail_account_id' => $account->id,
+        'mail_thread_id' => $thread->id,
+        'provider_message_id' => 'remaining-shared-message',
+    ]);
+    $sharedAddress = MailAddress::query()->create([
+        'mail_account_id' => $account->id,
+        'address' => 'shared@invented.test',
+    ]);
+    $orphanedAddress = MailAddress::query()->create([
+        'mail_account_id' => $account->id,
+        'address' => 'purged-only@invented.test',
+    ]);
+
+    foreach ([[$message, $sharedAddress], [$message, $orphanedAddress], [$remaining, $sharedAddress]] as $position => [$participantMessage, $address]) {
+        MailMessageParticipant::query()->create([
+            'mail_account_id' => $account->id,
+            'mail_message_id' => $participantMessage->id,
+            'mail_address_id' => $address->id,
+            'role' => 'to',
+            'position' => $position,
+        ]);
+    }
+
+    MailMessageHeader::query()->create([
+        'mail_account_id' => $account->id,
+        'mail_message_id' => $message->id,
+        'name' => 'X-Invented-Private',
+        'value' => 'private normalized header',
+        'position' => 0,
+    ]);
+    $checkpoint = MailSyncCheckpoint::query()->create([
+        'mail_account_id' => $account->id,
+        'scan_id' => '11111111-1111-4111-8111-111111111111',
+        'version' => 7,
+        'processed_count' => 1,
+        'scan_started_at' => now(),
+        'scan_completed_at' => now(),
+    ]);
+    $rawSource = storageStream('invented purge raw bytes');
+    $raw = app(MailObjectStorage::class)->storeRaw($account, $message, $rawSource, 'purge-raw');
+    fclose($rawSource);
+    $attachmentSource = storageStream('invented purge attachment bytes');
+    $attachment = app(MailObjectStorage::class)->storeAttachment(
+        $account,
+        $message,
+        $attachmentSource,
+        'purge-attachment',
+        'mime:2',
+        'text/plain',
+    );
+    fclose($attachmentSource);
+    $rawKey = $raw->object_key;
+    $attachmentKey = $attachment->object_key;
+    assert(is_string($rawKey) && is_string($attachmentKey));
+
+    expect(fn () => app(MailObjectStorage::class)->purgeMessage(
+        $account->id,
+        'synthetic-owner',
+        'wrong-owner',
+        $message->provider_message_id,
+        7,
+    ))->toThrow(AccountResourceMismatch::class)
+        ->and(fn () => app(MailObjectStorage::class)->purgeMessage(
+            $account->id,
+            'synthetic-owner',
+            'owner-one',
+            $message->provider_message_id,
+            6,
+        ))->toThrow(StaleCheckpoint::class)
+        ->and(app(MailObjectStorage::class)->purgeMessage(
+            $account->id,
+            'synthetic-owner',
+            'owner-one',
+            $message->provider_message_id,
+            7,
+        ))->toBeTrue()
+        ->and(app(MailObjectStorage::class)->purgeMessage(
+            $account->id,
+            'synthetic-owner',
+            'owner-one',
+            $message->provider_message_id,
+            7,
+        ))->toBeFalse()
+        ->and(MailRawObject::query()->forAccount($account)->count())->toBe(0)
+        ->and(MailAttachment::query()->forAccount($account)->count())->toBe(0)
+        ->and(MailMessage::query()->forAccount($account)->whereKey($message->id)->exists())->toBeFalse()
+        ->and(MailMessageHeader::query()->forAccount($account)->where('mail_message_id', $message->id)->count())->toBe(0)
+        ->and(MailMessageParticipant::query()->forAccount($account)->where('mail_message_id', $message->id)->count())->toBe(0)
+        ->and(MailLocalMessagePurge::query()->forAccount($account)->where('provider_message_id', $message->provider_message_id)->count())->toBe(1)
+        ->and(MailThread::query()->forAccount($account)->whereKey($thread->id)->exists())->toBeTrue()
+        ->and(MailAddress::query()->forAccount($account)->whereKey($sharedAddress->id)->exists())->toBeTrue()
+        ->and(MailAddress::query()->forAccount($account)->whereKey($orphanedAddress->id)->exists())->toBeFalse()
+        ->and($checkpoint->refresh()->version)->toBe(8);
+    Storage::disk('mail-mirror-test')->assertMissing([$rawKey, $attachmentKey]);
+
+    $lateSource = storageStream('invented late materialization');
+    expect(fn () => app(MailObjectStorage::class)->storeAttachment(
+        $account,
+        $message,
+        $lateSource,
+        'late-attachment',
+        'mime:3',
+        'text/plain',
+    ))->toThrow(AccountResourceMismatch::class);
+    fclose($lateSource);
+});
+
+it('preserves every object reference when one filesystem deletion fails and converges on retry', function (): void {
+    [$account, $message] = storageMessage('partial-local-purge');
+    $checkpoint = MailSyncCheckpoint::query()->create([
+        'mail_account_id' => $account->id,
+        'scan_id' => '22222222-2222-4222-8222-222222222222',
+        'version' => 3,
+        'processed_count' => 1,
+        'scan_started_at' => now(),
+        'scan_completed_at' => now(),
+    ]);
+    $prefix = "mail-mirror/accounts/{$account->id}/messages/{$message->id}";
+    $rawKey = "{$prefix}/raw/sha256/".str_repeat('a', 64);
+    $attachmentKey = "{$prefix}/attachments/part/sha256/".str_repeat('b', 64);
+    MailRawObject::query()->create([
+        'mail_account_id' => $account->id,
+        'mail_message_id' => $message->id,
+        'provider_object_id' => 'partial-purge-raw',
+        'kind' => 'rfc822',
+        'storage_disk' => 'mail-mirror-test',
+        'object_key' => $rawKey,
+    ]);
+    MailAttachment::query()->create([
+        'mail_account_id' => $account->id,
+        'mail_message_id' => $message->id,
+        'provider_attachment_id' => 'partial-purge-attachment',
+        'source_part_id' => 'mime:2',
+        'storage_disk' => 'mail-mirror-test',
+        'object_key' => $attachmentKey,
+    ]);
+    $disk = mock(Filesystem::class, function (MockInterface $mock) use ($rawKey, $attachmentKey): void {
+        $mock->shouldReceive('exists')->with($rawKey)->twice()->andReturn(true, false);
+        $mock->shouldReceive('delete')->with($rawKey)->once()->andReturnTrue();
+        $mock->shouldReceive('exists')->with($attachmentKey)->once()->andReturnTrue();
+        $mock->shouldReceive('delete')->with($attachmentKey)->once()->andReturnFalse();
+    });
+    /** @var FilesystemManager&MockInterface $manager */
+    $manager = mock(FilesystemManager::class, function (MockInterface $mock) use ($disk): void {
+        $mock->shouldReceive('disk')->with('mail-mirror-test')->andReturn($disk);
+    });
+    $storage = new MailObjectStorage($manager, new MailMimeParser);
+
+    expect(fn () => $storage->purgeMessage(
+        $account->id,
+        null,
+        null,
+        $message->provider_message_id,
+        3,
+    ))->toThrow(ObjectIntegrityFailure::class)
+        ->and(MailRawObject::query()->forAccount($account)->count())->toBe(1)
+        ->and(MailAttachment::query()->forAccount($account)->count())->toBe(1)
+        ->and(MailMessage::query()->forAccount($account)->whereKey($message->id)->exists())->toBeTrue()
+        ->and(MailLocalMessagePurge::query()->forAccount($account)->count())->toBe(0)
+        ->and($checkpoint->refresh()->version)->toBe(3);
+
+    expect(app(MailObjectStorage::class)->purgeMessage(
+        $account->id,
+        null,
+        null,
+        $message->provider_message_id,
+        3,
+    ))->toBeTrue()
+        ->and(MailRawObject::query()->forAccount($account)->count())->toBe(0)
+        ->and(MailAttachment::query()->forAccount($account)->count())->toBe(0)
+        ->and(MailLocalMessagePurge::query()->forAccount($account)->count())->toBe(1);
+});
+
+it('keeps durable retry references when an enclosing host transaction rolls back after filesystem deletion', function (): void {
+    [$account, $message] = storageMessage('outer-transaction-purge');
+    $checkpoint = MailSyncCheckpoint::query()->create([
+        'mail_account_id' => $account->id,
+        'scan_id' => '33333333-3333-4333-8333-333333333333',
+        'version' => 4,
+        'processed_count' => 1,
+        'scan_started_at' => now(),
+        'scan_completed_at' => now(),
+    ]);
+    $rawSource = storageStream('invented outer transaction raw bytes');
+    $raw = app(MailObjectStorage::class)->storeRaw($account, $message, $rawSource, 'outer-transaction-raw');
+    fclose($rawSource);
+    $rawKey = $raw->object_key;
+    assert(is_string($rawKey));
+
+    expect(function () use ($account, $message): void {
+        DB::transaction(function () use ($account, $message): void {
+            app(MailObjectStorage::class)->purgeMessage(
+                $account->id,
+                null,
+                null,
+                $message->provider_message_id,
+                4,
+            );
+
+            throw new RuntimeException('Force the host eligibility transaction to roll back.');
+        });
+    })->toThrow(RuntimeException::class)
+        ->and(MailRawObject::query()->forAccount($account)->count())->toBe(1)
+        ->and(MailMessage::query()->forAccount($account)->whereKey($message->id)->exists())->toBeTrue()
+        ->and(MailLocalMessagePurge::query()->forAccount($account)->count())->toBe(0)
+        ->and($checkpoint->refresh()->version)->toBe(4);
+    Storage::disk('mail-mirror-test')->assertMissing($rawKey);
+
+    expect(app(MailObjectStorage::class)->purgeMessage(
+        $account->id,
+        null,
+        null,
+        $message->provider_message_id,
+        4,
+    ))->toBeTrue()
+        ->and(MailRawObject::query()->forAccount($account)->count())->toBe(0)
+        ->and(MailMessage::query()->forAccount($account)->whereKey($message->id)->exists())->toBeFalse()
+        ->and(MailLocalMessagePurge::query()->forAccount($account)->count())->toBe(1)
+        ->and($checkpoint->refresh()->version)->toBe(5);
 });
 
 it('enforces database uniqueness as the final concurrent-write guard and adopts recoverable objects', function (): void {

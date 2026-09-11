@@ -8,14 +8,21 @@ use Illuminate\Contracts\Filesystem\Filesystem;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Database\QueryException;
 use Illuminate\Filesystem\FilesystemManager;
+use InvalidArgumentException;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\ImmutableObjectConflict;
 use Jkudish\MailMirror\Exceptions\MailObjectException;
 use Jkudish\MailMirror\Exceptions\ObjectIntegrityFailure;
+use Jkudish\MailMirror\Exceptions\StaleCheckpoint;
 use Jkudish\MailMirror\Models\MailAccount;
+use Jkudish\MailMirror\Models\MailAddress;
 use Jkudish\MailMirror\Models\MailAttachment;
+use Jkudish\MailMirror\Models\MailLocalMessagePurge;
 use Jkudish\MailMirror\Models\MailMessage;
+use Jkudish\MailMirror\Models\MailMessageParticipant;
 use Jkudish\MailMirror\Models\MailRawObject;
+use Jkudish\MailMirror\Models\MailSyncCheckpoint;
+use Jkudish\MailMirror\Models\MailThread;
 use Throwable;
 use ZBateson\MailMimeParser\MailMimeParser;
 use ZBateson\MailMimeParser\Message\IMessagePart;
@@ -247,6 +254,111 @@ final class MailObjectStorage
         }
     }
 
+    public function purgeMessage(
+        int $mailAccountId,
+        ?string $ownerType,
+        string|int|null $ownerId,
+        string $providerMessageId,
+        int $expectedCheckpointVersion,
+    ): bool {
+        if ($providerMessageId === '' || strlen($providerMessageId) > 255 || $expectedCheckpointVersion < 0) {
+            throw new InvalidArgumentException('A local message purge requires a bounded provider message ID and checkpoint version.');
+        }
+
+        try {
+            $account = MailAccount::query()->whereKey($mailAccountId)
+                ->where('owner_type', $ownerType)
+                ->where('owner_id', $ownerId === null ? null : (string) $ownerId)
+                ->firstOrFail();
+        } catch (ModelNotFoundException) {
+            throw new AccountResourceMismatch('The requested account does not match the supplied owner tuple.');
+        }
+
+        try {
+            return $account->getConnection()->transaction(function () use (
+                $account,
+                $providerMessageId,
+                $expectedCheckpointVersion,
+            ): bool {
+                MailAccount::query()->whereKey($account->id)->lockForUpdate()->firstOrFail();
+                $alreadyPurged = MailLocalMessagePurge::query()->forAccount($account)
+                    ->where('provider_message_id', $providerMessageId)
+                    ->lockForUpdate()
+                    ->exists();
+
+                if ($alreadyPurged) {
+                    return false;
+                }
+
+                $message = MailMessage::query()->forAccount($account)
+                    ->where('provider_message_id', $providerMessageId)
+                    ->lockForUpdate()
+                    ->first();
+
+                if ($message === null) {
+                    throw new AccountResourceMismatch('The requested message does not belong to the supplied account.');
+                }
+
+                $checkpoint = MailSyncCheckpoint::query()->forAccount($account)
+                    ->where('version', $expectedCheckpointVersion)
+                    ->lockForUpdate()
+                    ->first();
+
+                if ($checkpoint === null) {
+                    throw new StaleCheckpoint;
+                }
+
+                $rawObjects = MailRawObject::query()->forAccount($account)
+                    ->where('mail_message_id', $message->id)
+                    ->lockForUpdate()
+                    ->get();
+                $attachments = MailAttachment::query()->forAccount($account)
+                    ->where('mail_message_id', $message->id)
+                    ->whereNotNull('object_key')
+                    ->lockForUpdate()
+                    ->get();
+
+                foreach ($rawObjects->concat($attachments) as $object) {
+                    $this->deleteStoredObject($account, $message, $object);
+                }
+
+                $addressIds = MailMessageParticipant::query()->forAccount($account)
+                    ->where('mail_message_id', $message->id)
+                    ->pluck('mail_address_id')
+                    ->all();
+                $threadId = $message->mail_thread_id;
+                MailRawObject::query()->forAccount($account)
+                    ->where('mail_message_id', $message->id)
+                    ->delete();
+                MailMessage::query()->forAccount($account)->whereKey($message->id)->delete();
+                MailLocalMessagePurge::query()->create([
+                    'mail_account_id' => $account->id,
+                    'provider_message_id' => $providerMessageId,
+                    'purged_at' => now(),
+                ]);
+
+                if ($threadId !== null && ! MailMessage::query()->forAccount($account)->where('mail_thread_id', $threadId)->exists()) {
+                    MailThread::query()->forAccount($account)->whereKey($threadId)->delete();
+                }
+
+                if ($addressIds !== []) {
+                    MailAddress::query()->forAccount($account)
+                        ->whereIn('id', $addressIds)
+                        ->whereDoesntHave('participants')
+                        ->delete();
+                }
+
+                $checkpoint->forceFill(['version' => $checkpoint->version + 1])->save();
+
+                return true;
+            }, 3);
+        } catch (AccountResourceMismatch|MailObjectException|StaleCheckpoint $exception) {
+            throw $exception;
+        } catch (Throwable) {
+            throw new MailObjectException('The local message could not be purged.');
+        }
+    }
+
     /** @return resource */
     public function readAttachment(MailAccount $account, MailAttachment $attachment): mixed
     {
@@ -341,10 +453,12 @@ final class MailObjectStorage
     private function matchedMessage(MailAccount $account, MailMessage $message): MailMessage
     {
         try {
-            return MailMessage::query()->forAccount($account)->whereKey($message->id)->firstOrFail();
+            $matched = MailMessage::query()->forAccount($account)->whereKey($message->id)->firstOrFail();
         } catch (ModelNotFoundException) {
             throw new AccountResourceMismatch('The requested message does not belong to the supplied account.');
         }
+
+        return $matched;
     }
 
     private function lockMatchedMessage(MailAccount $account, MailMessage $message): void
@@ -618,6 +732,41 @@ final class MailObjectStorage
         }
 
         return $this->probe($this->filesystems->disk($diskName), $key, $checksum, $byteSize);
+    }
+
+    private function deleteStoredObject(
+        MailAccount $account,
+        MailMessage $message,
+        MailRawObject|MailAttachment $object,
+    ): void {
+        $diskName = $object->getAttribute('storage_disk');
+        $key = $object->getAttribute('object_key');
+        $prefix = "mail-mirror/accounts/{$account->id}/messages/{$message->id}/";
+
+        if (! is_string($diskName) || $diskName === '' || ! is_string($key) || ! str_starts_with($key, $prefix)) {
+            throw new ObjectIntegrityFailure('A local message object has invalid account-qualified storage metadata.');
+        }
+
+        try {
+            $disk = $this->filesystems->disk($diskName);
+
+            if (! $disk->exists($key)) {
+                return;
+            }
+
+            if (! $disk->delete($key) || $this->storedObjectExists($disk, $key)) {
+                throw new ObjectIntegrityFailure('A local message object could not be purged.');
+            }
+        } catch (MailObjectException $exception) {
+            throw $exception;
+        } catch (Throwable) {
+            throw new ObjectIntegrityFailure('A local message object could not be purged.');
+        }
+    }
+
+    private function storedObjectExists(Filesystem $disk, string $key): bool
+    {
+        return $disk->exists($key);
     }
 
     private function probe(Filesystem $disk, string $key, string $checksum, int $byteSize): string
