@@ -70,6 +70,13 @@ available but is never provider identity. One `mail_sync_checkpoints` row per
 account holds only current resumable state: stable scan ID, opaque cursor,
 version, progress, and timestamps. There is no generic run lifecycle.
 
+`MailMessageStateReader::read()` returns the current provider-neutral unread,
+flagged, draft, sent, spam, and trash flags together with bounded native
+keywords and account-qualified container facts. It reads only durable local
+records and rejects cross-account message references. Legacy records remain
+rebuildable without provider access; provider-specific facts stay authoritative
+in MailMirror while consumers choose their own visibility and retention policy.
+
 On completion, `ReconciliationService` writes one immutable metadata-only
 report per account/scan. It distinguishes mirrored inventory, provider-proven
 deletions, open transient errors, explicitly waived errors, unexplained missing
