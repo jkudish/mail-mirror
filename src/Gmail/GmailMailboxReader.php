@@ -838,16 +838,17 @@ final class GmailMailboxReader implements MailboxReader
 
     /**
      * @param  list<string>  $labelIds
-     * @return array{sent: bool, draft: bool, spam: bool, trash: bool, unread: bool}
+     * @return array{unread: bool, flagged: bool, draft: bool, sent: bool, spam: bool, trash: bool}
      */
     private function mailboxState(array $labelIds): array
     {
         return [
-            'sent' => in_array('SENT', $labelIds, true),
+            'unread' => in_array('UNREAD', $labelIds, true),
+            'flagged' => in_array('STARRED', $labelIds, true),
             'draft' => in_array('DRAFT', $labelIds, true),
+            'sent' => in_array('SENT', $labelIds, true),
             'spam' => in_array('SPAM', $labelIds, true),
             'trash' => in_array('TRASH', $labelIds, true),
-            'unread' => in_array('UNREAD', $labelIds, true),
         ];
     }
 

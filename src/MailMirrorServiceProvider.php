@@ -13,6 +13,7 @@ use Jkudish\MailMirror\Import\MailImportEngine;
 use Jkudish\MailMirror\Import\ReconciliationService;
 use Jkudish\MailMirror\Jmap\FastmailJmapMailboxReader;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
+use Jkudish\MailMirror\Read\MailMessageStateReader;
 use Jkudish\MailMirror\Read\MailReadService;
 use Jkudish\MailMirror\Storage\MailObjectStorage;
 use Spatie\LaravelPackageTools\Package;
@@ -45,6 +46,7 @@ final class MailMirrorServiceProvider extends PackageServiceProvider
             return $registry;
         });
         $this->app->singleton(MailReadService::class);
+        $this->app->singleton(MailMessageStateReader::class);
         $this->app->singleton(MailObjectStorage::class);
         $this->app->singleton(MailAccountConnection::class);
         $this->app->singleton(ReconciliationService::class);
