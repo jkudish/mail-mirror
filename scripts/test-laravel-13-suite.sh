@@ -11,4 +11,4 @@ fi
 
 "${composer_command[@]}" show laravel/framework --format=json |
   "${php_command[@]}" -r '$data=json_decode(stream_get_contents(STDIN), true); exit(str_starts_with($data["versions"][0], "v13.") ? 0 : 1);'
-"${composer_command[@]}" test
+"${php_command[@]}" vendor/bin/pest --ci --fail-on-deprecation --display-deprecations

@@ -23,7 +23,7 @@ namespace. Keep the package independent of jMail and consumer applications.
 - `composer test` — Pest tests and architecture rules.
 - `composer analyse` — Larastan/PHPStan at maximum level.
 - `composer lint:check` — Pint formatting check.
-- `composer consumer:check` — clean Laravel 13 consumer install proof.
+- `composer consumer:check` — clean Laravel 13 consumer migration and synthetic import proof.
 - `composer verify` — all package checks.
 - `composer pr:check` — exact-commit orb verification and local receipt.
 - `composer pr:signoff -- --approved-sha <sha>` — approved exact-SHA signoff.

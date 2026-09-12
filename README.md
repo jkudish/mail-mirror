@@ -45,6 +45,10 @@ consumer ownership optional and consumer-neutral. Future storage, credential,
 import, reconciliation, and provider work must add its concrete isolation tests
 alongside the implementation.
 
+For application installation, configuration, a minimal import, failure
+recovery, lifecycle events, and package evolution rules, follow the
+[consumer integration guide](docs/consumer-integration.md).
+
 ## Resumable import and reconciliation
 
 `MailboxReader::inventoryPage()` returns account-qualified message references,
@@ -161,10 +165,11 @@ Pull requests use repository-owned, credential-free Amp-orb verification:
 composer pr:check
 ```
 
-The plan verifies the locked Laravel 13 graph, a disposable Laravel 13
-prefer-lowest graph, a clean Laravel 12 consumer, quality checks, workflow
-safeguards, and a final clean diff. It writes a mode-`0600` exact-commit receipt
-in `.git`. GitHub Actions and enforced rulesets are intentionally absent. See
+The plan verifies Laravel 12 and 13 against stable and prefer-lowest dependency
+graphs, clean Laravel 12 and 13 consumer migrations and synthetic imports,
+quality checks, workflow safeguards, and a final clean diff. Deprecations fail
+every package-test graph. It writes a mode-`0600` exact-commit receipt in
+`.git`. GitHub Actions and enforced rulesets are intentionally absent. See
 the [pull-request verification skill](.agents/skills/verifying-pull-requests/SKILL.md)
 for exact-SHA or prospectively delegated approval, dedicated-token signoff,
 required status read-back, and authority boundaries.
