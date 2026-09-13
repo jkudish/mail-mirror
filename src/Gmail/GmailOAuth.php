@@ -76,6 +76,21 @@ final readonly class GmailOAuth
         return new GmailAuthorization($credential, $this->profile($credential));
     }
 
+    public function exchangeRefreshToken(#[SensitiveParameter] string $refreshToken): GmailAuthorization
+    {
+        if ($refreshToken === '') {
+            throw new GmailAuthorizationException;
+        }
+
+        $response = $this->tokenRequest([
+            'refresh_token' => $refreshToken,
+            'grant_type' => 'refresh_token',
+        ]);
+        $credential = $this->credentialFromResponse($response, $refreshToken, true);
+
+        return new GmailAuthorization($credential, $this->profile($credential));
+    }
+
     public function refresh(
         MailAccount $account,
         MailAccountCredential $stored,
@@ -128,7 +143,7 @@ final readonly class GmailOAuth
 
         try {
             $response = $this->http->withToken($credential->accessToken())
-                ->acceptJson()->timeout($this->timeout())->get(self::PROFILE_ENDPOINT);
+                ->acceptJson()->timeout($this->timeout())->withoutRedirecting()->get(self::PROFILE_ENDPOINT);
         } catch (Throwable) {
             throw new GmailAuthorizationException;
         }
@@ -166,7 +181,7 @@ final readonly class GmailOAuth
         $this->assertEnabled();
 
         try {
-            return $this->http->asForm()->acceptJson()->timeout($this->timeout())->post(
+            return $this->http->asForm()->acceptJson()->timeout($this->timeout())->withoutRedirecting()->post(
                 self::TOKEN_ENDPOINT,
                 $parameters + [
                     'client_id' => $this->configuration('client_id'),
@@ -198,11 +213,11 @@ final readonly class GmailOAuth
         $expiresIn = $payload['expires_in'] ?? null;
         $scopeValue = $payload['scope'] ?? null;
         $scopes = is_string($scopeValue)
-            ? array_values(array_filter(preg_split('/\s+/', trim($scopeValue)) ?: []))
+            ? (preg_split('/\s+/', trim($scopeValue), flags: PREG_SPLIT_NO_EMPTY) ?: [])
             : $fallbackScopes;
 
         if (! is_string($accessToken) || $accessToken === ''
-            || (! is_string($refreshToken) && $refreshToken !== null)
+            || (! is_string($refreshToken) && $refreshToken !== null) || $refreshToken === ''
             || ($requireRefreshToken && ! is_string($refreshToken))
             || ! is_int($expiresIn) || $expiresIn < 1
             || ($scopeRequired && ! is_string($scopeValue))
