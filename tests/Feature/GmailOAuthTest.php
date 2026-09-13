@@ -177,7 +177,14 @@ it('rejects an empty restored refresh token before network access', function ():
 });
 
 it('requires the provider gate and token client configuration before restoring a refresh token', function (array $configuration, ?string $secret): void {
-    config()->set('mail-mirror.gmail', [...config('mail-mirror.gmail'), ...$configuration]);
+    if (array_key_exists('enabled', $configuration)) {
+        config()->set('mail-mirror.gmail.enabled', $configuration['enabled']);
+    }
+
+    if (array_key_exists('client_id', $configuration)) {
+        config()->set('mail-mirror.gmail.client_id', $configuration['client_id']);
+    }
+
     putenv($secret === null ? 'MAIL_MIRROR_GMAIL_CLIENT_SECRET' : "MAIL_MIRROR_GMAIL_CLIENT_SECRET={$secret}");
 
     expect(fn () => app(GmailOAuth::class)->exchangeRefreshToken('synthetic-restored-refresh-3206'))
