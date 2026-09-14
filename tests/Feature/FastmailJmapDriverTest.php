@@ -64,6 +64,21 @@ final class JmapInventoryState
 
     public int $queryPositionOffset = 0;
 
+    public int $anchoredQueryPositionOffset = 0;
+
+    public bool $removeAnchorBeforeNextPage = false;
+
+    public bool $anchorNotFoundOnce = false;
+
+    public ?int $anchoredPositionOverride = null;
+
+    public bool $prependBeforeAnchoredPage = false;
+
+    public int $numericQueryRequests = 0;
+
+    /** @var list<string> */
+    public array $anchoredQueryRequests = [];
+
     public string $sessionState = 'jmap-session-state-3207';
 
     public ?string $nextResponseSessionState = null;
@@ -196,16 +211,42 @@ function fakeJmap(
         }
 
         if ($method === 'Email/query') {
-            $position = $arguments['position'] ?? 0;
-            assert(is_int($position) && ($arguments['calculateTotal'] ?? null) === true);
-            $calls['Email/query:calculate-total'] = ($calls['Email/query:calculate-total'] ?? 0) + 1;
-            if ($state->mutateAtPosition === $position) {
-                $state->emailState = 'jmap-email-state-during-full';
+            $anchor = $arguments['anchor'] ?? null;
+            assert(($arguments['calculateTotal'] ?? null) === true);
+            assert($anchor === null
+                ? (($arguments['position'] ?? null) === 0 && ! array_key_exists('anchorOffset', $arguments))
+                : (is_string($anchor) && ! array_key_exists('position', $arguments) && ($arguments['anchorOffset'] ?? null) === 1));
+
+            if (is_string($anchor)) {
+                $state->anchoredQueryRequests[] = $anchor;
+            } else {
+                $state->numericQueryRequests++;
             }
+
+            $calls['Email/query:calculate-total'] = ($calls['Email/query:calculate-total'] ?? 0) + 1;
             $exclude = $state->excludeChangedFromFull;
             $fullIds = $state->fullIds ?? ($exclude
                 ? ['jmap-email-draft']
-                : ['jmap-email-a', 'jmap-email-a', 'jmap-email-draft']);
+                : ['jmap-email-a', 'jmap-email-draft']);
+
+            if ($anchor !== null && $state->prependBeforeAnchoredPage) {
+                array_unshift($fullIds, 'jmap-email-rfc-null');
+            }
+
+            $anchorPosition = $anchor === null ? false : array_search($anchor, $fullIds, true);
+            $anchorMissing = $anchorPosition === false || $state->removeAnchorBeforeNextPage
+                || ($state->anchorNotFoundOnce && count($state->anchoredQueryRequests) === 1);
+
+            if ($anchor !== null && $anchorMissing) {
+                return Http::response(jmapResponse('error', ['type' => 'anchorNotFound'], $callId, $responseSessionState));
+            }
+
+            $position = $anchorPosition === false ? 0 : $anchorPosition + 1;
+
+            if ($state->mutateAtPosition === $position) {
+                $state->emailState = 'jmap-email-state-during-full';
+            }
+
             $ids = $state->prematureEmptyAtPosition === $position
                 ? []
                 : array_slice($fullIds, $position, 1);
@@ -216,11 +257,19 @@ function fakeJmap(
                 $state->mutateQueryStateAtPosition = null;
             }
 
+            $responsePosition = $position + $state->queryPositionOffset
+                + ($anchor === null ? 0 : $state->anchoredQueryPositionOffset);
+
+            if ($anchor !== null && $state->anchoredPositionOverride !== null
+                && count($state->anchoredQueryRequests) === 1) {
+                $responsePosition = $state->anchoredPositionOverride;
+            }
+
             return Http::response(jmapResponse($method, [
                 'accountId' => 'jmap-account-synthetic-3207',
                 'queryState' => $queryState,
                 'canCalculateChanges' => true,
-                'position' => $position + $state->queryPositionOffset,
+                'position' => $responsePosition,
                 'ids' => $ids,
                 'total' => count($fullIds),
             ], $callId, $responseSessionState));
@@ -428,7 +477,7 @@ it('accepts RFC 8621 nullable arrays, empty keyword maps, and empty content stri
     }
 });
 
-it('imports complete paginated JMAP state and converges duplicate delivery after crash resume', function (): void {
+it('imports complete paginated JMAP state and resumes after a crash', function (): void {
     $fixture = jmapFixture();
     $account = jmapAccount();
     $calls = [];
@@ -484,8 +533,8 @@ it('imports complete paginated JMAP state and converges duplicate delivery after
             'mailbox_state' => 'jmap-mailbox-state-1',
             'identity_state' => 'jmap-identity-state-1',
         ])
-        ->and($calls['Session/get'])->toBeGreaterThanOrEqual(4)
-        ->and($calls['Email/query:calculate-total'])->toBeGreaterThanOrEqual(3)
+        ->and($calls['Session/get'])->toBeGreaterThanOrEqual(3)
+        ->and($calls['Email/query:calculate-total'])->toBe(3)
         ->and($calls['Blob/download'])->toBeGreaterThanOrEqual(2);
 });
 
@@ -553,7 +602,7 @@ it('keeps the pre-full Email state baseline so changes during pagination replay 
         ->and(jmapCallCount($calls, 'Email/changes:since:jmap-email-state-before-full'))->toBe(1);
 });
 
-it('carries deletion evidence through a query-state restart and clears it on reappearance', function (): void {
+it('carries deletion evidence through query-state drift and clears it on reappearance', function (): void {
     $fixture = jmapFixture();
     $account = jmapAccount();
     $calls = [];
@@ -576,8 +625,8 @@ it('carries deletion evidence through a query-state restart and clears it on rea
 
     expect($report?->provider_deleted_count)->toBe(1)
         ->and($report?->unexpected_active_count)->toBe(0)
-        ->and(array_values(array_unique($durableScanIds)))->toHaveCount(2)
-        ->and($durableScanIds[0])->not->toBe($report?->scan_id)
+        ->and(array_values(array_unique($durableScanIds)))->toHaveCount(1)
+        ->and($durableScanIds[0])->toBe($report?->scan_id)
         ->and(MailSyncCheckpoint::query()->forAccount($account)->value('scan_id'))->toBe($report?->scan_id);
     expect($evidenceScanId)->toBe($report?->scan_id);
 
@@ -607,6 +656,10 @@ it('rejects malformed Email changes and query progression', function (string $ma
         $state->stalledChanges = true;
     } elseif ($malformation === 'premature-empty-query') {
         $state->prematureEmptyAtPosition = 0;
+    } elseif ($malformation === 'anchor-not-found') {
+        $state->removeAnchorBeforeNextPage = true;
+    } elseif ($malformation === 'anchored-query-position') {
+        $state->anchoredQueryPositionOffset = 1;
     } else {
         $state->queryPositionOffset = 1;
     }
@@ -619,7 +672,7 @@ it('rejects malformed Email changes and query progression', function (string $ma
     } catch (MailImportFailure $failure) {
         expect($failure->safeCode)->toBe(MailImportCode::StateMismatch);
     }
-})->with(['old-state', 'stalled-changes', 'query-position', 'premature-empty-query']);
+})->with(['old-state', 'stalled-changes', 'query-position', 'premature-empty-query', 'anchor-not-found', 'anchored-query-position']);
 
 it('rejects an oversized Identity list before parsing nested identity fields', function (): void {
     $fixture = jmapFixture();
@@ -692,73 +745,102 @@ it('preserves a wrong local credential type without destructive revocation', fun
     Http::assertNothingSent();
 });
 
-it('recovers from changed query state with one fresh scan and resumes its durable cursor', function (): void {
+it('uses stable anchors across query-state drift and insertion before the anchor', function (): void {
     $fixture = jmapFixture();
     $account = jmapAccount();
-    $queryCalls = 0;
-    Http::fake(function (Request $request) use ($fixture, &$queryCalls) {
-        if ($request->url() === 'https://api.fastmail.com/jmap/session') {
-            return Http::response(jmapFixturePart($fixture, 'session'));
-        }
+    $calls = [];
+    $state = new JmapInventoryState;
+    $state->mutateQueryStateAtPosition = 2;
+    $state->prependBeforeAnchoredPage = true;
+    fakeJmap($fixture, $calls, inventoryState: $state);
+    $reader = app(FastmailJmapMailboxReader::class);
 
-        $methodCalls = $request->data()['methodCalls'] ?? null;
-        assert(is_array($methodCalls));
-        $call = $methodCalls[0] ?? null;
-        assert(is_array($call));
-        $method = $call[0] ?? null;
-        $arguments = $call[1] ?? [];
-        $callId = $call[2] ?? null;
-        assert(is_string($method) && is_array($arguments) && is_string($callId));
+    $resources = $reader->inventoryPage($account, null);
+    $first = $reader->inventoryPage($account, $resources->nextCursor);
+    $second = $reader->inventoryPage($account, $first->nextCursor);
+    $third = $reader->inventoryPage($account, $second->nextCursor);
 
-        if ($method === 'Mailbox/get') {
-            return Http::response(jmapResponse($method, jmapFixturePart($fixture, 'mailboxes'), $callId));
-        }
+    expect(collect($first->messages)->pluck('providerMessageId')->all())->toBe(['jmap-email-a'])
+        ->and(collect($second->messages)->pluck('providerMessageId')->all())->toBe(['jmap-email-draft'])
+        // A non-empty anchored page never completes the scan; only a final
+        // empty anchored query may mark completion.
+        ->and($second->complete)->toBeFalse()
+        ->and(collect($third->messages)->pluck('providerMessageId')->all())->toBe([])
+        ->and($third->complete)->toBeTrue()
+        ->and($third->nextCursor)->toBeNull();
 
-        if ($method === 'Identity/get') {
-            return Http::response(jmapResponse($method, jmapFixturePart($fixture, 'identities'), $callId));
-        }
+    expect($state->numericQueryRequests)->toBe(1)
+        ->and($state->anchoredQueryRequests)->toBe(['jmap-email-a', 'jmap-email-draft']);
+});
 
-        if ($method === 'Email/query') {
-            $queryCalls++;
-            $position = $arguments['position'] ?? 0;
-            assert(($arguments['calculateTotal'] ?? null) === true);
+it('restarts a persisted legacy full cursor with a fresh scan while preserving its email state', function (): void {
+    $fixture = jmapFixture();
+    $account = jmapAccount();
+    // A newer state on the account must not be captured; the abandoned scan's
+    // own baseline email_state has to survive so deletion evidence stays replayable.
+    $account->forceFill(['provider_metadata' => ['email_state' => 'jmap-email-state-newer']])->save();
+    $legacyCursor = rtrim(strtr(base64_encode(json_encode([
+        'phase' => 'full',
+        'account_id' => 'jmap-account-synthetic-3207',
+        'session_state' => 'jmap-session-state-3207',
+        'email_state' => 'jmap-email-state-legacy',
+        'query_state' => 'jmap-query-state-legacy',
+        'position' => 1,
+    ], JSON_THROW_ON_ERROR)), '+/', '-_'), '=');
+    MailSyncCheckpoint::query()->create([
+        'mail_account_id' => $account->id,
+        'scan_id' => 'synthetic-legacy-scan-3207',
+        'version' => 0,
+        'processed_count' => 0,
+        'provider_cursor' => $legacyCursor,
+        'scan_started_at' => now(),
+    ]);
+    $calls = [];
+    fakeJmap($fixture, $calls);
 
-            return Http::response(jmapResponse($method, [
-                'accountId' => 'jmap-account-synthetic-3207',
-                'queryState' => $queryCalls === 2 ? 'changed-query-state' : 'stable-query-state',
-                'ids' => match ($position) {
-                    0 => ['jmap-email-a'],
-                    1 => ['jmap-email-draft'],
-                    default => [],
-                },
-                'position' => $position,
-                'total' => 2,
-            ], $callId));
-        }
+    $report = app(MailImportEngine::class)->sync($account);
 
-        if ($method === 'Email/get') {
-            $ids = $arguments['ids'] ?? [];
-            assert(is_array($ids) && array_filter($ids, fn (mixed $id): bool => ! is_string($id)) === []);
-            /** @var list<string> $ids */
-            $list = array_map(fn (string $id): array => ['id' => $id, 'threadId' => 'jmap-thread-one'], $ids);
+    expect($report?->inventory_count)->toBe(2)
+        ->and(MailMessage::query()->forAccount($account)->count())->toBe(2)
+        ->and($account->refresh()->provider_metadata['email_state'] ?? null)->toBe('jmap-email-state-legacy')
+        ->and(MailSyncCheckpoint::query()->forAccount($account)->value('scan_id'))->not->toBe('synthetic-legacy-scan-3207')
+        ->and(MailSyncCheckpoint::query()->forAccount($account)->value('provider_cursor'))->not->toBe($legacyCursor);
+});
 
-            return Http::response(jmapResponse($method, [
-                'accountId' => 'jmap-account-synthetic-3207',
-                'state' => 'jmap-email-state-1',
-                'list' => $list,
-                'notFound' => [],
-            ], $callId));
-        }
+it('recovers when an anchored page reports anchorNotFound instead of failing terminally', function (): void {
+    $fixture = jmapFixture();
+    $account = jmapAccount();
+    $calls = [];
+    $state = new JmapInventoryState;
+    $state->anchorNotFoundOnce = true;
+    fakeJmap($fixture, $calls, inventoryState: $state);
 
-        return Http::response([], 500);
-    });
+    $report = app(MailImportEngine::class)->sync($account);
 
-    app(MailImportEngine::class)->sync($account, 2);
-    $firstScan = MailSyncCheckpoint::query()->forAccount($account)->value('scan_id');
+    expect($report?->inventory_count)->toBe(2)
+        ->and(MailMessage::query()->forAccount($account)->count())->toBe(2)
+        ->and($state->anchoredQueryRequests)->toBe(['jmap-email-a', 'jmap-email-a', 'jmap-email-draft'])
+        ->and($account->refresh()->provider_metadata['email_state'] ?? null)->toBe('jmap-email-state-1');
+});
 
-    expect(fn () => app(MailImportEngine::class)->sync($account, 1))->not->toThrow(Throwable::class)
-        ->and(MailSyncCheckpoint::query()->forAccount($account)->value('scan_id'))->not->toBe($firstScan)
-        ->and(MailSyncCheckpoint::query()->forAccount($account)->value('provider_cursor'))->not->toBeNull();
+it('refuses to complete the scan from a plausible-but-wrong anchored position', function (): void {
+    $fixture = jmapFixture();
+    $account = jmapAccount();
+    $calls = [];
+    $state = new JmapInventoryState;
+    // The provider reports position 2 (total 3) while actually serving the
+    // middle page: endPosition === total would previously complete the scan and
+    // silently skip jmap-email-rfc-null.
+    $state->anchoredPositionOverride = 2;
+    $state->fullIds = ['jmap-email-a', 'jmap-email-draft', 'jmap-email-rfc-null'];
+    fakeJmap($fixture, $calls, inventoryState: $state);
+
+    $report = app(MailImportEngine::class)->sync($account);
+
+    expect($report?->inventory_count)->toBe(3)
+        ->and(MailMessage::query()->forAccount($account)->count())->toBe(3)
+        ->and(MailMessage::query()->forAccount($account)->where('provider_message_id', 'jmap-email-rfc-null')->exists())->toBeTrue()
+        ->and($calls['Email/query:calculate-total'])->toBe(4);
 });
 
 it('bounds Retry-After retries and revokes a rejected API token without exposing it', function (): void {
