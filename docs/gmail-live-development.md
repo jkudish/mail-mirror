@@ -1,49 +1,44 @@
-# Gmail live development-account check
+# Check a Gmail development account
 
-MailMirror's ordinary tests, verification, consumer installs, and CI use only
-Laravel HTTP fakes and keep `mail-mirror.gmail.enabled` false. They cannot opt
-into this lane. The lane is a separately named, direct script intended only for
-a later, explicitly human-authorized check against a dedicated development
-account.
+This script makes live Gmail requests. Run it only with explicit approval and a
+dedicated, non-personal development account. Normal tests use HTTP fakes and
+keep Gmail disabled.
 
-## Safety boundary
+## What the check reads
 
-The check performs profile, label, send-as identity, history, and/or message
-inventory reads. It does not retrieve message bodies, run the import engine,
-write mailbox state, send mail, create or update drafts, delete mail, or revoke
-the provider grant. An expired access token may be refreshed and rotated through
-the encrypted `MailAccountConnection` lifecycle. Output contains only counts,
-completion state, and a truncated hash of the provider account ID.
+The check may read the account profile, labels, send-as identities, history,
+and message inventory. It does not read message bodies, run an import, send or
+delete mail, change mailbox state, or revoke the grant. An expired access token
+may be refreshed and stored through `MailAccountConnection`.
 
-Do not use a personal or production mailbox. Do not paste credentials or tokens
-into a command, shell history, issue, log, fixture, or report.
+Output contains counts, completion state, and a short hash of the provider
+account ID. Do not use a personal or production mailbox. Never put credentials
+in a command, shell history, issue, log, fixture, or report.
 
-## Preconditions
+## Prepare the account
 
-In a disposable Laravel 12 or 13 consumer application:
+In a disposable Laravel 12 or 13 application:
 
 1. Configure a Google OAuth client outside the repository.
-2. Configure exactly `https://www.googleapis.com/auth/gmail.modify`; never add
-   `https://mail.google.com/`, settings scopes, compose, send, or other scopes.
-3. Complete consent only after separate human authorization, then store the
-   returned `OAuthTokenSetCredential` through `MailAccountConnection` for a
-   Gmail `MailAccount` owned by an explicit consumer owner tuple.
-   The consumer must generate and retain the OAuth state and PKCE verifier in
-   its own short-lived server-side session, pass the matching S256 challenge to
-   `GmailOAuth::authorizationUrl()`, and pass the verifier to
-   `GmailOAuth::exchange()`. MailMirror validates PKCE values but intentionally
-   does not own consumer session persistence.
-4. Supply the client ID, client secret, and redirect URI through the consumer's
-   secret manager as `MAIL_MIRROR_GMAIL_CLIENT_ID`,
+2. Request exactly `https://www.googleapis.com/auth/gmail.modify`. Do not add
+   full-mail, settings, compose, or send scopes.
+3. Store OAuth state and the PKCE verifier in a short-lived server-side session.
+   Pass the S256 challenge to `GmailOAuth::authorizationUrl()` and the verifier
+   to `GmailOAuth::exchange()`.
+4. Store the returned `OAuthTokenSetCredential` through
+   `MailAccountConnection` for an owned Gmail account.
+5. Inject the client ID, client secret, and redirect URI through your secret
+   manager as `MAIL_MIRROR_GMAIL_CLIENT_ID`,
    `MAIL_MIRROR_GMAIL_CLIENT_SECRET`, and
-   `MAIL_MIRROR_GMAIL_REDIRECT_URI`. The client secret must be injected into the
-   process environment; MailMirror intentionally never copies it into Laravel's
-   configuration array or configuration cache.
+   `MAIL_MIRROR_GMAIL_REDIRECT_URI`.
 
-## Explicit invocation
+The client secret must come from the process environment. MailMirror does not
+copy it into Laravel's configuration array or cache.
 
-Run from a clean MailMirror checkout only after provider-access authorization.
-Use a secrets-safe environment injector rather than literal secret values:
+## Run the check
+
+From a clean MailMirror checkout, use a secret-safe environment injector and
+run:
 
 ```bash
 APP_ENV=local \
@@ -56,13 +51,11 @@ MAIL_MIRROR_GMAIL_OWNER_ID='<consumer owner ID>' \
 php scripts/gmail-live-development-check.php
 ```
 
-The script refuses to run unless every gate is present, the consumer boots as
-`local`, Gmail is explicitly enabled, and the account ID, owner tuple, and Gmail
-driver all match durable state. This script is intentionally absent from all
-Composer scripts and verification commands.
+Success starts with `Live Gmail read check passed` and reports only bounded
+metadata. The script exits with status 2 if any safety gate, owner value, or
+driver does not match.
 
-Laravel's HTTP client materializes a provider JSON response before MailMirror
-can inspect decoded fields. MailMirror therefore keeps the transport/provider
-body limit as a consumer HTTP-boundary responsibility, then independently
-bounds pages, cursors, history outputs, headers, MIME parts, identities, and the
-encoded raw RFC822 value before base64 decoding and allocation.
+Laravel's HTTP client materializes provider JSON before MailMirror can inspect
+decoded fields. Your application must bound the HTTP response body. MailMirror
+separately bounds pages, cursors, history, headers, MIME parts, identities, and
+encoded raw messages.
