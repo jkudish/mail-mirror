@@ -222,8 +222,8 @@ final class FastmailJmapMailboxReader implements MailboxReader
             'email_state' => is_string($previousState) && $previousState !== ''
                 ? $previousState
                 : $this->currentEmailState($account, $session),
-            'query_state' => null,
-            'position' => 0,
+            'anchor' => null,
+            'progress' => 0,
         ];
 
         return new InventoryPage(
@@ -241,7 +241,7 @@ final class FastmailJmapMailboxReader implements MailboxReader
 
     /**
      * @param  array{api_url: string, download_url: string, session_state: string}  $session
-     * @param  array{phase: string, account_id: string, session_state: string, email_state: string|null, query_state: string|null, position: int}  $cursor
+     * @param  array{phase: string, account_id: string, session_state: string, email_state: string|null, anchor: string|null, progress: int}  $cursor
      */
     private function changesPage(MailAccount $account, array $session, array $cursor): InventoryPage
     {
@@ -301,8 +301,8 @@ final class FastmailJmapMailboxReader implements MailboxReader
             'account_id' => $account->provider_account_id,
             'session_state' => $session['session_state'],
             'email_state' => $newState,
-            'query_state' => null,
-            'position' => 0,
+            'anchor' => null,
+            'progress' => 0,
         ] : $this->fullState($account, $session, $newState);
 
         return new InventoryPage(
@@ -317,43 +317,90 @@ final class FastmailJmapMailboxReader implements MailboxReader
 
     /**
      * @param  array{api_url: string, download_url: string, session_state: string}  $session
-     * @param  array{phase: string, account_id: string, session_state: string, email_state: string|null, query_state: string|null, position: int}  $cursor
+     * @param  array{phase: string, account_id: string, session_state: string, email_state: string|null, anchor: string|null, progress: int}  $cursor
      */
     private function fullPage(MailAccount $account, array $session, array $cursor): InventoryPage
     {
-        $result = $this->call($account, $session, 'Email/query', [
+        // Eventual-convergence contract for the full-scan traversal:
+        //
+        // - Query-state drift is intentionally tolerated. The responses on this
+        //   traversal may report a queryState that differs from the one observed
+        //   on earlier pages because traversal is anchor-stable rather than a
+        //   consistent JMAP query snapshot; a consistent snapshot view would
+        //   require /queryChanges (RFC 8620 Section 5.5), which is not used here.
+        // - Provider mutations that happen while the scan runs are therefore not
+        //   reflected in this pass. They are converged by the following
+        //   Email/changes pass plus subsequent full scans, not by this one.
+        $arguments = [
             'accountId' => $account->provider_account_id,
-            'position' => $cursor['position'],
             'limit' => $this->pageSize(),
             'calculateTotal' => true,
-        ], 'query', MailImportStage::Inventory);
+        ];
+
+        if ($cursor['anchor'] === null) {
+            $arguments['position'] = 0;
+        } else {
+            $arguments['anchor'] = $cursor['anchor'];
+            $arguments['anchorOffset'] = 1;
+        }
+
+        try {
+            $result = $this->call($account, $session, 'Email/query', $arguments, 'query', MailImportStage::Inventory);
+        } catch (MailImportFailure $failure) {
+            if ($cursor['anchor'] !== null && $failure->cursorRejected) {
+                // The anchor no longer exists in the provider query. Restart the
+                // full scan from a fresh cursor while preserving THIS cursor's
+                // email_state (not a newer one) so deletion evidence recorded
+                // during the abandoned scan stays replayable.
+                throw new InventoryRestartRequired($this->encodeCursor($this->fullState(
+                    $account,
+                    $session,
+                    $this->boundedString($cursor['email_state'], 255, MailImportStage::Inventory),
+                )));
+            }
+
+            throw $failure;
+        }
+
         $ids = $this->stringList($result['ids'] ?? [], 255, MailImportStage::Inventory);
-        $queryState = $this->boundedString($result['queryState'] ?? null, 255, MailImportStage::Inventory);
+        $this->boundedString($result['queryState'] ?? null, 255, MailImportStage::Inventory);
         $total = $this->nonNegativeInteger($result['total'] ?? null, MailImportStage::Inventory);
         $responsePosition = $this->nonNegativeInteger($result['position'] ?? null, MailImportStage::Inventory);
 
-        if ($responsePosition !== $cursor['position']) {
+        if (($cursor['anchor'] === null && $responsePosition !== 0)
+            || ($cursor['anchor'] !== null && $responsePosition < 1)) {
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::StateMismatch);
         }
 
-        if ($cursor['query_state'] !== null && $cursor['query_state'] !== $queryState) {
-            throw new InventoryRestartRequired($this->freshFullCursor($account, $session));
-        }
-
-        if (count($ids) > $this->pageSize()) {
+        if (count($ids) > $this->pageSize() || count(array_unique($ids)) !== count($ids)
+            || ($cursor['anchor'] !== null && in_array($cursor['anchor'], $ids, true))) {
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
         }
 
-        $position = $cursor['position'] + count($ids);
+        $endPosition = $responsePosition + count($ids);
 
-        if ($position > $total || ($ids === [] && $position < $total)) {
+        if ($endPosition > $total || ($ids === [] && $endPosition < $total)
+            || $cursor['progress'] > PHP_INT_MAX - count($ids)) {
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::StateMismatch);
         }
 
         $references = $this->referencesForIds($account, $session, $ids, 'full');
-        $complete = $position === $total;
+
+        // Completion rule: a NON-EMPTY anchored page never completes the scan. A
+        // provider reporting a plausible-but-wrong position (for example 200
+        // instead of 101 with total 300) would otherwise satisfy
+        // endPosition === total and silently skip the tail. The scan completes
+        // only when the first (position 0) page exhausts the mailbox, or when a
+        // final EMPTY anchored query reports endPosition === total.
+        $complete = $cursor['anchor'] === null
+            ? $endPosition === $total
+            : ($ids === [] && $endPosition === $total);
         $emailState = $this->boundedString($cursor['email_state'], 255, MailImportStage::Inventory);
         $profile = $this->profile($account, $session, ['email_state' => $emailState]);
+        $nextAnchor = $complete ? null : ($ids[count($ids) - 1] ?? throw new MailImportFailure(
+            MailImportStage::Inventory,
+            MailImportCode::StateMismatch,
+        ));
 
         return new InventoryPage(
             $references,
@@ -362,8 +409,8 @@ final class FastmailJmapMailboxReader implements MailboxReader
                 'account_id' => $account->provider_account_id,
                 'session_state' => $session['session_state'],
                 'email_state' => $emailState,
-                'query_state' => $queryState,
-                'position' => $position,
+                'anchor' => $nextAnchor,
+                'progress' => $cursor['progress'] + count($ids),
             ]),
             $complete,
             accountProfile: $profile,
@@ -502,6 +549,7 @@ final class FastmailJmapMailboxReader implements MailboxReader
             throw match ($type) {
                 'cannotCalculateChanges' => new MailImportFailure($stage, MailImportCode::HistoryExpired),
                 'stateMismatch', 'accountNotFound' => new MailImportFailure($stage, MailImportCode::StateMismatch),
+                'anchorNotFound' => new MailImportFailure($stage, MailImportCode::StateMismatch, cursorRejected: true),
                 'forbidden', 'accountNotSupportedByMethod' => new MailImportFailure($stage, MailImportCode::PermissionDenied),
                 'notFound' => new MailImportFailure($stage, MailImportCode::MessageUnavailable),
                 'serverFail', 'serverPartialFail' => new MailImportFailure($stage, MailImportCode::ProviderUnavailable, true),
@@ -1027,7 +1075,11 @@ final class FastmailJmapMailboxReader implements MailboxReader
         );
     }
 
-    /** @return array{phase: string, account_id: string, session_state: string, email_state: string|null, query_state: string|null, position: int} */
+    /**
+     * @return array{phase: string, account_id: string, session_state: string, email_state: string|null, anchor: string|null, progress: int}
+     *
+     * @throws InventoryRestartRequired When a bounded legacy (position-based) full-scan cursor is decoded.
+     */
     private function decodeCursor(string $cursor): array
     {
         if (strlen($cursor) > 8192 || ! preg_match('/^[A-Za-z0-9_-]+$/', $cursor)) {
@@ -1037,28 +1089,63 @@ final class FastmailJmapMailboxReader implements MailboxReader
         $decoded = base64_decode(strtr($cursor, '-_', '+/'), true);
         $state = is_string($decoded) ? json_decode($decoded, true) : null;
 
-        if (! is_array($state) || ! in_array($state['phase'] ?? null, ['resources', 'changes', 'full'], true)
-            || ! is_string($state['account_id'] ?? null) || $state['account_id'] === ''
-            || ! is_string($state['session_state'] ?? null) || $state['session_state'] === ''
-            || (! is_string($state['email_state'] ?? null) && ($state['email_state'] ?? null) !== null)
-            || (! is_string($state['query_state'] ?? null) && ($state['query_state'] ?? null) !== null)
-            || ! is_int($state['position'] ?? null) || $state['position'] < 0
-            || ($state['phase'] === 'resources' && ($state['email_state'] !== null || $state['query_state'] !== null || $state['position'] !== 0))
-            || ($state['phase'] === 'changes' && (($state['email_state'] ?? '') === '' || $state['query_state'] !== null || $state['position'] !== 0))
-            || ($state['phase'] === 'full' && (($state['email_state'] ?? '') === ''
-                || ($state['position'] === 0 && $state['query_state'] !== null)
-                || ($state['position'] > 0 && ($state['query_state'] ?? '') === '')))) {
+        if (! is_array($state)) {
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::StateMismatch);
         }
 
-        /** @var array{phase: string, account_id: string, session_state: string, email_state: string|null, query_state: string|null, position: int} $state */
+        $legacyAccountId = $state['account_id'] ?? null;
+        $legacySessionState = $state['session_state'] ?? null;
+        $legacyEmailState = $state['email_state'] ?? null;
+        $legacyQueryState = $state['query_state'] ?? null;
+        $legacyPosition = $state['position'] ?? null;
+
+        // A cursor persisted by the previous position-based full-scan schema
+        // would permanently strand the import: every retry re-fails on the same
+        // cursor. Recognize its exact bounded shape and restart with a fresh
+        // full cursor derived from the SAME cursor's preserved email_state (a
+        // newer state must not be captured, so deletion evidence recorded
+        // during the abandoned scan stays replayable). Anything else that does
+        // not match the current schema — including tampered hybrids — stays a
+        // terminal StateMismatch below.
+        if (! array_key_exists('anchor', $state) && ! array_key_exists('progress', $state)
+            && ($state['phase'] ?? null) === 'full'
+            && is_string($legacyAccountId) && $legacyAccountId !== '' && mb_strlen($legacyAccountId) <= 255
+            && is_string($legacySessionState) && $legacySessionState !== '' && mb_strlen($legacySessionState) <= 255
+            && is_string($legacyEmailState) && $legacyEmailState !== '' && mb_strlen($legacyEmailState) <= 255
+            && is_string($legacyQueryState) && $legacyQueryState !== '' && mb_strlen($legacyQueryState) <= 255
+            && is_int($legacyPosition) && $legacyPosition >= 0) {
+            throw new InventoryRestartRequired($this->encodeCursor([
+                'phase' => 'full',
+                'account_id' => $legacyAccountId,
+                'session_state' => $legacySessionState,
+                'email_state' => $legacyEmailState,
+                'anchor' => null,
+                'progress' => 0,
+            ]));
+        }
+
+        if (! in_array($state['phase'] ?? null, ['resources', 'changes', 'full'], true)
+            || ! is_string($state['account_id'] ?? null) || $state['account_id'] === ''
+            || ! is_string($state['session_state'] ?? null) || $state['session_state'] === ''
+            || (! is_string($state['email_state'] ?? null) && ($state['email_state'] ?? null) !== null)
+            || (! is_string($state['anchor'] ?? null) && ($state['anchor'] ?? null) !== null)
+            || ! is_int($state['progress'] ?? null) || $state['progress'] < 0
+            || ($state['phase'] === 'resources' && ($state['email_state'] !== null || $state['anchor'] !== null || $state['progress'] !== 0))
+            || ($state['phase'] === 'changes' && (($state['email_state'] ?? '') === '' || $state['anchor'] !== null || $state['progress'] !== 0))
+            || ($state['phase'] === 'full' && (($state['email_state'] ?? '') === ''
+                || ($state['progress'] === 0 && $state['anchor'] !== null)
+                || ($state['progress'] > 0 && ($state['anchor'] ?? '') === '')))) {
+            throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::StateMismatch);
+        }
+
+        /** @var array{phase: string, account_id: string, session_state: string, email_state: string|null, anchor: string|null, progress: int} $state */
         return $state;
     }
 
-    /** @param array{phase: string, account_id: string, session_state: string, email_state: string|null, query_state: string|null, position: int} $state */
+    /** @param array{phase: string, account_id: string, session_state: string, email_state: string|null, anchor: string|null, progress: int} $state */
     private function encodeCursor(array $state): string
     {
-        foreach ([$state['account_id'], $state['session_state'], $state['email_state'], $state['query_state']] as $value) {
+        foreach ([$state['account_id'], $state['session_state'], $state['email_state'], $state['anchor']] as $value) {
             if ($value !== null && mb_strlen($value) > 255) {
                 throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
             }
@@ -1069,7 +1156,7 @@ final class FastmailJmapMailboxReader implements MailboxReader
 
     /**
      * @param  array{api_url: string, download_url: string, session_state: string}  $session
-     * @return array{phase: string, account_id: string, session_state: string, email_state: string, query_state: null, position: int}
+     * @return array{phase: string, account_id: string, session_state: string, email_state: string, anchor: null, progress: int}
      */
     private function fullState(MailAccount $account, array $session, string $emailState): array
     {
@@ -1078,8 +1165,8 @@ final class FastmailJmapMailboxReader implements MailboxReader
             'account_id' => $account->provider_account_id,
             'session_state' => $session['session_state'],
             'email_state' => $emailState,
-            'query_state' => null,
-            'position' => 0,
+            'anchor' => null,
+            'progress' => 0,
         ];
     }
 
@@ -1097,8 +1184,8 @@ final class FastmailJmapMailboxReader implements MailboxReader
             'account_id' => $account->provider_account_id,
             'session_state' => $session['session_state'],
             'email_state' => null,
-            'query_state' => null,
-            'position' => 0,
+            'anchor' => null,
+            'progress' => 0,
         ]);
     }
 
