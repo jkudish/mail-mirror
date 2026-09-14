@@ -82,6 +82,144 @@ it('exchanges an authorization code, validates the exact grant, and discovers th
         && $request['client_secret'] === 'synthetic-client-secret-3206');
 });
 
+it('exchanges an existing refresh token, validates the exact grant, and discovers the profile', function (): void {
+    $refreshToken = 'synthetic-restored-refresh-3206';
+
+    Http::fake(function (Request $request) {
+        if ($request->url() === 'https://oauth2.googleapis.com/token') {
+            return Http::response([
+                'access_token' => 'synthetic-restored-access-3206',
+                'expires_in' => 1800,
+                'scope' => GmailOAuth::SCOPE,
+            ]);
+        }
+
+        return Http::response([
+            'emailAddress' => 'restored@invented.test',
+            'messagesTotal' => 12,
+            'threadsTotal' => 7,
+            'historyId' => 'history-restored-100',
+        ]);
+    });
+
+    $authorization = app(GmailOAuth::class)->exchangeRefreshToken($refreshToken);
+
+    expect($authorization)->toBeInstanceOf(GmailAuthorization::class)
+        ->and($authorization->credential()->accessToken())->toBe('synthetic-restored-access-3206')
+        ->and($authorization->credential()->refreshToken())->toBe($refreshToken)
+        ->and($authorization->credential()->scopes())->toBe([GmailOAuth::SCOPE])
+        ->and($authorization->credential()->expiresAt())->not->toBeNull()
+        ->and($authorization->profile->providerAccountId)->toBe('restored@invented.test')
+        ->and($authorization->profile->emailAddress)->toBe('restored@invented.test')
+        ->and($authorization->profile->providerMetadata)->toBe([
+            'history_id' => 'history-restored-100',
+            'messages_total' => 12,
+            'threads_total' => 7,
+        ]);
+
+    Http::assertSent(fn (Request $request): bool => $request->url() === 'https://oauth2.googleapis.com/token'
+        && $request->method() === 'POST'
+        && $request->hasHeader('Content-Type', 'application/x-www-form-urlencoded')
+        && $request['grant_type'] === 'refresh_token'
+        && $request['refresh_token'] === $refreshToken
+        && $request['client_id'] === 'synthetic-client-id.apps.example.test'
+        && $request['client_secret'] === 'synthetic-client-secret-3206'
+        && ! isset($request['redirect_uri'])
+        && ! isset($request['code'])
+        && ! isset($request['code_verifier']));
+    Http::assertSent(fn (Request $request): bool => $request->url() === 'https://gmail.googleapis.com/gmail/v1/users/me/profile'
+        && $request->hasHeader('Authorization', 'Bearer synthetic-restored-access-3206'));
+    Http::assertSentCount(2);
+});
+
+it('rejects invalid, revoked, and broader restored refresh-token grants without leaking the token', function (array $response, int $status): void {
+    $refreshToken = 'hostile-restored-refresh-secret-3206';
+
+    Http::fake([
+        'https://oauth2.googleapis.com/token' => Http::response($response, $status),
+    ]);
+
+    try {
+        app(GmailOAuth::class)->exchangeRefreshToken($refreshToken);
+        throw new RuntimeException('The unsafe restored refresh-token grant was accepted.');
+    } catch (GmailAuthorizationException $failure) {
+        expect((string) $failure)->not->toContain($refreshToken)
+            ->and($failure->grantInvalid)->toBe(($response['error'] ?? null) === 'invalid_grant');
+    }
+
+    Http::assertSentCount(1);
+})->with([
+    'invalid response' => [['access_token' => 'hostile-restored-access-3206', 'expires_in' => 3600], 200],
+    'revoked token' => [['error' => 'invalid_grant', 'error_description' => 'Token has been expired or revoked.'], 400],
+    'broader grant' => [[
+        'access_token' => 'hostile-restored-access-3206',
+        'expires_in' => 3600,
+        'scope' => GmailOAuth::SCOPE.' openid',
+    ], 200],
+    'numeric-looking extra scope' => [[
+        'access_token' => 'hostile-restored-access-3206',
+        'expires_in' => 3600,
+        'scope' => GmailOAuth::SCOPE.' 0',
+    ], 200],
+    'empty replacement refresh token' => [[
+        'access_token' => 'hostile-restored-access-3206',
+        'refresh_token' => '',
+        'expires_in' => 3600,
+        'scope' => GmailOAuth::SCOPE,
+    ], 200],
+]);
+
+it('rejects an empty restored refresh token before network access', function (): void {
+    expect(fn () => app(GmailOAuth::class)->exchangeRefreshToken(''))
+        ->toThrow(GmailAuthorizationException::class);
+
+    Http::assertNothingSent();
+});
+
+it('requires the provider gate and token client configuration before restoring a refresh token', function (array $configuration, ?string $secret): void {
+    if (array_key_exists('enabled', $configuration)) {
+        config()->set('mail-mirror.gmail.enabled', $configuration['enabled']);
+    }
+
+    if (array_key_exists('client_id', $configuration)) {
+        config()->set('mail-mirror.gmail.client_id', $configuration['client_id']);
+    }
+
+    putenv($secret === null ? 'MAIL_MIRROR_GMAIL_CLIENT_SECRET' : "MAIL_MIRROR_GMAIL_CLIENT_SECRET={$secret}");
+
+    expect(fn () => app(GmailOAuth::class)->exchangeRefreshToken('synthetic-restored-refresh-3206'))
+        ->toThrow(GmailAuthorizationException::class);
+
+    Http::assertNothingSent();
+})->with([
+    'disabled provider' => [['enabled' => false], 'synthetic-client-secret-3206'],
+    'missing client id' => [['client_id' => ''], 'synthetic-client-secret-3206'],
+    'missing client secret' => [[], null],
+]);
+
+it('restores without redirect configuration and accepts a rotated refresh token', function (): void {
+    config()->set('mail-mirror.gmail.redirect_uri', '');
+    Http::fake(function (Request $request) {
+        return $request->url() === 'https://oauth2.googleapis.com/token'
+            ? Http::response([
+                'access_token' => 'synthetic-rotated-access-3206',
+                'refresh_token' => 'synthetic-rotated-refresh-3206',
+                'expires_in' => 3600,
+                'scope' => GmailOAuth::SCOPE,
+            ])
+            : Http::response([
+                'emailAddress' => 'rotated@invented.test',
+                'messagesTotal' => 1,
+                'threadsTotal' => 1,
+                'historyId' => 'history-rotated-100',
+            ]);
+    });
+
+    $authorization = app(GmailOAuth::class)->exchangeRefreshToken('synthetic-original-refresh-3206');
+
+    expect($authorization->credential()->refreshToken())->toBe('synthetic-rotated-refresh-3206');
+});
+
 it('rejects an authorization-code exchange that cannot establish refresh integration', function (): void {
     Http::fake([
         'https://oauth2.googleapis.com/token' => Http::response([
