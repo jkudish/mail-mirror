@@ -1,175 +1,118 @@
 # MailMirror
 
-MailMirror is a private, standalone Laravel package foundation. It provides an
-account-rooted, provider-neutral persistence schema, resumable inventory/import
-and reconciliation orchestration, read-only driver contracts, and immutable
-raw-message and materialized-attachment byte storage. It includes a read-only
-Gmail integration, but no search or provider mutation API.
+Mirror Gmail and Fastmail accounts into account-scoped Laravel models and
+private object storage.
 
-Mail accounts may optionally belong to a consumer model through a polymorphic
-owner. Provider-derived records are isolated by account-qualified identifiers
-and composite account/parent foreign keys. Drivers are selected with the closed
-`MailDriver` enum (`gmail` and `jmap`); consumers register read adapters in
-`MailDriverRegistry` with enum keys rather than arbitrary strings.
+MailMirror provides read-only Gmail and JMAP adapters, resumable imports,
+reconciliation reports, encrypted credential storage, and integrity-checked
+RFC 822 and attachment storage. It does not provide a UI, search, or provider
+write operations.
 
-The package registers its Gmail reader under `MailDriver::Gmail` and its
-Fastmail API-token JMAP reader under `MailDriver::Jmap`. Gmail OAuth
-requests exactly `gmail.modify`, validates the exact returned grant, and keeps
-token refresh, rotation, and local invalid-grant revocation inside
-`MailAccountConnection`. Provider network access is fail-closed unless
-the matching driver opt-in is true; ordinary verification never enables either
-driver. See the separately authorized
-[Gmail](docs/gmail-live-development.md) and
-[Fastmail JMAP](docs/fastmail-jmap-live-development.md) development lanes.
+## Requirements
 
-## Development
+- PHP 8.4 or 8.5
+- Laravel 12 or 13
+- PostgreSQL in production
+
+SQLite is supported for tests and local development.
+
+## Installation
+
+Install the package with Composer, then run its migrations:
 
 ```bash
-./.agents/setup
-composer verify
+composer require jkudish/mail-mirror
+php artisan migrate
 ```
 
-The package supports PHP 8.4–8.5 and Laravel 12–13. PostgreSQL is the supported
-runtime database; SQLite is supported for package tests and local consumers.
-The migration fails closed on other database drivers.
+Laravel package discovery registers the service provider, configuration,
+migrations, and built-in Gmail and Fastmail JMAP readers.
 
-The package suite uses SQLite by default. To exercise the feature tests on a
-disposable PostgreSQL database, set `MAIL_MIRROR_TEST_POSTGRES=1` and the
-`MAIL_MIRROR_TEST_POSTGRES_*` connection variables before running Pest. The
-test harness runs `migrate:fresh` before every test and must never target a
-shared or persistent database.
-
-The package [ownership and boundary contract](docs/architecture/ownership-and-boundaries.md)
-defines mail accounts as the roots for provider-derived records while keeping
-consumer ownership optional and consumer-neutral. Future storage, credential,
-import, reconciliation, and provider work must add its concrete isolation tests
-alongside the implementation.
-
-For application installation, configuration, a minimal import, failure
-recovery, lifecycle events, and package evolution rules, follow the
-[consumer integration guide](docs/consumer-integration.md).
-
-## Resumable import and reconciliation
-
-`MailboxReader::inventoryPage()` returns account-qualified message references,
-an opaque next cursor, completion status, and any explicit provider deletion
-evidence. `MailImportEngine` processes one bounded page at a time. It retrieves
-messages sequentially, retries only explicitly retryable content-safe failures
-up to `mail-mirror.import_max_attempts`, and commits inventory rows, idempotent
-message/thread/header/participant/attachment/container state, sparse errors,
-scan-qualified deletion evidence, and the checkpoint in one transaction. Later
-provider state replaces stale child rows and memberships while preserving
-provider-native metadata. `RetrievedMessage` carries optional immutable sent and
-received datetimes into the corresponding message columns. Import failures use
-the package-owned `MailImportStage` and `MailImportCode` closed values; unknown
-driver strings normalize to generic content-safe metadata and never reach
-persistence or exceptions. The optimistic checkpoint version and account row
-lock reject concurrent or stale advancement. Inventory pages are rejected above
-`mail-mirror.inventory_page_max_messages`; the cursor changes only after all
-corresponding database and object work is durable.
-
-`MailMessage` identity is exactly `(mail_account_id, provider_message_id)`.
-The nullable, non-unique `internet_message_id` preserves RFC Message-ID when
-available but is never provider identity. One `mail_sync_checkpoints` row per
-account holds only current resumable state: stable scan ID, opaque cursor,
-version, progress, and timestamps. There is no generic run lifecycle.
-
-`MailMessageStateReader::read()` returns the current provider-neutral unread,
-flagged, draft, sent, spam, and trash flags together with bounded native
-keywords and account-qualified container facts. It reads only durable local
-records and rejects cross-account message references. Legacy records remain
-rebuildable without provider access; provider-specific facts stay authoritative
-in MailMirror while consumers choose their own visibility and retention policy.
-When shared container state changes, MailMirror emits an account-qualified,
-after-commit event so consumers can refresh every affected local projection.
-
-On completion, `ReconciliationService` writes one immutable metadata-only
-report per account/scan. It distinguishes mirrored inventory, provider-proven
-deletions, open transient errors, explicitly waived errors, unexplained missing
-inventory, and unexpected active mirror records. Reports, errors, and thrown
-exceptions contain no message content, credentials, object keys, or provider
-error text. For current inventory, an open unwaived error takes precedence over
-a prior mirror row, followed by an open waiver; only rows without an open error
-are mirrored or unexplained. Each report category contains its indexed SQL count
-plus at most `mail-mirror.reconciliation_sample_limit` opaque provider IDs and a
-`truncated` flag; it never stores the full provider inventory. Deletion evidence
-explains a difference only for the completed scan that observed it and is
-invalidated by reappearance. MailMirror does not quarantine, retain, purge, or
-otherwise apply deletion lifecycle policy here.
-
-Committed deletion-evidence changes dispatch
-`ProviderDeletionStateChanged(mailAccountId, providerMessageId, hasEvidence)`.
-The event implements Laravel's `ShouldDispatchAfterCommit`; consumers can
-idempotently start or cancel their own recovery episode without observing
-rolled-back import state. The import engine dispatches it explicitly for both
-evidence upserts and query-builder removal paths rather than relying on Eloquent
-observers.
-
-The upgrade migration refuses to replace populated legacy run/checkpoint state
-before making any schema change. Its rollback restores compatible legacy run,
-checkpoint, and provider identity schema; clean installs use only the
-simplified import foundation.
-
-Consumers may call `syncAccount()` with scalar account and owner tuple values;
-the engine reacquires the account and rejects mismatches before provider or
-database side effects. Work is deliberately sequential (bounded concurrency of
-one) until a concrete provider demonstrates a need for wider concurrency.
-
-The package automatically registers its config and migration. Applications can
-publish the config with Laravel's conventional `vendor:publish` command; the
-migration is loaded directly from the package so it cannot also be published
-and accidentally run twice. Models use the application's default database
-connection unless `mail-mirror.database_connection` selects another configured
-connection.
-
-## Immutable object storage
-
-Set `mail-mirror.storage_disk` to a private Laravel Filesystem disk. Consumers
-use the package-owned `MailObjectStorage` boundary and must pass both the
-`MailAccount` and matching message, raw object, or attachment record for every
-operation. Reads verify SHA-256 and byte count before exposing a rewindable
-stream. `integrityReport()` returns IDs, MIME metadata, checksums, sizes, and
-statuses only; it never returns object keys, filenames, or content.
-
-Writes first hash a bounded-memory local stream. Inside a database transaction
-they lock the message row, reject any different immutable record, create the
-uniquely constrained record, stream an account/message/content-addressed object
-with private visibility, and verify it. A failed write is removed; a partial
-object left by process interruption is repaired by an identical retry. If
-object finalization succeeds inside an import page that later rolls back, the
-engine calls an account-qualified cleanup boundary after the root rollback. It
-deletes the key only when no durable raw-object row references it, preserving
-previously committed bytes. Missing materialized attachments can be regenerated
-from the verified, unchanged RFC 822 raw source using stable MIME part paths.
-
-Consumers that have independently authorized a local retention purge may call
-`MailObjectStorage::purgeMessage()` with the account/owner tuple, provider
-message ID, and current checkpoint version. It locks the account, message, and
-checkpoint; removes every account-qualified raw and materialized attachment
-object before deleting the normalized occurrence and its object references;
-and advances the checkpoint version to fence stale import work. A partial
-filesystem failure leaves every reference available for a convergent retry.
-A minimal account/provider tombstone blocks stale materialization and preserves
-reconciliation meaning until fresh provider hydration replaces it. Shared
-threads and addresses are retained while referenced by another occurrence.
-MailMirror never calls this method automatically, chooses a retention period,
-or performs a provider write.
-
-The setup is independent and idempotent. In the combined Amp project, jMail's
-primary setup invokes it from `../repos/mail-mirror` relative to jMail because
-Amp automatically runs only the primary repository setup.
-
-Pull requests use repository-owned, credential-free Amp-orb verification:
+Publish the configuration if you need to change the database connection,
+storage disk, import limits, or provider settings:
 
 ```bash
-composer pr:check
+php artisan vendor:publish --tag=mail-mirror-config
 ```
 
-The plan verifies Laravel 12 and 13 against stable and prefer-lowest dependency
-graphs, clean Laravel 12 and 13 consumer migrations and synthetic imports,
-quality checks, workflow safeguards, and a final clean diff. Deprecations fail
-every package-test graph. It writes a mode-`0600` exact-commit receipt in
-`.git`. GitHub Actions and enforced rulesets are intentionally absent. See
-the [pull-request verification skill](.agents/skills/verifying-pull-requests/SKILL.md)
-for exact-SHA or prospectively delegated approval, dedicated-token signoff,
-required status read-back, and authority boundaries.
+Set `MAIL_MIRROR_STORAGE_DISK` to a private Laravel Filesystem disk before
+mirroring real mail. Gmail and JMAP network access remain disabled until you
+enable the matching provider.
+
+## Mirror an account
+
+Create a `MailAccount`, store its credential, then call `syncAccount()`. This
+Fastmail example assumes `$apiToken` came from your application's secret
+manager:
+
+```php
+use Jkudish\MailMirror\Credentials\ApiTokenCredential;
+use Jkudish\MailMirror\Credentials\MailAccountConnection;
+use Jkudish\MailMirror\Enums\MailDriver;
+use Jkudish\MailMirror\Import\MailImportEngine;
+use Jkudish\MailMirror\Models\MailAccount;
+
+$account = MailAccount::query()->create([
+    'owner_type' => 'user',
+    'owner_id' => (string) $user->getKey(),
+    'driver' => MailDriver::Jmap,
+    'provider_account_id' => $providerAccountId,
+]);
+
+app(MailAccountConnection::class)->store(
+    $account,
+    new ApiTokenCredential($apiToken),
+);
+
+$report = app(MailImportEngine::class)->syncAccount(
+    mailAccountId: $account->id,
+    ownerType: 'user',
+    ownerId: $user->getKey(),
+    pageLimit: 10,
+);
+```
+
+Set `MAIL_MIRROR_JMAP_ENABLED=true` before the import. For Gmail, complete the
+OAuth flow with `GmailOAuth`, store the returned `OAuthTokenSetCredential`, and
+set `MAIL_MIRROR_GMAIL_ENABLED=true`.
+
+A bounded import returns `null` when more pages remain. Call `syncAccount()`
+again with the same account and owner tuple to resume. A completed scan returns
+an immutable `MailReconciliationReport` with mirrored, provider-deleted,
+transient-error, waived-error, unexplained-missing, and unexpected-active
+counts.
+
+Imports are idempotent. MailMirror qualifies provider identities by account,
+commits each page with its checkpoint, and verifies stored object checksums and
+byte counts before returning content.
+
+## Application responsibilities
+
+Your application must:
+
+- authenticate and authorize the owner before every package call;
+- keep credentials outside logs, queues, events, and browser payloads;
+- use a private storage disk for real mail;
+- decide retention and deletion policy;
+- retry bounded imports and investigate reconciliation errors;
+- treat package events as notification references, not authorization.
+
+MailMirror never sends mail, changes mailbox state, or purges local mail on its
+own.
+
+## Documentation
+
+- [Consumer integration](docs/consumer-integration.md)
+- [Ownership and trust boundaries](docs/architecture/ownership-and-boundaries.md)
+- [Gmail development-account check](docs/gmail-live-development.md)
+- [Fastmail JMAP development-account check](docs/fastmail-jmap-live-development.md)
+- [Verification](docs/verification.md)
+- [Releasing](docs/releasing.md)
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local development and
+[SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+
+## License
+
+MailMirror is open source software licensed under the
+[MIT License](LICENSE.md).

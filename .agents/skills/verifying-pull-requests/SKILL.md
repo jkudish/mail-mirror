@@ -3,7 +3,7 @@ name: verifying-pull-requests
 description: Verifies MailMirror pull requests in an Amp orb and posts trusted exact-SHA signoff. Use before creating, updating, or signing off a pull request.
 ---
 
-# Verifying Pull Requests
+# Verifying pull requests
 
 Use the repository-owned commands. Do not reconstruct or bypass the plan.
 

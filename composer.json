@@ -1,8 +1,8 @@
 {
     "$schema": "https://getcomposer.org/schema.json",
     "name": "jkudish/mail-mirror",
-    "description": "A standalone Laravel package foundation for MailMirror.",
-    "keywords": ["laravel", "mail-mirror"],
+    "description": "Mirror Gmail and Fastmail accounts into account-scoped Laravel models and object storage.",
+    "keywords": ["email", "fastmail", "gmail", "jmap", "laravel", "mail-mirror"],
     "homepage": "https://github.com/jkudish/mail-mirror",
     "license": "MIT",
     "type": "library",
