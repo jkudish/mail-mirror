@@ -52,8 +52,9 @@ bash scripts/test-consumer-install.sh 12
 ```
 
 Together they cover Laravel 12 and 13 with stable and lowest-supported
-dependencies. Consumer checks install a package archive, run migrations, and
-prove that a repeated synthetic import converges without provider access.
+dependencies. Consumer checks install a non-symlinked local package copy, run
+migrations, and prove that a repeated synthetic import converges without
+provider access.
 
 ## Pull-request verification
 

@@ -776,6 +776,7 @@ it('uses stable anchors across query-state drift and insertion before the anchor
 it('restarts a persisted legacy full cursor with a fresh scan while preserving its email state', function (): void {
     $fixture = jmapFixture();
     $account = jmapAccount();
+    $legacyScanId = '00000000-0000-4000-8000-000000003207';
     // A newer state on the account must not be captured; the abandoned scan's
     // own baseline email_state has to survive so deletion evidence stays replayable.
     $account->forceFill(['provider_metadata' => ['email_state' => 'jmap-email-state-newer']])->save();
@@ -789,7 +790,7 @@ it('restarts a persisted legacy full cursor with a fresh scan while preserving i
     ], JSON_THROW_ON_ERROR)), '+/', '-_'), '=');
     MailSyncCheckpoint::query()->create([
         'mail_account_id' => $account->id,
-        'scan_id' => 'synthetic-legacy-scan-3207',
+        'scan_id' => $legacyScanId,
         'version' => 0,
         'processed_count' => 0,
         'provider_cursor' => $legacyCursor,
@@ -803,7 +804,7 @@ it('restarts a persisted legacy full cursor with a fresh scan while preserving i
     expect($report?->inventory_count)->toBe(2)
         ->and(MailMessage::query()->forAccount($account)->count())->toBe(2)
         ->and($account->refresh()->provider_metadata['email_state'] ?? null)->toBe('jmap-email-state-legacy')
-        ->and(MailSyncCheckpoint::query()->forAccount($account)->value('scan_id'))->not->toBe('synthetic-legacy-scan-3207')
+        ->and(MailSyncCheckpoint::query()->forAccount($account)->value('scan_id'))->not->toBe($legacyScanId)
         ->and(MailSyncCheckpoint::query()->forAccount($account)->value('provider_cursor'))->not->toBe($legacyCursor);
 });
 
