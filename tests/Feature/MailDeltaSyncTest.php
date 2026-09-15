@@ -379,6 +379,72 @@ it('confirms exact source absence after a complete repair and finitely quarantin
         ->and(MailDeltaCheckpoint::query()->forAccount($account)->value('provider_cursor'))->toBe('expired-deletion-caught-up');
 });
 
+it('durably resolves an oversized exact-source repair batch across bounded invocations', function (): void {
+    config()->set('mail-mirror.inventory_page_max_messages', 2);
+    $account = deltaAccount('delta-repair-bounded-exact');
+
+    foreach (['absent-a', 'absent-b', 'absent-c'] as $providerMessageId) {
+        MailMessage::query()->create([
+            'mail_account_id' => $account->id,
+            'provider_message_id' => $providerMessageId,
+        ]);
+    }
+
+    $reader = new DeterministicDeltaReader;
+    $reader->repairCursor = 'bounded-exact-baseline';
+    $reader->inventoryPages['start'] = new InventoryPage([], null, true);
+    $reader->changePages['bounded-exact-baseline'] = new MailboxChangesPage([], [], [], false, 'bounded-exact-caught-up', true);
+    $reader->unavailableRetrieval = ['absent-a' => true, 'absent-b' => true, 'absent-c' => true];
+    $engine = deltaEngine($reader);
+
+    $first = $engine->syncChanges($account);
+    $checkpoint = MailDeltaCheckpoint::query()->forAccount($account)->firstOrFail();
+    $repairScanId = $checkpoint->repair_scan_id;
+
+    expect($first->repairPending)->toBeTrue()
+        ->and($reader->retrieved)->toBe(['absent-a', 'absent-b'])
+        ->and(MailProviderDeletionEvidence::query()->forAccount($account)->where('scan_id', $repairScanId)->count())->toBe(2);
+
+    $second = $engine->syncChanges($account);
+
+    expect($second->caughtUp)->toBeTrue()
+        ->and($second->repairPending)->toBeFalse()
+        ->and($reader->retrieved)->toBe(['absent-a', 'absent-b', 'absent-c'])
+        ->and(MailProviderDeletionEvidence::query()->forAccount($account)->where('scan_id', $repairScanId)->count())->toBe(3)
+        ->and($checkpoint->refresh()->repair_scan_id)->toBeNull();
+});
+
+it('keeps completed exact-source repair outcomes when its shared budget stops a later candidate', function (): void {
+    $account = deltaAccount('delta-repair-budgeted-exact');
+
+    foreach (['budget-absent-a', 'budget-absent-b'] as $providerMessageId) {
+        MailMessage::query()->create([
+            'mail_account_id' => $account->id,
+            'provider_message_id' => $providerMessageId,
+        ]);
+    }
+
+    $reader = new DeterministicDeltaReader;
+    $reader->repairCursor = 'budgeted-exact-baseline';
+    $reader->inventoryPages['start'] = new InventoryPage([], null, true);
+    $reader->changePages['budgeted-exact-baseline'] = new MailboxChangesPage([], [], [], false, 'budgeted-exact-caught-up', true);
+    $reader->unavailableRetrieval = ['budget-absent-a' => true, 'budget-absent-b' => true];
+    $engine = deltaEngine($reader);
+
+    expect(fn () => $engine->syncChanges($account, budget: new SyncWorkBudget(maxFetchedMessages: 1)))
+        ->toThrow(SyncBudgetExhausted::class);
+    $repairScanId = MailDeltaCheckpoint::query()->forAccount($account)->value('repair_scan_id');
+
+    expect(MailProviderDeletionEvidence::query()->forAccount($account)->where('scan_id', $repairScanId)->pluck('provider_message_id')->all())
+        ->toBe(['budget-absent-a']);
+
+    $result = $engine->syncChanges($account, budget: new SyncWorkBudget(maxFetchedMessages: 1));
+
+    expect($result->caughtUp)->toBeTrue()
+        ->and($reader->retrieved)->toBe(['budget-absent-a', 'budget-absent-b'])
+        ->and(MailProviderDeletionEvidence::query()->forAccount($account)->where('scan_id', $repairScanId)->count())->toBe(2);
+});
+
 it('replays its captured baseline when an unexpected local message is present at exact source', function (): void {
     $account = deltaAccount('delta-repair-unexpected-present');
     $message = MailMessage::query()->create([

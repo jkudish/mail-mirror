@@ -621,8 +621,6 @@ final readonly class MailImportEngine
 
         if ($report->unexpected_active_count > 0
             && ! $this->resolveRepairUnexpectedActive($account, $expected, $report, $budget)) {
-            $this->restartDeltaRepairScan($account, $expected);
-
             return new DeltaSyncResult(0, false, true);
         }
 
@@ -682,6 +680,11 @@ final readonly class MailImportEngine
         $limit = config('mail-mirror.inventory_page_max_messages', 500);
         $limit = is_int($limit) && $limit > 0 ? $limit : 500;
         $messages = MailMessage::query()->forAccount($account)
+            ->leftJoin('mail_import_errors as repair_errors', function (JoinClause $join): void {
+                $join->on('repair_errors.mail_account_id', '=', 'mail_messages.mail_account_id')
+                    ->on('repair_errors.provider_message_id', '=', 'mail_messages.provider_message_id')
+                    ->where('repair_errors.stage', MailImportStage::Retrieve->value);
+            })
             ->whereNotExists(function (Builder $query) use ($account, $report): void {
                 $query->selectRaw('1')->from('mail_inventory_items as repair_inventory')
                     ->where('repair_inventory.mail_account_id', $account->id)
@@ -694,74 +697,99 @@ final readonly class MailImportEngine
                     ->where('repair_deletions.scan_id', $report->scan_id)
                     ->whereColumn('repair_deletions.provider_message_id', 'mail_messages.provider_message_id');
             })
-            ->orderBy('provider_message_id')
-            ->limit($limit + 1)
-            ->get(['provider_message_id']);
+            ->orderByRaw('COALESCE(repair_errors.attempt_count, 0)')
+            ->orderBy('mail_messages.provider_message_id')
+            ->limit($limit)
+            ->get(['mail_messages.provider_message_id']);
 
-        if ($messages->count() !== $report->unexpected_active_count || $messages->count() > $limit) {
-            return false;
-        }
+        foreach ($messages as $message) {
+            $reference = new MessageReference($account->id, $account->driver, $message->provider_message_id);
+            $outcomes = $this->retrieveReferences($account, [$reference], $budget);
+            $outcome = $outcomes[$reference->providerMessageId];
 
-        $references = array_values($messages->map(fn (MailMessage $message): MessageReference => new MessageReference(
-            $account->id,
-            $account->driver,
-            $message->provider_message_id,
-        ))->all());
-        $outcomes = $this->retrieveReferences($account, $references, $budget);
-        $resolved = ! collect($outcomes)->contains(
-            fn (RetrievedMessage|MailImportFailure $outcome): bool => $outcome instanceof MailImportFailure
-                && $outcome->safeCode !== MailImportCode::MessageUnavailable,
-        );
+            try {
+                $account->getConnection()->transaction(function () use ($account, $expected, $outcome, $reference, $report): void {
+                    MailAccount::query()->whereKey($account->id)->lockForUpdate()->firstOrFail();
+                    $checkpoint = $this->lockDeltaCheckpoint($account, $expected);
 
-        try {
-            $account->getConnection()->transaction(function () use ($account, $expected, $outcomes, $report): void {
-                MailAccount::query()->whereKey($account->id)->lockForUpdate()->firstOrFail();
-                $checkpoint = $this->lockDeltaCheckpoint($account, $expected);
+                    if ($checkpoint === null || $checkpoint->repair_scan_id !== $report->scan_id) {
+                        throw new StaleCheckpoint;
+                    }
 
-                if ($checkpoint === null || $checkpoint->repair_scan_id !== $report->scan_id) {
-                    throw new StaleCheckpoint;
-                }
+                    if ($outcome instanceof MailImportFailure
+                        && $outcome->safeCode !== MailImportCode::MessageUnavailable) {
+                        $this->recordFailure($account, $reference->providerMessageId, $outcome);
 
-                foreach ($outcomes as $providerMessageId => $outcome) {
-                    if (! $outcome instanceof MailImportFailure
-                        || $outcome->safeCode !== MailImportCode::MessageUnavailable) {
-                        continue;
+                        return;
+                    }
+
+                    if ($outcome instanceof RetrievedMessage) {
+                        MailInventoryItem::query()->updateOrCreate(
+                            [
+                                'mail_account_id' => $account->id,
+                                'provider_message_id' => $reference->providerMessageId,
+                            ],
+                            [
+                                'scan_id' => $report->scan_id,
+                                'provider_thread_id' => $reference->providerThreadId,
+                                'provider_metadata' => $reference->providerMetadata,
+                            ],
+                        );
+                        MailImportError::query()->forAccount($account)
+                            ->where('provider_message_id', $reference->providerMessageId)
+                            ->whereNull('resolved_at')
+                            ->update(['resolved_at' => now()]);
+
+                        return;
                     }
 
                     $evidence = MailProviderDeletionEvidence::query()->firstOrNew([
                         'mail_account_id' => $account->id,
-                        'provider_message_id' => $providerMessageId,
+                        'provider_message_id' => $reference->providerMessageId,
                     ]);
                     $evidence->fill([
                         'scan_id' => $report->scan_id,
                         'proof_code' => 'exact_source_absent',
-                        'audit_reference' => 'repair-absence-'.hash('sha256', $report->scan_id.':'.$providerMessageId),
+                        'audit_reference' => 'repair-absence-'.hash('sha256', $report->scan_id.':'.$reference->providerMessageId),
                         'provider_metadata' => [],
                     ])->save();
 
                     if ($evidence->wasRecentlyCreated) {
-                        $this->recordDeletionChange($account, $providerMessageId, true);
+                        $this->recordDeletionChange($account, $reference->providerMessageId, true);
                         $this->events->dispatch(new ProviderDeletionStateChanged(
                             $account->id,
-                            $providerMessageId,
+                            $reference->providerMessageId,
                             true,
                         ));
                     }
 
                     MailDeltaPendingMessage::query()->forAccount($account)
-                        ->where('provider_message_id', $providerMessageId)
+                        ->where('provider_message_id', $reference->providerMessageId)
                         ->delete();
                     MailImportError::query()->forAccount($account)
-                        ->where('provider_message_id', $providerMessageId)
+                        ->where('provider_message_id', $reference->providerMessageId)
                         ->whereNull('resolved_at')
                         ->update(['resolved_at' => now()]);
-                }
-            }, 1);
-        } finally {
-            $this->closeRawSources($outcomes);
+                }, 1);
+            } finally {
+                $this->closeRawSources($outcomes);
+            }
         }
 
-        return $resolved;
+        return ! MailMessage::query()->forAccount($account)
+            ->whereNotExists(function (Builder $query) use ($account, $report): void {
+                $query->selectRaw('1')->from('mail_inventory_items as repair_inventory')
+                    ->where('repair_inventory.mail_account_id', $account->id)
+                    ->where('repair_inventory.scan_id', $report->scan_id)
+                    ->whereColumn('repair_inventory.provider_message_id', 'mail_messages.provider_message_id');
+            })
+            ->whereNotExists(function (Builder $query) use ($account, $report): void {
+                $query->selectRaw('1')->from('mail_provider_deletion_evidence as repair_deletions')
+                    ->where('repair_deletions.mail_account_id', $account->id)
+                    ->where('repair_deletions.scan_id', $report->scan_id)
+                    ->whereColumn('repair_deletions.provider_message_id', 'mail_messages.provider_message_id');
+            })
+            ->exists();
     }
 
     private function startFreshInventoryScan(MailAccount $account): string

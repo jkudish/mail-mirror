@@ -166,9 +166,12 @@ remains pending when that exact scan reports transient errors, unexplained
 missing messages, or an inconclusive exact lookup. For unexpected local
 messages absent from a complete inventory, bounded exact provider lookup either
 confirms current presence or records deletion evidence for quarantine; it never
-purges the message. After convergence, change sync replays from the captured
-repair cursor before reporting `caughtUp`. Partial container snapshots and
-transient or authorization failures never prove deletion.
+purges the message. Each exact outcome is committed under the existing repair
+scan before the next lookup, so a large set or exhausted invocation resumes from
+its remaining messages instead of restarting the scan. After convergence,
+change sync replays from the captured repair cursor before reporting `caughtUp`.
+Partial container snapshots and transient or authorization failures never prove
+deletion.
 
 ### Bound one invocation
 
@@ -213,14 +216,29 @@ contain only scalar counters and limits; they contain no account, message, or
 credential data. A budget exception does not reset a durable cursor: work
 committed before it remains resumable.
 
-HTTP attempts and fetched-message attempts are reserved before work starts.
-Listed IDs and downloaded response bytes are charged at their actual count after
-each buffered provider response. Laravel's HTTP client currently buffers each
-response, so a single response can cross the byte or elapsed limit before the
-exception is raised; the existing provider response-size limit and request
-timeout still bound that overshoot. Custom readers keep their existing API and
-unlimited behavior, but must implement `BudgetedMailboxReader` (and
-`BudgetedDeltaMailboxReader` for deltas) before accepting a finite budget.
+HTTP attempts and fetched-message attempts are reserved before work starts. An
+exactly consumed HTTP, listed-ID, fetched-message, or downloaded-byte allowance
+rejects the next network request. Gmail `maxResults` and JMAP
+`limit`/`maxChanges` are clamped to the remaining listed-ID allowance, although
+one Gmail history record can still expand into multiple message IDs; every
+returned page is therefore validated and charged before persistence.
+
+Budgeted credentialed requests do not follow redirects, and each request
+timeout is the smaller of provider configuration and the remaining elapsed
+allowance. With Guzzle's normal cURL handler, its native `progress` callback
+aborts at the first reported downloaded-byte count beyond the remaining
+allowance. Guzzle does not specify callback granularity, its stream handler
+ignores callback return values, compressed transport bytes can differ from the
+decoded body, and Laravel test fakes do not drive transfer progress. The final
+buffered body length is therefore still charged as a fallback. This is not a
+strict wire-byte guarantee: a response can overshoot until the cURL callback or,
+without cURL progress support, until buffering completes. Provider request
+timeouts and raw-message decoded-size limits remain independent bounds; JSON
+responses have no separate per-response byte cap.
+
+Custom readers keep their existing API and unlimited behavior, but must
+implement `BudgetedMailboxReader` (and `BudgetedDeltaMailboxReader` for deltas)
+before accepting a finite budget.
 
 ### Project source changes
 

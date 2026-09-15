@@ -17,6 +17,8 @@ final class SyncWorkBudget
 
     private int $downloadedBytes = 0;
 
+    private ?string $exhaustedDimension = null;
+
     private readonly int $startedAtNanoseconds;
 
     public function __construct(
@@ -36,7 +38,7 @@ final class SyncWorkBudget
 
     public function claimHttpRequest(): void
     {
-        $this->assertElapsed();
+        $this->assertNetworkAvailable();
 
         if ($this->httpRequests >= $this->maxHttpRequests) {
             $this->exhausted('http_requests');
@@ -88,9 +90,30 @@ final class SyncWorkBudget
 
     public function assertElapsed(): void
     {
+        if ($this->exhaustedDimension !== null) {
+            $this->exhausted($this->exhaustedDimension);
+        }
+
         if ($this->elapsedMilliseconds() >= $this->maxElapsedSeconds * 1000) {
             $this->exhausted('elapsed_time');
         }
+    }
+
+    public function remainingListedIds(): int
+    {
+        return max(0, $this->maxListedIds - $this->listedIds);
+    }
+
+    public function remainingDownloadedBytes(): int
+    {
+        return max(0, $this->maxDownloadedBytes - $this->downloadedBytes);
+    }
+
+    public function remainingElapsedSeconds(): float
+    {
+        $this->assertElapsed();
+
+        return max(0.001, ($this->maxElapsedSeconds * 1000 - $this->elapsedMilliseconds()) / 1000);
     }
 
     /**
@@ -128,8 +151,25 @@ final class SyncWorkBudget
         return (int) floor((hrtime(true) - $this->startedAtNanoseconds) / 1_000_000);
     }
 
+    private function assertNetworkAvailable(): void
+    {
+        $this->assertElapsed();
+
+        foreach ([
+            'listed_ids' => [$this->listedIds, $this->maxListedIds],
+            'fetched_messages' => [$this->fetchedMessages, $this->maxFetchedMessages],
+            'downloaded_bytes' => [$this->downloadedBytes, $this->maxDownloadedBytes],
+        ] as $dimension => [$used, $maximum]) {
+            if ($used >= $maximum) {
+                $this->exhausted($dimension);
+            }
+        }
+    }
+
     private function exhausted(string $dimension): never
     {
+        $this->exhaustedDimension = $dimension;
+
         throw new SyncBudgetExhausted($dimension, $this->snapshot());
     }
 }

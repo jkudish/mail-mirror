@@ -46,3 +46,42 @@ it('enforces elapsed time before more provider work starts', function (): void {
             ->and($failure->snapshot['max_elapsed_milliseconds'])->toBe(0);
     }
 });
+
+it('refuses another network attempt when the listed-ID allowance is exactly consumed', function (): void {
+    $budget = new SyncWorkBudget(maxListedIds: 1);
+    $budget->recordListedIds(1);
+
+    try {
+        $budget->claimHttpRequest();
+        throw new RuntimeException('A fully consumed response allowance admitted another network request.');
+    } catch (SyncBudgetExhausted $failure) {
+        expect($failure->dimension)->toBe('listed_ids')
+            ->and($failure->snapshot['http_requests'])->toBe(0);
+    }
+});
+
+it('refuses another network attempt when the downloaded-byte allowance is exactly consumed', function (): void {
+    $budget = new SyncWorkBudget(maxDownloadedBytes: 1);
+    $budget->recordDownloadedBytes(1);
+
+    try {
+        $budget->claimHttpRequest();
+        throw new RuntimeException('A fully consumed response allowance admitted another network request.');
+    } catch (SyncBudgetExhausted $failure) {
+        expect($failure->dimension)->toBe('downloaded_bytes')
+            ->and($failure->snapshot['http_requests'])->toBe(0);
+    }
+});
+
+it('refuses another network attempt when the fetched-message allowance is exactly consumed', function (): void {
+    $budget = new SyncWorkBudget(maxFetchedMessages: 1);
+    $budget->claimFetchedMessage();
+
+    try {
+        $budget->claimHttpRequest();
+        throw new RuntimeException('A fully consumed response allowance admitted another network request.');
+    } catch (SyncBudgetExhausted $failure) {
+        expect($failure->dimension)->toBe('fetched_messages')
+            ->and($failure->snapshot['http_requests'])->toBe(0);
+    }
+});

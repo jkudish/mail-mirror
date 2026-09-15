@@ -7,6 +7,7 @@ namespace Jkudish\MailMirror\Jmap;
 use Closure;
 use DateTimeImmutable;
 use Illuminate\Http\Client\Factory;
+use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Sleep;
 use InvalidArgumentException;
@@ -141,7 +142,7 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader
             $result = $this->call($account, $session, 'Email/changes', [
                 'accountId' => $account->provider_account_id,
                 'sinceState' => $state['email_state'],
-                'maxChanges' => max(1, $this->resourceLimit() - count($containers)),
+                'maxChanges' => $this->listedPageLimit(max(1, $this->resourceLimit() - count($containers))),
             ], 'delta-changes', MailImportStage::Inventory);
         } catch (MailImportFailure $failure) {
             if (in_array($failure->safeCode, [MailImportCode::HistoryExpired, MailImportCode::StateMismatch], true)) {
@@ -374,7 +375,7 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader
             $result = $this->call($account, $session, 'Email/changes', [
                 'accountId' => $account->provider_account_id,
                 'sinceState' => $cursor['email_state'],
-                'maxChanges' => $this->resourceLimit(),
+                'maxChanges' => $this->listedPageLimit($this->resourceLimit()),
             ], 'changes', MailImportStage::Inventory);
         } catch (MailImportFailure $failure) {
             if (in_array($failure->safeCode, [MailImportCode::HistoryExpired, MailImportCode::StateMismatch], true)) {
@@ -825,12 +826,14 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader
             $this->budget?->claimHttpRequest();
 
             try {
-                $pending = $this->http->withToken($credential->token())->acceptJson()->timeout($this->timeout());
+                $pending = $this->prepareRequest($this->http->withToken($credential->token())->acceptJson());
                 $response = $pending->send($method, $url, $body === null ? [] : ['json' => $body]);
                 $this->budget?->recordDownloadedBytes(strlen($response->body()));
-            } catch (SyncBudgetExhausted $failure) {
-                throw $failure;
-            } catch (Throwable) {
+            } catch (Throwable $failure) {
+                if (($budgetFailure = $this->budgetFailure($failure)) !== null) {
+                    throw $budgetFailure;
+                }
+
                 if ($attempt === $maximum) {
                     throw new MailImportFailure($stage, MailImportCode::ProviderUnavailable, true, $attempt);
                 }
@@ -850,6 +853,41 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader
         }
 
         throw new MailImportFailure($stage, MailImportCode::ProviderUnavailable, true);
+    }
+
+    private function prepareRequest(PendingRequest $request): PendingRequest
+    {
+        if ($this->budget === null) {
+            return $request->timeout($this->timeout());
+        }
+
+        $remainingBytes = $this->budget->remainingDownloadedBytes();
+        $budget = $this->budget;
+
+        return $request->withoutRedirecting()
+            ->timeout(min($this->timeout(), $budget->remainingElapsedSeconds()))
+            ->withOptions([
+                'progress' => static function (int $downloadTotal, int $downloadedBytes) use ($budget, $remainingBytes): bool {
+                    if ($downloadedBytes > $remainingBytes) {
+                        $budget->recordDownloadedBytes($downloadedBytes);
+                    }
+
+                    return false;
+                },
+            ]);
+    }
+
+    private function budgetFailure(Throwable $failure): ?SyncBudgetExhausted
+    {
+        do {
+            if ($failure instanceof SyncBudgetExhausted) {
+                return $failure;
+            }
+
+            $failure = $failure->getPrevious();
+        } while ($failure !== null);
+
+        return null;
     }
 
     /** @param array{api_url: string, download_url: string, session_state: string} $session */
@@ -1496,7 +1534,14 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader
         $size = config('mail-mirror.jmap.page_size', 100);
         $size = is_int($size) && $size >= 1 && $size <= 500 ? $size : 100;
 
-        return min($size, $this->resourceLimit());
+        return $this->listedPageLimit(min($size, $this->resourceLimit()));
+    }
+
+    private function listedPageLimit(int $maximum): int
+    {
+        $listedBudget = $this->budget?->remainingListedIds() ?? $maximum;
+
+        return max(1, min($maximum, $listedBudget));
     }
 
     private function timeout(): int
