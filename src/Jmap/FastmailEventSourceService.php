@@ -28,9 +28,10 @@ final readonly class FastmailEventSourceService
 
     public function receive(MailAccount $account): FastmailEventBatch
     {
+        $deadline = hrtime(true) + ($this->timeout() * 1_000_000_000);
         $account = $this->matchedAccount($account);
         $credential = $this->credential($account);
-        $session = $this->request($credential, self::SESSION_URL, true);
+        $session = $this->request($credential, self::SESSION_URL, $deadline);
         $template = $session['eventSourceUrl'] ?? null;
         $accounts = $session['accounts'] ?? null;
 
@@ -46,8 +47,11 @@ final readonly class FastmailEventSourceService
             throw new ProviderNotificationException('resource_mismatch');
         }
 
-        $response = $this->streamRequest($credential, $url, $state?->last_event_id);
-        $batch = $this->parse($account, $this->readBounded($response));
+        $response = $this->streamRequest($credential, $url, $state?->last_event_id, $deadline);
+        $body = $this->readBounded($response, $deadline);
+        $this->remainingSeconds($deadline);
+        $batch = $this->parse($account, $body);
+        $this->remainingSeconds($deadline);
 
         MailJmapEventSource::query()->firstOrCreate(
             ['mail_account_id' => $account->id],
@@ -81,20 +85,25 @@ final readonly class FastmailEventSourceService
     }
 
     /** @return array<string, mixed> */
-    private function request(ApiTokenCredential $credential, string $url, bool $json): array
+    private function request(ApiTokenCredential $credential, string $url, int $deadline): array
     {
         try {
             $response = $this->http->withToken($credential->token())->acceptJson()
-                ->withOptions(['allow_redirects' => false])->timeout($this->timeout())->get($url);
+                ->withoutRedirecting()->timeout($this->remainingSeconds($deadline))->get($url);
+        } catch (ProviderNotificationException $exception) {
+            throw $exception;
         } catch (Throwable) {
             throw new ProviderNotificationException('provider_unavailable', true);
         }
 
         if (! $response->successful()) {
-            throw $this->failure($response);
+            $failure = $this->failure($response);
+            $this->closeResponse($response);
+
+            throw $failure;
         }
 
-        $payload = $json ? $response->json() : null;
+        $payload = $response->json();
 
         if (! is_array($payload)) {
             throw new ProviderNotificationException('malformed_payload');
@@ -104,34 +113,47 @@ final readonly class FastmailEventSourceService
         return $payload;
     }
 
-    private function streamRequest(ApiTokenCredential $credential, string $url, ?string $lastEventId): Response
-    {
+    private function streamRequest(
+        ApiTokenCredential $credential,
+        string $url,
+        ?string $lastEventId,
+        int $deadline,
+    ): Response {
         if ($lastEventId !== null && ! $this->validEventId($lastEventId)) {
             throw new ProviderNotificationException('resource_mismatch');
         }
 
         try {
+            $remaining = $this->remainingSeconds($deadline);
             $request = $this->http->withToken($credential->token())
                 ->withHeaders(['Accept' => 'text/event-stream', 'Cache-Control' => 'no-cache'])
-                ->withOptions(['allow_redirects' => false, 'stream' => true])
-                ->timeout($this->timeout());
+                ->withoutRedirecting()
+                ->withOptions(['stream' => true, 'read_timeout' => min(1.0, $remaining)])
+                ->timeout($remaining);
 
             if ($lastEventId !== null) {
                 $request = $request->withHeaders(['Last-Event-ID' => $lastEventId]);
             }
 
             $response = $request->get($url);
+        } catch (ProviderNotificationException $exception) {
+            throw $exception;
         } catch (Throwable) {
             throw new ProviderNotificationException('provider_unavailable', true);
         }
 
         if (! $response->successful()) {
-            throw $this->failure($response);
+            $failure = $this->failure($response);
+            $this->closeResponse($response);
+
+            throw $failure;
         }
 
         $contentType = strtolower($response->header('Content-Type'));
 
         if (! str_starts_with($contentType, 'text/event-stream')) {
+            $this->closeResponse($response);
+
             throw new ProviderNotificationException('malformed_payload');
         }
 
@@ -179,27 +201,51 @@ final readonly class FastmailEventSourceService
         return [$url, 'https://api.fastmail.com'];
     }
 
-    private function readBounded(Response $response): string
+    private function readBounded(Response $response, int $deadline): string
     {
         $stream = $response->toPsrResponse()->getBody();
         $maximum = $this->maximumStreamBytes();
         $body = '';
 
-        while (! $stream->eof()) {
-            $remaining = $maximum - strlen($body);
+        try {
+            while (! $stream->eof()) {
+                $this->remainingSeconds($deadline);
+                $remaining = $maximum - strlen($body);
 
-            if ($remaining < 1) {
-                throw new ProviderNotificationException('malformed_payload');
+                if ($remaining < 1) {
+                    throw new ProviderNotificationException('malformed_payload');
+                }
+
+                $chunk = $stream->read(min(8192, $remaining + 1));
+                $this->remainingSeconds($deadline);
+                $body .= $chunk;
+
+                if (strlen($body) > $maximum) {
+                    throw new ProviderNotificationException('malformed_payload');
+                }
             }
-
-            $body .= $stream->read(min(8192, $remaining + 1));
-
-            if (strlen($body) > $maximum) {
-                throw new ProviderNotificationException('malformed_payload');
+        } catch (ProviderNotificationException $exception) {
+            throw $exception;
+        } catch (Throwable) {
+            throw new ProviderNotificationException('provider_unavailable', true);
+        } finally {
+            try {
+                $stream->close();
+            } catch (Throwable) {
+                // The operation outcome is already bounded and content-safe.
             }
         }
 
         return $body;
+    }
+
+    private function closeResponse(Response $response): void
+    {
+        try {
+            $response->toPsrResponse()->getBody()->close();
+        } catch (Throwable) {
+            // Failure classification must not expose provider stream details.
+        }
     }
 
     private function parse(MailAccount $account, string $body): FastmailEventBatch
@@ -209,7 +255,9 @@ final readonly class FastmailEventSourceService
         }
 
         $normalized = str_replace(["\r\n", "\r"], "\n", $body);
-        $blocks = preg_split('/\n\n+/', $normalized, -1, PREG_SPLIT_NO_EMPTY);
+        $lastDelimiter = strrpos($normalized, "\n\n");
+        $complete = $lastDelimiter === false ? '' : substr($normalized, 0, $lastDelimiter + 2);
+        $blocks = preg_split('/\n\n+/', $complete, -1, PREG_SPLIT_NO_EMPTY);
 
         if (! is_array($blocks) || count($blocks) > $this->maximumEvents()) {
             throw new ProviderNotificationException('malformed_payload');
@@ -371,6 +419,17 @@ final readonly class FastmailEventSourceService
         $value = config('mail-mirror.jmap.event_source.timeout_seconds', 35);
 
         return is_int($value) && $value >= 1 && $value <= 120 ? $value : 35;
+    }
+
+    private function remainingSeconds(int $deadline): float
+    {
+        $remaining = ($deadline - hrtime(true)) / 1_000_000_000;
+
+        if ($remaining <= 0) {
+            throw new ProviderNotificationException('provider_unavailable', true);
+        }
+
+        return $remaining;
     }
 
     private function pingSeconds(): int

@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+use GuzzleHttp\Psr7\StreamDecoratorTrait;
+use GuzzleHttp\Psr7\Utils;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Http;
@@ -22,6 +24,7 @@ use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailDeltaCheckpoint;
 use Jkudish\MailMirror\Models\MailGmailWatch;
 use Jkudish\MailMirror\Models\MailJmapEventSource;
+use Psr\Http\Message\StreamInterface;
 
 beforeEach(function (): void {
     Carbon::setTestNow('2026-09-15 12:00:00 UTC');
@@ -334,4 +337,133 @@ it('rejects an oversized Fastmail SSE line instead of ignoring it', function ():
 
     expect(fn () => app(FastmailEventSourceService::class)->receive($account))
         ->toThrow(ProviderNotificationException::class);
+});
+
+it('bounds a Fastmail stream that keeps sending pings without ending', function (): void {
+    $account = notificationAccount(MailDriver::Jmap, 'jmap-account-3208');
+    config()->set('mail-mirror.jmap.event_source.timeout_seconds', 1);
+    $stream = new class(Utils::streamFor('')) implements StreamInterface
+    {
+        use StreamDecoratorTrait { close as private closeWrapped; }
+
+        protected StreamInterface $stream;
+
+        public bool $closed = false;
+
+        public int $reads = 0;
+
+        public function eof(): bool
+        {
+            return $this->reads >= 20;
+        }
+
+        public function read(int $length): string
+        {
+            usleep(100_000);
+            $this->reads++;
+
+            return "event: ping\ndata: {\"interval\":30}\n\n";
+        }
+
+        public function close(): void
+        {
+            $this->closed = true;
+            $this->closeWrapped();
+        }
+    };
+    Http::fake(function (Request $request) use ($stream) {
+        return $request->url() === 'https://api.fastmail.com/jmap/session'
+            ? Http::response([
+                'eventSourceUrl' => 'https://api.fastmail.com/events?types={types}&closeafter={closeafter}&ping={ping}',
+                'accounts' => ['jmap-account-3208' => []],
+            ])
+            : Http::response($stream, 200, ['Content-Type' => 'text/event-stream']);
+    });
+    $started = hrtime(true);
+
+    try {
+        app(FastmailEventSourceService::class)->receive($account);
+        throw new RuntimeException('Non-ending stream exceeded its wall-time budget.');
+    } catch (ProviderNotificationException $exception) {
+        expect($exception->safeCode)->toBe('provider_unavailable')
+            ->and($exception->retryable)->toBeTrue();
+    }
+
+    expect((hrtime(true) - $started) / 1_000_000_000)->toBeLessThan(1.5)
+        ->and($stream->reads)->toBeGreaterThan(1)
+        ->and($stream->closed)->toBeTrue();
+});
+
+it('sanitizes a Fastmail stream failure and always closes its body', function (): void {
+    $account = notificationAccount(MailDriver::Jmap, 'jmap-account-3208');
+    $stream = new class(Utils::streamFor('')) implements StreamInterface
+    {
+        use StreamDecoratorTrait { close as private closeWrapped; }
+
+        protected StreamInterface $stream;
+
+        public bool $closed = false;
+
+        private int $reads = 0;
+
+        public function eof(): bool
+        {
+            return false;
+        }
+
+        public function read(int $length): string
+        {
+            if ($this->reads++ === 0) {
+                return "event: ping\ndata: {\"interval\":30}\n\n";
+            }
+
+            throw new RuntimeException('sensitive-provider-stream-content');
+        }
+
+        public function close(): void
+        {
+            $this->closed = true;
+            $this->closeWrapped();
+        }
+    };
+    Http::fake(function (Request $request) use ($stream) {
+        return $request->url() === 'https://api.fastmail.com/jmap/session'
+            ? Http::response([
+                'eventSourceUrl' => 'https://api.fastmail.com/events?types={types}&closeafter={closeafter}&ping={ping}',
+                'accounts' => ['jmap-account-3208' => []],
+            ])
+            : Http::response($stream, 200, ['Content-Type' => 'text/event-stream']);
+    });
+
+    try {
+        app(FastmailEventSourceService::class)->receive($account);
+        throw new RuntimeException('Throwing stream was accepted.');
+    } catch (ProviderNotificationException $exception) {
+        expect($exception->safeCode)->toBe('provider_unavailable')
+            ->and($exception->retryable)->toBeTrue()
+            ->and((string) $exception)->not->toContain('sensitive-provider-stream-content');
+    }
+
+    expect($stream->closed)->toBeTrue();
+});
+
+it('discards a Fastmail state event truncated before its dispatch delimiter', function (): void {
+    $account = notificationAccount(MailDriver::Jmap, 'jmap-account-3208');
+    $complete = "id: event-41\nevent: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"jmap-account-3208\":{\"Email\":\"email-state-1\"}}}\n\n";
+    $truncated = "id: event-42\nevent: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"jmap-account-3208\":{\"Email\":\"email-state-2\"}}}";
+    Http::fake(function (Request $request) use ($complete, $truncated) {
+        return $request->url() === 'https://api.fastmail.com/jmap/session'
+            ? Http::response([
+                'eventSourceUrl' => 'https://api.fastmail.com/events?types={types}&closeafter={closeafter}&ping={ping}',
+                'accounts' => ['jmap-account-3208' => []],
+            ])
+            : Http::response($complete.$truncated, 200, ['Content-Type' => 'text/event-stream']);
+    });
+
+    $batch = app(FastmailEventSourceService::class)->receive($account);
+
+    expect($batch->stateChanges)->toHaveCount(1)
+        ->and($batch->stateChanges[0]->eventId)->toBe('event-41')
+        ->and($batch->stateChanges[0]->changed)->toBe(['Email' => 'email-state-1'])
+        ->and($batch->lastEventId)->toBe('event-41');
 });

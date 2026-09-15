@@ -123,7 +123,8 @@ final readonly class GmailWatchService
     {
         try {
             return $this->http->withToken($credential->accessToken())->acceptJson()
-                ->timeout($this->timeout())->post(self::WATCH_URL, ['topicName' => $identity->topic]);
+                ->withoutRedirecting()->timeout($this->timeout())
+                ->post(self::WATCH_URL, ['topicName' => $identity->topic]);
         } catch (Throwable) {
             throw new ProviderNotificationException('provider_unavailable', true);
         }
