@@ -192,16 +192,20 @@ persisted account/owner identity and stored watch project/topic/subscription.
 Each envelope is size bounded and yields only account ID, provider message ID,
 publish time, optional history hint, and a safe rejection reason. Ack IDs remain
 inside non-serializable envelope capabilities. `acknowledge()` rejects an empty,
-oversized, or cross-subscription list.
+oversized, or cross-subscription list. Gmail history IDs encoded as either
+decimal strings or exact positive JSON integers are normalized to decimal
+strings; zero, negative, fractional, and imprecise numeric values are rejected.
 
 ### Fastmail EventSource
 
 Each `receive()` call makes at most two authenticated requests: Session
 discovery and one finite EventSource request with `closeafter=state`. The package
 accepts only the Session-advertised level-1 template with exactly `types`,
-`closeafter`, and `ping`, an HTTPS `api.fastmail.com` origin, no userinfo,
-fragment, custom port, static query credential, or redirect. Stream, event,
-line, event-count, and request-time limits come from
+`closeafter`, and `ping`, an HTTPS origin in the package's finite Fastmail
+allowlist (`api.fastmail.com` or `phl.api.fastmail.com`), no userinfo, fragment,
+custom port, static query credential, or redirect. The first accepted origin is
+persisted and later Session responses must match it. Stream, event, line,
+event-count, and request-time limits come from
 `mail-mirror.jmap.event_source`. The timeout is a wall-time limit shared by
 Session discovery, EventSource connection, and bounded reads; each blocking read
 is limited to the remaining wall-time budget, so normal silence before a ping is

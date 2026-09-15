@@ -19,6 +19,8 @@ final readonly class FastmailEventSourceService
 {
     private const SESSION_URL = 'https://api.fastmail.com/jmap/session';
 
+    private const EVENT_SOURCE_HOSTS = ['api.fastmail.com', 'phl.api.fastmail.com'];
+
     private const TYPES = ['Email', 'EmailDelivery', 'Mailbox'];
 
     public function __construct(
@@ -177,9 +179,10 @@ final readonly class FastmailEventSourceService
 
         $parts = parse_url($template);
         $query = is_array($parts) ? ($parts['query'] ?? null) : null;
+        $host = is_array($parts) ? strtolower((string) ($parts['host'] ?? '')) : '';
 
         if (! is_array($parts) || ($parts['scheme'] ?? null) !== 'https'
-            || strtolower((string) ($parts['host'] ?? '')) !== 'api.fastmail.com'
+            || ! in_array($host, self::EVENT_SOURCE_HOSTS, true)
             || isset($parts['user']) || isset($parts['pass']) || isset($parts['fragment']) || isset($parts['port'])
             || ! is_string($query)) {
             throw new ProviderNotificationException('resource_mismatch');
@@ -198,7 +201,7 @@ final readonly class FastmailEventSourceService
             $template,
         );
 
-        return [$url, 'https://api.fastmail.com'];
+        return [$url, 'https://'.$host];
     }
 
     private function readBounded(Response $response, int $deadline): string

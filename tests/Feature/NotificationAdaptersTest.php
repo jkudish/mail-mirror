@@ -74,9 +74,14 @@ function notificationAccount(MailDriver $driver, string $providerId, string $own
     return $account;
 }
 
-function gmailNotificationData(string $email, string $historyId): string
+function gmailNotificationData(string $email, mixed $historyId): string
 {
     return base64_encode(json_encode(['emailAddress' => $email, 'historyId' => $historyId], JSON_THROW_ON_ERROR));
+}
+
+function rawGmailNotificationData(string $json): string
+{
+    return base64_encode($json);
 }
 
 function storeNotificationWatch(MailAccount $account): void
@@ -180,6 +185,28 @@ it('pulls bounded Gmail hints, classifies misrouting, and acknowledges only on a
     Http::assertSentCount(2);
 });
 
+it('accepts exact positive numeric Gmail history IDs and rejects unsafe JSON numbers', function (): void {
+    $account = notificationAccount(MailDriver::Gmail, 'first@invented.test');
+    storeNotificationWatch($account);
+    Http::fake(fn () => Http::response(['receivedMessages' => [
+        ['ackId' => 'ack-positive', 'message' => ['messageId' => 'message-positive', 'publishTime' => '2026-09-15T12:00:01Z', 'data' => gmailNotificationData('first@invented.test', 9876543210)]],
+        ['ackId' => 'ack-zero', 'message' => ['messageId' => 'message-zero', 'publishTime' => '2026-09-15T12:00:02Z', 'data' => gmailNotificationData('first@invented.test', 0)]],
+        ['ackId' => 'ack-negative', 'message' => ['messageId' => 'message-negative', 'publishTime' => '2026-09-15T12:00:03Z', 'data' => gmailNotificationData('first@invented.test', -1)]],
+        ['ackId' => 'ack-fractional', 'message' => ['messageId' => 'message-fractional', 'publishTime' => '2026-09-15T12:00:04Z', 'data' => gmailNotificationData('first@invented.test', 1.5)]],
+        ['ackId' => 'ack-imprecise', 'message' => ['messageId' => 'message-imprecise', 'publishTime' => '2026-09-15T12:00:05Z', 'data' => rawGmailNotificationData('{"emailAddress":"first@invented.test","historyId":9223372036854775808}')]],
+    ]]));
+
+    $notifications = app(GmailPubSubService::class)->pull([$account], 5)->notifications;
+
+    expect($notifications)->toHaveCount(5)
+        ->and($notifications[0]->accepted())->toBeTrue()
+        ->and($notifications[0]->historyIdHint)->toBe('9876543210')
+        ->and($notifications[1]->accepted())->toBeFalse()
+        ->and($notifications[2]->accepted())->toBeFalse()
+        ->and($notifications[3]->accepted())->toBeFalse()
+        ->and($notifications[4]->accepted())->toBeFalse();
+});
+
 it('rejects stale or cross-resource Pub/Sub acknowledgement capabilities', function (): void {
     $account = notificationAccount(MailDriver::Gmail, 'first@invented.test');
     storeNotificationWatch($account);
@@ -227,6 +254,42 @@ it('parses one bounded Fastmail EventSource response and advances resume state o
         && str_contains($request->url(), 'closeafter=state')
         && $request->hasHeader('Authorization', 'Bearer synthetic-fastmail-token')
         && ! $request->hasHeader('Last-Event-ID'));
+});
+
+it('accepts the exact Session-advertised Fastmail Philadelphia EventSource origin', function (): void {
+    $account = notificationAccount(MailDriver::Jmap, 'jmap-account-3208');
+    Http::fake(function (Request $request) {
+        return $request->url() === 'https://api.fastmail.com/jmap/session'
+            ? Http::response([
+                'eventSourceUrl' => 'https://phl.api.fastmail.com/events?types={types}&closeafter={closeafter}&ping={ping}',
+                'accounts' => ['jmap-account-3208' => []],
+            ])
+            : Http::response("event: ping\ndata: {\"interval\":30}\n\n", 200, ['Content-Type' => 'text/event-stream']);
+    });
+
+    $batch = app(FastmailEventSourceService::class)->receive($account);
+
+    expect($batch->pingIntervalSeconds)->toBe(30)
+        ->and(MailJmapEventSource::query()->where('mail_account_id', $account->id)->value('event_source_origin'))
+        ->toBe('https://phl.api.fastmail.com');
+    Http::assertSent(fn (Request $request): bool => str_starts_with($request->url(), 'https://phl.api.fastmail.com/events?'));
+});
+
+it('refuses a Session-advertised Fastmail origin change after the origin is persisted', function (): void {
+    $account = notificationAccount(MailDriver::Jmap, 'jmap-account-3208');
+    MailJmapEventSource::query()->create([
+        'mail_account_id' => $account->id,
+        'event_source_origin' => 'https://api.fastmail.com',
+        'last_event_id' => null,
+    ]);
+    Http::fake(['https://api.fastmail.com/jmap/session' => Http::response([
+        'eventSourceUrl' => 'https://phl.api.fastmail.com/events?types={types}&closeafter={closeafter}&ping={ping}',
+        'accounts' => ['jmap-account-3208' => []],
+    ])]);
+
+    expect(fn () => app(FastmailEventSourceService::class)->receive($account))
+        ->toThrow(ProviderNotificationException::class);
+    Http::assertSentCount(1);
 });
 
 it('sends the persisted Fastmail Last-Event-ID without mixing it with applied JMAP state', function (): void {
@@ -300,6 +363,8 @@ it('rejects credential-bearing or redirected Fastmail EventSource destinations b
     Http::assertSentCount(1);
 })->with([
     'foreign origin' => 'https://attacker.invalid/events?types={types}&closeafter={closeafter}&ping={ping}',
+    'unqualified Fastmail subdomain' => 'https://syd.api.fastmail.com/events?types={types}&closeafter={closeafter}&ping={ping}',
+    'Fastmail suffix lookalike' => 'https://phl.api.fastmail.com.attacker.invalid/events?types={types}&closeafter={closeafter}&ping={ping}',
     'userinfo secret' => 'https://secret@api.fastmail.com/events?types={types}&closeafter={closeafter}&ping={ping}',
     'static query credential' => 'https://api.fastmail.com/events?token=secret&types={types}&closeafter={closeafter}&ping={ping}',
     'duplicate query variable' => 'https://api.fastmail.com/events?types=Email&types={types}&closeafter={closeafter}&ping={ping}',
