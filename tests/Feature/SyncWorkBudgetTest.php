@@ -76,6 +76,7 @@ it('refuses another network attempt when the downloaded-byte allowance is exactl
 it('refuses another network attempt when the fetched-message allowance is exactly consumed', function (): void {
     $budget = new SyncWorkBudget(maxFetchedMessages: 1);
     $budget->claimFetchedMessage();
+    $budget->finishFetchedMessage();
 
     try {
         $budget->claimHttpRequest();
@@ -83,5 +84,21 @@ it('refuses another network attempt when the fetched-message allowance is exactl
     } catch (SyncBudgetExhausted $failure) {
         expect($failure->dimension)->toBe('fetched_messages')
             ->and($failure->snapshot['http_requests'])->toBe(0);
+    }
+});
+
+it('keeps other network dimensions enforced during an admitted final message fetch', function (): void {
+    $budget = new SyncWorkBudget(maxFetchedMessages: 1, maxDownloadedBytes: 0);
+    $budget->claimFetchedMessage();
+
+    try {
+        $budget->claimHttpRequest();
+        throw new RuntimeException('An admitted fetch bypassed its downloaded-byte allowance.');
+    } catch (SyncBudgetExhausted $failure) {
+        expect($failure->dimension)->toBe('downloaded_bytes')
+            ->and($failure->snapshot['fetched_messages'])->toBe(1)
+            ->and($failure->snapshot['http_requests'])->toBe(0);
+    } finally {
+        $budget->finishFetchedMessage();
     }
 });

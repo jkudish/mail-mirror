@@ -85,9 +85,15 @@ final readonly class MailReadService
         }
 
         $budget?->claimFetchedMessage();
-        $retrieved = $reader instanceof BudgetedMailboxReader
-            ? $reader->retrieve($account, $message, $budget)
-            : $reader->retrieve($account, $message);
+
+        try {
+            $retrieved = $reader instanceof BudgetedMailboxReader
+                ? $reader->retrieve($account, $message, $budget)
+                : $reader->retrieve($account, $message);
+        } finally {
+            $budget?->finishFetchedMessage();
+        }
+
         $this->assertReferenceBelongsTo($account, $retrieved->reference);
 
         return $retrieved;
