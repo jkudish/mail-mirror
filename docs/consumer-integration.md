@@ -202,7 +202,11 @@ accepts only the Session-advertised level-1 template with exactly `types`,
 `closeafter`, and `ping`, an HTTPS `api.fastmail.com` origin, no userinfo,
 fragment, custom port, static query credential, or redirect. Stream, event,
 line, event-count, and request-time limits come from
-`mail-mirror.jmap.event_source`.
+`mail-mirror.jmap.event_source`. The timeout is a wall-time limit shared by
+Session discovery, EventSource connection, and bounded reads; each blocking read
+is independently limited, read failures are content-safe and retryable, and the
+stream is always closed. An event is exposed only after its terminating blank
+line arrives; a partial final event is discarded and replayed after reconnect.
 
 ```php
 $batch = app(FastmailEventSourceService::class)->receive($account);

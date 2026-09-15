@@ -159,7 +159,7 @@ final readonly class GmailPubSubService
     {
         try {
             $response = $this->http->withToken($this->tokens->accessToken())->acceptJson()
-                ->timeout($this->timeout())
+                ->withoutRedirecting()->timeout($this->timeout())
                 ->post(self::API.$identity->subscription.':'.$operation, $body);
         } catch (ProviderNotificationException $exception) {
             throw $exception;
