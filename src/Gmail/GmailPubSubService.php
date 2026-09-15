@@ -98,10 +98,9 @@ final readonly class GmailPubSubService
             ? json_decode($decoded, true, 8)
             : null;
         $email = is_array($payload) ? ($payload['emailAddress'] ?? null) : null;
-        $historyId = is_array($payload) ? ($payload['historyId'] ?? null) : null;
+        $historyId = $this->historyId(is_array($payload) ? ($payload['historyId'] ?? null) : null);
         $account = is_string($email) ? ($accountsByEmail[strtolower($email)] ?? null) : null;
-        $accepted = $account instanceof MailAccount
-            && is_string($historyId) && $historyId !== '' && strlen($historyId) <= 255 && ctype_digit($historyId);
+        $accepted = $account instanceof MailAccount && $historyId !== null;
 
         return new GmailPulledNotification(
             $account instanceof MailAccount ? $account->id : 0,
@@ -112,6 +111,19 @@ final readonly class GmailPubSubService
             $accepted ? $historyId : null,
             $accepted ? null : 'malformed_or_misrouted',
         );
+    }
+
+    private function historyId(mixed $value): ?string
+    {
+        if (is_int($value)) {
+            return $value > 0 ? (string) $value : null;
+        }
+
+        if (! is_string($value) || strlen($value) > 255 || preg_match('/\A[1-9][0-9]*\z/', $value) !== 1) {
+            return null;
+        }
+
+        return $value;
     }
 
     /**
