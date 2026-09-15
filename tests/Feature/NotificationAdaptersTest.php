@@ -7,6 +7,7 @@ use GuzzleHttp\Psr7\StreamDecoratorTrait;
 use GuzzleHttp\Psr7\Utils;
 use Illuminate\Http\Client\Factory;
 use Illuminate\Http\Client\Request;
+use Illuminate\Http\Client\Response;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Http;
 use Jkudish\MailMirror\Credentials\ApiTokenCredential;
@@ -27,6 +28,7 @@ use Jkudish\MailMirror\Models\MailDeltaCheckpoint;
 use Jkudish\MailMirror\Models\MailGmailWatch;
 use Jkudish\MailMirror\Models\MailJmapEventSource;
 use Psr\Http\Message\StreamInterface;
+use Symfony\Component\Process\Process;
 
 beforeEach(function (): void {
     Carbon::setTestNow('2026-09-15 12:00:00 UTC');
@@ -82,6 +84,87 @@ function gmailNotificationData(string $email, mixed $historyId): string
 function rawGmailNotificationData(string $json): string
 {
     return base64_encode($json);
+}
+
+/** @return array{Process, string} */
+function localEventSourceServer(string $mode): array
+{
+    $server = <<<'PHP'
+        $mode = $argv[1];
+        $server = stream_socket_server('tcp://127.0.0.1:0', $errorCode, $errorMessage);
+
+        if ($server === false) {
+            fwrite(STDERR, "server failed: {$errorCode}\n");
+            exit(1);
+        }
+
+        $address = stream_socket_get_name($server, false);
+        fwrite(STDOUT, $address."\n");
+        fflush(STDOUT);
+        $connection = stream_socket_accept($server, 5);
+
+        if ($connection === false) {
+            exit(2);
+        }
+
+        while (($line = fgets($connection)) !== false && $line !== "\r\n") {
+        }
+
+        fwrite($connection, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
+        fflush($connection);
+
+        if ($mode === 'complete') {
+            fwrite($connection, "id: local-1\nevent: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"jmap-account-3208\":{\"Email\":\"local-state-2\"}}}\n\n");
+            fflush($connection);
+        } elseif ($mode === 'oversized') {
+            fwrite($connection, str_repeat('x', 2048));
+            fflush($connection);
+        } elseif ($mode === 'continuous') {
+            for ($i = 0; $i < 40; $i++) {
+                @fwrite($connection, ": ping {$i}\n\n");
+                @fflush($connection);
+                usleep(100000);
+            }
+        } else {
+            usleep(4000000);
+        }
+
+        fclose($connection);
+        fclose($server);
+        PHP;
+    $process = new Process([PHP_BINARY, '-r', $server, $mode]);
+    $process->setTimeout(6);
+    $process->start();
+    $process->waitUntil(fn (): bool => str_contains($process->getOutput(), "\n"));
+    $address = trim($process->getOutput());
+
+    if (preg_match('/\A127\.0\.0\.1:(\d+)\z/', $address, $matches) !== 1) {
+        $process->stop(0.1);
+        throw new RuntimeException('Local EventSource fixture did not report its address.');
+    }
+
+    return [$process, 'http://'.$address.'/events'];
+}
+
+function receiveLocalEventSource(string $url, float $seconds): string
+{
+    $service = app(FastmailEventSourceService::class);
+    $deadline = hrtime(true) + (int) ($seconds * 1_000_000_000);
+    $request = new ReflectionMethod(FastmailEventSourceService::class, 'streamRequest');
+    $read = new ReflectionMethod(FastmailEventSourceService::class, 'readBounded');
+    $response = $request->invoke($service, new ApiTokenCredential('synthetic-fastmail-token'), $url, null, $deadline);
+
+    if (! $response instanceof Response) {
+        throw new RuntimeException('Local EventSource fixture returned an invalid response.');
+    }
+
+    $body = $read->invoke($service, $response, $deadline);
+
+    if (! is_string($body)) {
+        throw new RuntimeException('Local EventSource fixture returned an invalid body.');
+    }
+
+    return $body;
 }
 
 function storeNotificationWatch(MailAccount $account): void
@@ -461,6 +544,61 @@ it('bounds a Fastmail stream that keeps sending pings without ending', function 
         ->and($stream->closed)->toBeTrue();
 });
 
+it('enforces the whole receive deadline through the real local HTTP transport', function (string $mode): void {
+    [$process, $url] = localEventSourceServer($mode);
+    Http::allowStrayRequests([$url]);
+    $startedAt = hrtime(true);
+
+    try {
+        receiveLocalEventSource($url, 1.0);
+        throw new RuntimeException('Local EventSource exceeded its deadline without failing.');
+    } catch (ProviderNotificationException $exception) {
+        expect($exception->safeCode)->toBe('provider_unavailable')
+            ->and($exception->retryable)->toBeTrue()
+            ->and($process->isRunning())->toBeTrue()
+            ->and((hrtime(true) - $startedAt) / 1_000_000_000)->toBeLessThan(2.5);
+    } finally {
+        $process->stop(0.1);
+    }
+})->with(['quiet', 'continuous']);
+
+it('receives a complete event through the real local HTTP transport', function (): void {
+    $account = notificationAccount(MailDriver::Jmap, 'jmap-account-3208');
+    [$process, $url] = localEventSourceServer('complete');
+    Http::allowStrayRequests([$url]);
+
+    try {
+        $body = receiveLocalEventSource($url, 2.0);
+        $parse = new ReflectionMethod(FastmailEventSourceService::class, 'parse');
+        $batch = $parse->invoke(app(FastmailEventSourceService::class), $account, $body);
+
+        if (! $batch instanceof FastmailEventBatch) {
+            throw new RuntimeException('Local EventSource fixture returned an invalid event batch.');
+        }
+
+        expect($batch->lastEventId)->toBe('local-1')
+            ->and($batch->stateChanges)->toHaveCount(1)
+            ->and($batch->stateChanges[0]->changed)->toBe(['Email' => 'local-state-2']);
+    } finally {
+        $process->stop(0.1);
+    }
+});
+
+it('rejects an oversized response received through the real local HTTP transport', function (): void {
+    config()->set('mail-mirror.jmap.event_source.max_stream_bytes', 1024);
+    [$process, $url] = localEventSourceServer('oversized');
+    Http::allowStrayRequests([$url]);
+
+    try {
+        receiveLocalEventSource($url, 2.0);
+        throw new RuntimeException('Oversized local EventSource response was accepted.');
+    } catch (ProviderNotificationException $exception) {
+        expect($exception->safeCode)->toBe('malformed_payload');
+    } finally {
+        $process->stop(0.1);
+    }
+});
+
 it('accepts a complete Fastmail event after more than one quiet second', function (): void {
     $account = notificationAccount(MailDriver::Jmap, 'jmap-account-3208');
     config()->set('mail-mirror.jmap.event_source.timeout_seconds', 3);
@@ -513,7 +651,8 @@ it('accepts a complete Fastmail event after more than one quiet second', functio
 
     expect($batch->stateChanges)->toHaveCount(1)
         ->and($batch->stateChanges[0]->changed)->toBe(['Email' => 'email-after-quiet'])
-        ->and($eventSourceRequest['options']['read_timeout'] ?? null)->toBeGreaterThan(2.0)
+        ->and($eventSourceRequest['options']['stream'] ?? false)->toBeFalse()
+        ->and($eventSourceRequest['options']['timeout'] ?? null)->toBeGreaterThan(2.0)
         ->and($stream->closed)->toBeTrue();
 });
 

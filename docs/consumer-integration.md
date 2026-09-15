@@ -207,12 +207,13 @@ custom port, static query credential, or redirect. The first accepted origin is
 persisted and later Session responses must match it. Stream, event, line,
 event-count, and request-time limits come from
 `mail-mirror.jmap.event_source`. The timeout is a wall-time limit shared by
-Session discovery, EventSource connection, and bounded reads; each blocking read
-is limited to the remaining wall-time budget, so normal silence before a ping is
-not treated as a short polling failure. Read failures are content-safe and
-retryable, and the stream is always closed. An event is exposed only after its
-terminating blank line arrives; a partial final event is discarded and replayed
-after reconnect.
+Session discovery and the complete finite `closeafter=state` transfer. The
+EventSource response is buffered by the HTTP transport rather than returned as a
+live PHP stream, so its total timeout remains active during quiet periods and
+continuous pings. Transfer and read failures are content-safe and retryable, and
+the response body is always closed after a successful transfer. An event is
+exposed only after its terminating blank line arrives; a partial final event is
+discarded and replayed after reconnect.
 
 ```php
 $batch = app(FastmailEventSourceService::class)->receive($account);
