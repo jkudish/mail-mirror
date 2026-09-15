@@ -188,10 +188,23 @@ final class GmailMailboxReader implements DeltaMailboxReader
         }
 
         $messages = [];
+        $unavailableMessages = [];
 
         foreach ($finalStates as $providerMessageId => $deletion) {
             if ($deletion === null) {
-                $messages[] = $this->changedMessageState($account, $providerMessageId);
+                try {
+                    $messages[] = $this->changedMessageState($account, $providerMessageId);
+                } catch (MailImportFailure $failure) {
+                    if ($failure->safeCode !== MailImportCode::MessageUnavailable) {
+                        throw $failure;
+                    }
+
+                    $unavailableMessages[] = new MessageReference(
+                        $account->id,
+                        MailDriver::Gmail,
+                        $providerMessageId,
+                    );
+                }
             }
         }
 
@@ -218,6 +231,7 @@ final class GmailMailboxReader implements DeltaMailboxReader
                 $profile->providerMetadata,
                 ['history_id' => $nextPageToken === null ? $resultHistoryId : $state['history_id']],
             )),
+            $unavailableMessages,
         );
     }
 

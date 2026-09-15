@@ -149,7 +149,7 @@ final class FastmailJmapMailboxReader implements DeltaMailboxReader
             throw new DeltaRepairRequired($this->deltaCursor($account, $session, $this->currentEmailState($account, $session)));
         }
 
-        $messages = $this->changedMessageStates($account, $session, $changedIds, $mailboxResult['mailboxes'], $newState);
+        $changed = $this->changedMessageStates($account, $session, $changedIds, $mailboxResult['mailboxes'], $newState);
         $deletions = array_map(fn (string $id): ProviderDeletionEvidence => new ProviderDeletionEvidence(
             $account->id,
             $id,
@@ -159,7 +159,7 @@ final class FastmailJmapMailboxReader implements DeltaMailboxReader
         ), $destroyed);
 
         return new MailboxChangesPage(
-            $messages,
+            $changed['messages'],
             $deletions,
             $containers,
             true,
@@ -169,6 +169,7 @@ final class FastmailJmapMailboxReader implements DeltaMailboxReader
                 'email_state' => $newState,
                 'mailbox_state' => $mailboxResult['state'],
             ]),
+            $changed['unavailable'],
         );
     }
 
@@ -564,12 +565,12 @@ final class FastmailJmapMailboxReader implements DeltaMailboxReader
      * @param  array{api_url: string, download_url: string, session_state: string}  $session
      * @param  list<string>  $ids
      * @param  array<string, array{id: string, name: string, role: string|null, sort_order: int, metadata: array<string, mixed>}>  $mailboxes
-     * @return list<ChangedMessageState>
+     * @return array{messages: list<ChangedMessageState>, unavailable: list<MessageReference>}
      */
     private function changedMessageStates(MailAccount $account, array $session, array $ids, array $mailboxes, string $emailState): array
     {
         if ($ids === []) {
-            return [];
+            return ['messages' => [], 'unavailable' => []];
         }
 
         $result = $this->call($account, $session, 'Email/get', [
@@ -581,10 +582,6 @@ final class FastmailJmapMailboxReader implements DeltaMailboxReader
         ], 'delta-state', MailImportStage::Retrieve);
         $objects = $this->objectList($result, MailImportStage::Retrieve);
         $notFound = $this->stringList($result['notFound'] ?? [], 255, MailImportStage::Retrieve);
-
-        if ($notFound !== [] || count($objects) !== count($ids)) {
-            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::StateMismatch, true);
-        }
 
         $byId = [];
 
@@ -630,15 +627,23 @@ final class FastmailJmapMailboxReader implements DeltaMailboxReader
             );
         }
 
-        if (count($byId) !== count($ids)) {
+        if (count($byId) + count($notFound) !== count($ids)
+            || array_diff(array_keys($byId), $ids) !== []
+            || array_diff($notFound, $ids) !== []
+            || array_intersect(array_keys($byId), $notFound) !== []) {
             throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
         }
 
-        return array_map(
-            fn (string $id): ChangedMessageState => $byId[$id]
-                ?? throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::StateMismatch),
-            $ids,
-        );
+        return [
+            'messages' => array_values(array_filter(array_map(
+                fn (string $id): ?ChangedMessageState => $byId[$id] ?? null,
+                $ids,
+            ))),
+            'unavailable' => array_map(
+                fn (string $id): MessageReference => new MessageReference($account->id, MailDriver::Jmap, $id),
+                $notFound,
+            ),
+        ];
     }
 
     /** @return array{api_url: string, download_url: string, session_state: string} */

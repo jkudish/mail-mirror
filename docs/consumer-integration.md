@@ -151,10 +151,18 @@ persistence.
 not the last push hint received. A page commits its source records, deletion
 evidence, normalized container lifecycle, replayable source changes, and cursor
 in one database transaction. A failed new-message retrieval records a
-`MailImportError` but retains the cursor so the page is retried. An expired
-cursor stores `repair_cursor` and runs the existing authoritative inventory in
-`repairPageLimit` chunks; the applied cursor changes only after that inventory
-completes. Partial container snapshots never prove deletion.
+`MailImportError` but retains the cursor so the page is retried. A message that
+disappears between the provider change list and state retrieval instead creates
+a `mail_delta_pending_messages` obligation while advancing past that page. A
+later deletion resolves it, or the next changed-message sync retries full
+retrieval; `caughtUp` remains false while an obligation is open.
+
+An expired cursor stores `repair_cursor` and binds `repair_scan_id` to a newly
+started authoritative inventory, run in `repairPageLimit` chunks. The repair
+remains pending when that exact scan reports transient errors, unexplained
+missing messages, or unexpected active messages. After convergence, change
+sync replays from the captured repair cursor before reporting `caughtUp`.
+Partial container snapshots never prove deletion.
 
 ### Project source changes
 
@@ -205,10 +213,10 @@ database connection, acknowledge inside the host projection transaction as
 shown. Otherwise apply idempotently and acknowledge afterward; a crash may
 replay a row but cannot lose it.
 
-The package migration creates `mail_delta_checkpoints` and
-`mail_source_changes`; existing inventory APIs and tables remain compatible.
-Deploy the migration before calling `syncChangesAccount()` or
-`SourceChangeService`.
+The package migration creates `mail_delta_checkpoints`,
+`mail_delta_pending_messages`, and `mail_source_changes`; existing inventory
+APIs and tables remain compatible. Deploy the migration before calling
+`syncChangesAccount()` or `SourceChangeService`.
 
 ## Read stored objects
 

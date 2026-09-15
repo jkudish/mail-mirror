@@ -17,6 +17,7 @@ use Jkudish\MailMirror\Gmail\GmailOAuth;
 use Jkudish\MailMirror\Import\MailImportEngine;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAttachment;
+use Jkudish\MailMirror\Models\MailDeltaPendingMessage;
 use Jkudish\MailMirror\Models\MailIdentity;
 use Jkudish\MailMirror\Models\MailInventoryItem;
 use Jkudish\MailMirror\Models\MailMessage;
@@ -248,6 +249,34 @@ it('applies Gmail history deltas without a full inventory or raw download for ex
         ->and(MailProviderDeletionEvidence::query()->forAccount($account)->where('provider_message_id', 'gmail-message-b')->exists())->toBeTrue()
         ->and(collect($sent)->contains(fn (string $url): bool => str_contains($url, '/messages?')))->toBeFalse()
         ->and(collect($sent)->contains(fn (string $url): bool => str_contains($url, 'format=full') || str_contains($url, 'format=raw')))->toBeFalse();
+});
+
+it('durably defers a Gmail history message that disappears before minimal retrieval', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $account->forceFill(['provider_metadata' => ['history_id' => 'history-100']])->save();
+    $profile = $fixture['profile'];
+    $profile['historyId'] = 'history-200';
+
+    Http::fake(function (Request $request) use ($fixture, $profile) {
+        $url = $request->url();
+
+        return match (true) {
+            str_ends_with($url, '/profile') => Http::response($profile),
+            str_ends_with($url, '/labels') => Http::response($fixture['labels']),
+            str_contains($url, '/history') => Http::response(['history' => [[
+                'id' => 'history-raced-message',
+                'messagesAdded' => [['message' => ['id' => 'gmail-raced-message', 'threadId' => 'gmail-raced-thread']]],
+            ]], 'historyId' => 'history-200']),
+            str_contains($url, '/messages/gmail-raced-message') => Http::response([], 404),
+            default => Http::response([], 500),
+        };
+    });
+
+    $result = app(MailImportEngine::class)->syncChanges($account);
+
+    expect($result->caughtUp)->toBeFalse()
+        ->and(MailDeltaPendingMessage::query()->forAccount($account)->where('provider_message_id', 'gmail-raced-message')->exists())->toBeTrue();
 });
 
 it('falls back to a full scan when Gmail history has expired', function (): void {

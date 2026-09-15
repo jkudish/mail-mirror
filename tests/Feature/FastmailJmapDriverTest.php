@@ -16,6 +16,7 @@ use Jkudish\MailMirror\Import\MailImportEngine;
 use Jkudish\MailMirror\Jmap\FastmailJmapMailboxReader;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAttachment;
+use Jkudish\MailMirror\Models\MailDeltaPendingMessage;
 use Jkudish\MailMirror\Models\MailIdentity;
 use Jkudish\MailMirror\Models\MailInventoryItem;
 use Jkudish\MailMirror\Models\MailMessage;
@@ -572,6 +573,24 @@ it('applies JMAP Email changes without Email query or raw download for existing 
         ->and(jmapCallCount($calls, 'Email/query'))->toBe(0)
         ->and(jmapCallCount($calls, 'Blob/download'))->toBe(0)
         ->and(MailProviderDeletionEvidence::query()->forAccount($account)->where('provider_message_id', 'jmap-email-gone')->exists())->toBeTrue();
+});
+
+it('durably defers a JMAP changed message returned in notFound by state retrieval', function (): void {
+    $fixture = jmapFixture();
+    $account = jmapAccount();
+    $account->forceFill(['provider_metadata' => ['email_state' => 'jmap-email-state-1']])->save();
+    $calls = [];
+    $state = new JmapInventoryState;
+    $state->changes = true;
+    $state->updatedIds = ['jmap-raced-message'];
+    $state->destroyedIds = [];
+    fakeJmap($fixture, $calls, inventoryState: $state);
+
+    $result = app(MailImportEngine::class)->syncChanges($account);
+
+    expect($result->caughtUp)->toBeFalse()
+        ->and(jmapCallCount($calls, 'Email/changes'))->toBe(1)
+        ->and(MailDeltaPendingMessage::query()->forAccount($account)->where('provider_message_id', 'jmap-raced-message')->exists())->toBeTrue();
 });
 
 it('uses Email changes only for evidence and excludes a changed message absent from full inventory', function (): void {

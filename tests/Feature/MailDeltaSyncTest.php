@@ -20,11 +20,15 @@ use Jkudish\MailMirror\Import\ReconciliationService;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailContainer;
 use Jkudish\MailMirror\Models\MailDeltaCheckpoint;
+use Jkudish\MailMirror\Models\MailDeltaPendingMessage;
 use Jkudish\MailMirror\Models\MailImportError;
 use Jkudish\MailMirror\Models\MailMessage;
+use Jkudish\MailMirror\Models\MailMessageContainerMembership;
 use Jkudish\MailMirror\Models\MailProviderDeletionEvidence;
 use Jkudish\MailMirror\Models\MailRawObject;
+use Jkudish\MailMirror\Models\MailReconciliationReport;
 use Jkudish\MailMirror\Models\MailSourceChange;
+use Jkudish\MailMirror\Models\MailSyncCheckpoint;
 use Jkudish\MailMirror\Read\ChangedMessageState;
 use Jkudish\MailMirror\Read\InventoryPage;
 use Jkudish\MailMirror\Read\MailboxChangesPage;
@@ -72,7 +76,10 @@ final class DeterministicDeltaReader implements DeltaMailboxReader
         $this->onChanges = null;
 
         if ($this->repairCursor !== null) {
-            throw new DeltaRepairRequired($this->repairCursor);
+            $repairCursor = $this->repairCursor;
+            $this->repairCursor = null;
+
+            throw new DeltaRepairRequired($repairCursor);
         }
 
         return $this->changePages[$cursor ?? 'start'];
@@ -185,10 +192,15 @@ it('retains the applied cursor until a failed new-message retrieval is replayed 
 it('persists container rename deletion and message deletion reappearance as replayable changes', function (): void {
     $account = deltaAccount('delta-lifecycle');
     $message = MailMessage::query()->create(['mail_account_id' => $account->id, 'provider_message_id' => 'lifecycle']);
-    MailContainer::query()->create([
+    $removed = MailContainer::query()->create([
         'mail_account_id' => $account->id,
         'provider_container_id' => 'removed',
         'name' => 'Removed',
+    ]);
+    MailMessageContainerMembership::query()->create([
+        'mail_account_id' => $account->id,
+        'mail_message_id' => $message->id,
+        'mail_container_id' => $removed->id,
     ]);
     MailContainer::query()->create([
         'mail_account_id' => $account->id,
@@ -212,12 +224,21 @@ it('persists container rename deletion and message deletion reappearance as repl
 
     $engine->syncChanges($account);
     $engine->syncChanges($account);
+    $membershipChange = MailSourceChange::query()->forAccount($account)
+        ->where('kind', MailSourceChangeKind::MessageChanged)
+        ->where('mail_message_id', $message->id)
+        ->firstOrFail();
+    $containerDelete = MailSourceChange::query()->forAccount($account)
+        ->where('kind', MailSourceChangeKind::ContainerDeleted)
+        ->where('mail_container_id', $removed->id)
+        ->firstOrFail();
 
     expect(MailProviderDeletionEvidence::query()->forAccount($account)->count())->toBe(0)
         ->and($message->refresh()->provider_metadata)->toMatchArray(['state' => 'returned'])
         ->and(MailContainer::query()->forAccount($account)->where('provider_container_id', 'removed')->exists())->toBeFalse()
         ->and(MailContainer::query()->forAccount($account)->where('provider_container_id', 'renamed')->value('name'))->toBe('New name')
         ->and(MailSourceChange::query()->forAccount($account)->where('kind', MailSourceChangeKind::ContainerDeleted)->count())->toBe(1)
+        ->and($membershipChange->id)->toBeLessThan($containerDelete->id)
         ->and(MailSourceChange::query()->forAccount($account)->where('kind', MailSourceChangeKind::ProviderDeletionChanged)->pluck('provider_deleted')->all())->toBe([true, false]);
 });
 
@@ -274,6 +295,7 @@ it('keeps an expired cursor pending until bounded inventory repair completes', f
         'start' => new InventoryPage([], 'repair-page-2', false),
         'repair-page-2' => new InventoryPage([], null, true),
     ];
+    $reader->changePages['cursor-after-repair'] = new MailboxChangesPage([], [], [], false, 'cursor-after-replay', true);
     $engine = deltaEngine($reader);
 
     $first = $engine->syncChanges($account, repairPageLimit: 1);
@@ -287,8 +309,184 @@ it('keeps an expired cursor pending until bounded inventory repair completes', f
 
     expect($second->caughtUp)->toBeTrue()
         ->and($second->repairPending)->toBeFalse()
-        ->and($checkpoint->refresh()->provider_cursor)->toBe('cursor-after-repair')
+        ->and($checkpoint->refresh()->provider_cursor)->toBe('cursor-after-replay')
         ->and($checkpoint->repair_cursor)->toBeNull();
+});
+
+it('binds repair to a fresh scan and keeps repair pending when that scan does not converge', function (): void {
+    $account = deltaAccount('delta-repair-nonconvergent');
+    $reader = new DeterministicDeltaReader;
+    $reader->inventoryPages['start'] = new InventoryPage([], null, true);
+    $engine = deltaEngine($reader);
+    $priorReport = $engine->sync($account);
+    MailMessage::query()->create([
+        'mail_account_id' => $account->id,
+        'provider_message_id' => 'unexpected-after-prior-scan',
+    ]);
+    $reader->repairCursor = 'repair-baseline';
+
+    $result = $engine->syncChanges($account);
+    $delta = MailDeltaCheckpoint::query()->forAccount($account)->firstOrFail();
+
+    expect($result->caughtUp)->toBeFalse()
+        ->and($result->repairPending)->toBeTrue()
+        ->and($delta->repair_cursor)->toBe('repair-baseline')
+        ->and($delta->repair_scan_id)->not->toBe($priorReport?->scan_id)
+        ->and(MailReconciliationReport::query()->forAccount($account)->count())->toBe(2)
+        ->and(MailReconciliationReport::query()->forAccount($account)->latest('id')->value('unexpected_active_count'))->toBe(1)
+        ->and(MailSyncCheckpoint::query()->forAccount($account)->value('scan_id'))->toBe($delta->repair_scan_id);
+});
+
+it('keeps repair pending when its bound inventory has an unresolved retrieval failure', function (): void {
+    $account = deltaAccount('delta-repair-retrieval-failure');
+    $reader = new DeterministicDeltaReader;
+    $reader->repairCursor = 'repair-failure-baseline';
+    $reader->inventoryPages['start'] = new InventoryPage([
+        deltaReference($account, 'repair-failure-message'),
+    ], null, true);
+    $reader->failRetrieval['repair-failure-message'] = true;
+
+    $result = deltaEngine($reader)->syncChanges($account);
+    $delta = MailDeltaCheckpoint::query()->forAccount($account)->firstOrFail();
+
+    expect($result->caughtUp)->toBeFalse()
+        ->and($result->repairPending)->toBeTrue()
+        ->and($delta->repair_cursor)->toBe('repair-failure-baseline')
+        ->and(MailReconciliationReport::query()->forAccount($account)->latest('id')->value('transient_error_count'))->toBe(1)
+        ->and(MailSyncCheckpoint::query()->forAccount($account)->value('scan_id'))->toBe($delta->repair_scan_id);
+});
+
+it('resumes its exact completed repair report instead of consuming or starting another scan', function (): void {
+    $account = deltaAccount('delta-repair-completed-report');
+    $scanId = '10000000-0000-4000-8000-000000003735';
+    MailSyncCheckpoint::query()->create([
+        'mail_account_id' => $account->id,
+        'scan_id' => $scanId,
+        'version' => 1,
+        'processed_count' => 0,
+        'scan_started_at' => now(),
+        'scan_completed_at' => now(),
+    ]);
+    MailReconciliationReport::query()->create([
+        'mail_account_id' => $account->id,
+        'scan_id' => $scanId,
+        'inventory_count' => 0,
+        'mirrored_count' => 0,
+        'provider_deleted_count' => 0,
+        'transient_error_count' => 0,
+        'waived_error_count' => 0,
+        'unexplained_missing_count' => 0,
+        'unexpected_active_count' => 0,
+        'summary' => [],
+    ]);
+    MailDeltaCheckpoint::query()->create([
+        'mail_account_id' => $account->id,
+        'version' => 1,
+        'repair_cursor' => 'completed-repair-baseline',
+        'repair_scan_id' => $scanId,
+        'repair_started_at' => now(),
+    ]);
+    $reader = new DeterministicDeltaReader;
+    $reader->changePages['completed-repair-baseline'] = new MailboxChangesPage([], [], [], false, 'completed-repair-replayed', true);
+
+    $result = deltaEngine($reader)->syncChanges($account);
+
+    expect($result->caughtUp)->toBeTrue()
+        ->and(MailSyncCheckpoint::query()->forAccount($account)->value('scan_id'))->toBe($scanId)
+        ->and(MailReconciliationReport::query()->forAccount($account)->count())->toBe(1)
+        ->and(MailDeltaCheckpoint::query()->forAccount($account)->value('provider_cursor'))->toBe('completed-repair-replayed');
+});
+
+it('replays the captured repair baseline before catching up changes that occurred during inventory', function (): void {
+    Storage::fake('delta-repair-objects');
+    config()->set('mail-mirror.storage_disk', 'delta-repair-objects');
+    $account = deltaAccount('delta-repair-mutation');
+    $reader = new DeterministicDeltaReader;
+    $reader->repairCursor = 'repair-mutation-baseline';
+    $reader->inventoryPages = [
+        'start' => new InventoryPage([], 'repair-mutation-page-2', false),
+        'repair-mutation-page-2' => new InventoryPage([], null, true),
+    ];
+    $reader->changePages['repair-mutation-baseline'] = new MailboxChangesPage([
+        new ChangedMessageState(deltaReference($account, 'arrived-during-repair'), [], []),
+    ], [], [], false, 'repair-mutation-caught-up', true);
+    $engine = deltaEngine($reader);
+
+    $first = $engine->syncChanges($account, repairPageLimit: 1);
+    $second = $engine->syncChanges($account, repairPageLimit: 1);
+
+    expect($first->repairPending)->toBeTrue()
+        ->and($second->caughtUp)->toBeTrue()
+        ->and($second->processedCount)->toBe(1)
+        ->and($reader->retrieved)->toBe(['arrived-during-repair'])
+        ->and(MailMessage::query()->forAccount($account)->where('provider_message_id', 'arrived-during-repair')->exists())->toBeTrue()
+        ->and(MailDeltaCheckpoint::query()->forAccount($account)->value('provider_cursor'))->toBe('repair-mutation-caught-up');
+});
+
+it('advances past an unavailable change and resolves it from a later deletion page', function (): void {
+    $account = deltaAccount('delta-unavailable-then-delete');
+    $reference = deltaReference($account, 'raced-delete');
+    $reader = new DeterministicDeltaReader;
+    $reader->changePages = [
+        'start' => new MailboxChangesPage([], [], [], false, 'race-page-2', false, unavailableMessages: [$reference]),
+        'race-page-2' => new MailboxChangesPage([], [
+            new ProviderDeletionEvidence($account->id, 'raced-delete', 'synthetic_delta', 'raced-delete-proof'),
+        ], [], false, 'race-complete', true),
+    ];
+
+    $result = deltaEngine($reader)->syncChanges($account);
+
+    expect($result->caughtUp)->toBeTrue()
+        ->and(MailDeltaCheckpoint::query()->forAccount($account)->value('provider_cursor'))->toBe('race-complete')
+        ->and(MailDeltaPendingMessage::query()->forAccount($account)->count())->toBe(0)
+        ->and(MailImportError::query()->forAccount($account)->where('provider_message_id', 'raced-delete')->whereNull('resolved_at')->exists())->toBeFalse()
+        ->and(MailProviderDeletionEvidence::query()->forAccount($account)->where('provider_message_id', 'raced-delete')->exists())->toBeTrue();
+});
+
+it('keeps an unavailable new message pending until a later bounded retry retrieves it', function (): void {
+    Storage::fake('delta-pending-objects');
+    config()->set('mail-mirror.storage_disk', 'delta-pending-objects');
+    $account = deltaAccount('delta-new-unavailable');
+    $reference = deltaReference($account, 'temporarily-unavailable');
+    $reader = new DeterministicDeltaReader;
+    $reader->changePages = [
+        'start' => new MailboxChangesPage([], [], [], false, 'pending-cursor', true, unavailableMessages: [$reference]),
+        'pending-cursor' => new MailboxChangesPage([], [], [], false, 'pending-caught-up', true),
+    ];
+    $engine = deltaEngine($reader);
+
+    $first = $engine->syncChanges($account);
+    expect(fn () => DB::table('mail_delta_pending_messages')
+        ->where('mail_account_id', $account->id)
+        ->update(['provider_message_id' => 'rewritten-pending-id']))
+        ->toThrow(QueryException::class);
+    $second = $engine->syncChanges($account);
+
+    expect($first->caughtUp)->toBeFalse()
+        ->and($second->caughtUp)->toBeTrue()
+        ->and($reader->retrieved)->toBe(['temporarily-unavailable'])
+        ->and(MailDeltaPendingMessage::query()->forAccount($account)->count())->toBe(0)
+        ->and(MailMessage::query()->forAccount($account)->where('provider_message_id', 'temporarily-unavailable')->exists())->toBeTrue();
+});
+
+it('retains one deletion evidence episode while another message forces page replay', function (): void {
+    $account = deltaAccount('delta-stable-deletion-evidence');
+    $reader = new DeterministicDeltaReader;
+    $reader->changePages['start'] = new MailboxChangesPage([
+        new ChangedMessageState(deltaReference($account, 'failing-neighbor'), [], []),
+    ], [
+        new ProviderDeletionEvidence($account->id, 'stable-deletion', 'synthetic_delta', 'stable-proof'),
+    ], [], false, 'not-yet-applied', true);
+    $reader->failRetrieval['failing-neighbor'] = true;
+    $engine = deltaEngine($reader);
+
+    $engine->syncChanges($account);
+    $firstEvidence = MailProviderDeletionEvidence::query()->forAccount($account)->where('provider_message_id', 'stable-deletion')->firstOrFail();
+    $engine->syncChanges($account);
+
+    expect($firstEvidence->fresh()?->scan_id)->toBe($firstEvidence->scan_id)
+        ->and(MailProviderDeletionEvidence::query()->forAccount($account)->where('provider_message_id', 'stable-deletion')->count())->toBe(1)
+        ->and(MailSourceChange::query()->forAccount($account)->where('kind', MailSourceChangeKind::ProviderDeletionChanged)->where('provider_message_id', 'stable-deletion')->count())->toBe(1);
 });
 
 it('exposes account-isolated ordered pending changes and acknowledges only the supplied owner path', function (): void {

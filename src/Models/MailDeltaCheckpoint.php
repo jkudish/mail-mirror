@@ -10,6 +10,7 @@ use Carbon\CarbonImmutable;
  * @property string|null $provider_cursor
  * @property int $version
  * @property string|null $repair_cursor
+ * @property string|null $repair_scan_id
  * @property CarbonImmutable|null $repair_started_at
  */
 final class MailDeltaCheckpoint extends AccountScopedModel

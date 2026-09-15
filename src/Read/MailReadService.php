@@ -80,7 +80,7 @@ final readonly class MailReadService
         $maximum = config('mail-mirror.inventory_page_max_messages', 500);
         $maximum = is_int($maximum) && $maximum > 0 ? $maximum : 500;
 
-        if (count($page->messages) + count($page->deletions) + count($page->containers) > $maximum) {
+        if (count($page->messages) + count($page->unavailableMessages) + count($page->deletions) + count($page->containers) > $maximum) {
             throw new InvalidArgumentException('The provider changes page exceeds the configured resource limit.');
         }
 
@@ -91,6 +91,10 @@ final readonly class MailReadService
 
         foreach ($page->messages as $change) {
             $this->assertReferenceBelongsTo($account, $change->reference);
+        }
+
+        foreach ($page->unavailableMessages as $message) {
+            $this->assertReferenceBelongsTo($account, $message);
         }
 
         foreach ($page->deletions as $deletion) {
