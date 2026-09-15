@@ -128,7 +128,7 @@ final readonly class FastmailEventSourceService
             $request = $this->http->withToken($credential->token())
                 ->withHeaders(['Accept' => 'text/event-stream', 'Cache-Control' => 'no-cache'])
                 ->withoutRedirecting()
-                ->withOptions(['stream' => true, 'read_timeout' => min(1.0, $remaining)])
+                ->withOptions(['stream' => true, 'read_timeout' => $remaining])
                 ->timeout($remaining);
 
             if ($lastEventId !== null) {
