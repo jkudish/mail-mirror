@@ -2,8 +2,10 @@
 
 declare(strict_types=1);
 
+use GuzzleHttp\Middleware;
 use GuzzleHttp\Psr7\StreamDecoratorTrait;
 use GuzzleHttp\Psr7\Utils;
+use Illuminate\Http\Client\Factory;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Http;
@@ -391,6 +393,62 @@ it('bounds a Fastmail stream that keeps sending pings without ending', function 
 
     expect((hrtime(true) - $started) / 1_000_000_000)->toBeLessThan(1.5)
         ->and($stream->reads)->toBeGreaterThan(1)
+        ->and($stream->closed)->toBeTrue();
+});
+
+it('accepts a complete Fastmail event after more than one quiet second', function (): void {
+    $account = notificationAccount(MailDriver::Jmap, 'jmap-account-3208');
+    config()->set('mail-mirror.jmap.event_source.timeout_seconds', 3);
+    $history = [];
+    app(Factory::class)->globalMiddleware(Middleware::history($history));
+    $stream = new class(Utils::streamFor('')) implements StreamInterface
+    {
+        use StreamDecoratorTrait { close as private closeWrapped; }
+
+        protected StreamInterface $stream;
+
+        public bool $closed = false;
+
+        private bool $delivered = false;
+
+        public function eof(): bool
+        {
+            return $this->delivered;
+        }
+
+        public function read(int $length): string
+        {
+            usleep(1_200_000);
+            $this->delivered = true;
+
+            return "id: event-quiet\nevent: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"jmap-account-3208\":{\"Email\":\"email-after-quiet\"}}}\n\n";
+        }
+
+        public function close(): void
+        {
+            $this->closed = true;
+            $this->closeWrapped();
+        }
+    };
+    Http::fake(function (Request $request) use ($stream) {
+        return $request->url() === 'https://api.fastmail.com/jmap/session'
+            ? Http::response([
+                'eventSourceUrl' => 'https://api.fastmail.com/events?types={types}&closeafter={closeafter}&ping={ping}',
+                'accounts' => ['jmap-account-3208' => []],
+            ])
+            : Http::response($stream, 200, ['Content-Type' => 'text/event-stream']);
+    });
+
+    $batch = app(FastmailEventSourceService::class)->receive($account);
+    $eventSourceRequest = $history[1] ?? null;
+
+    if (! is_array($eventSourceRequest)) {
+        throw new RuntimeException('EventSource request options were not recorded.');
+    }
+
+    expect($batch->stateChanges)->toHaveCount(1)
+        ->and($batch->stateChanges[0]->changed)->toBe(['Email' => 'email-after-quiet'])
+        ->and($eventSourceRequest['options']['read_timeout'] ?? null)->toBeGreaterThan(2.0)
         ->and($stream->closed)->toBeTrue();
 });
 
