@@ -9,6 +9,9 @@ use InvalidArgumentException;
 
 final readonly class RetrievedMessage
 {
+    /** @var list<array<string, mixed>> */
+    public array $containers;
+
     /**
      * @param  list<mixed>  $headers
      * @param  list<mixed>  $participants
@@ -24,7 +27,7 @@ final readonly class RetrievedMessage
         public array $headers = [],
         public array $participants = [],
         public array $attachments = [],
-        public array $containers = [],
+        array $containers = [],
         public array $providerMetadata = [],
         public ?RawMessageSource $rawSource = null,
         public array $providerThreadMetadata = [],
@@ -85,25 +88,46 @@ final readonly class RetrievedMessage
         }
 
         $containerIds = [];
+        $validatedContainers = [];
 
         foreach ($containers as $container) {
-            if (! is_array($container)
-                || ! isset($container['provider_id']) || ! is_string($container['provider_id'])
-                || trim($container['provider_id']) === ''
-                || mb_strlen($container['provider_id']) > 255
-                || (isset($container['name']) && (! is_string($container['name']) || mb_strlen($container['name']) > 255))
-                || (isset($container['kind']) && (! is_string($container['kind']) || mb_strlen($container['kind']) > 255))
-                || (isset($container['membership_id']) && (! is_string($container['membership_id']) || mb_strlen($container['membership_id']) > 255))
-                || (isset($container['provider_metadata']) && ! is_array($container['provider_metadata']))
-                || (isset($container['membership_metadata']) && ! is_array($container['membership_metadata']))) {
-                throw new InvalidArgumentException('Retrieved message containers are malformed.');
-            }
+            $container = self::validatedContainer($container);
+            $providerId = $container['provider_id'];
 
-            if (isset($containerIds[$container['provider_id']])) {
+            if (isset($containerIds[$providerId])) {
                 throw new InvalidArgumentException('Retrieved message container identities must be unique.');
             }
 
-            $containerIds[$container['provider_id']] = true;
+            $containerIds[$providerId] = true;
+            $validatedContainers[] = $container;
         }
+
+        $this->containers = $validatedContainers;
+    }
+
+    /** @return array{provider_id: string, name?: mixed, kind?: mixed, membership_id?: mixed, provider_metadata?: mixed, membership_metadata?: mixed} */
+    private static function validatedContainer(mixed $container): array
+    {
+        if (! is_array($container)
+            || ! isset($container['provider_id']) || ! is_string($container['provider_id'])
+            || trim($container['provider_id']) === ''
+            || mb_strlen($container['provider_id']) > 255
+            || (isset($container['name']) && (! is_string($container['name']) || mb_strlen($container['name']) > 255))
+            || (isset($container['kind']) && (! is_string($container['kind']) || mb_strlen($container['kind']) > 255))
+            || (isset($container['membership_id']) && (! is_string($container['membership_id']) || mb_strlen($container['membership_id']) > 255))
+            || (isset($container['provider_metadata']) && ! is_array($container['provider_metadata']))
+            || (isset($container['membership_metadata']) && ! is_array($container['membership_metadata']))) {
+            throw new InvalidArgumentException('Retrieved message containers are malformed.');
+        }
+
+        $validated = ['provider_id' => $container['provider_id']];
+
+        foreach (['name', 'kind', 'membership_id', 'provider_metadata', 'membership_metadata'] as $key) {
+            if (array_key_exists($key, $container)) {
+                $validated[$key] = $container[$key];
+            }
+        }
+
+        return $validated;
     }
 }

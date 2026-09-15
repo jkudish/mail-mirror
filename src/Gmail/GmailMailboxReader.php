@@ -8,19 +8,23 @@ use DateTimeImmutable;
 use Illuminate\Http\Client\Factory;
 use Illuminate\Http\Client\Response;
 use InvalidArgumentException;
-use Jkudish\MailMirror\Contracts\MailboxReader;
+use Jkudish\MailMirror\Contracts\DeltaMailboxReader;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
+use Jkudish\MailMirror\Exceptions\DeltaRepairRequired;
 use Jkudish\MailMirror\Exceptions\GmailAuthorizationException;
 use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAccountCredential;
 use Jkudish\MailMirror\Read\AccountProfile;
+use Jkudish\MailMirror\Read\ChangedMessageState;
 use Jkudish\MailMirror\Read\InventoryPage;
+use Jkudish\MailMirror\Read\MailboxChangesPage;
+use Jkudish\MailMirror\Read\MailboxContainerState;
 use Jkudish\MailMirror\Read\MailboxIdentity;
 use Jkudish\MailMirror\Read\MessageReference;
 use Jkudish\MailMirror\Read\ProviderDeletionEvidence;
@@ -31,7 +35,7 @@ use Throwable;
 use ZBateson\MailMimeParser\Header\AddressHeader;
 use ZBateson\MailMimeParser\MailMimeParser;
 
-final class GmailMailboxReader implements MailboxReader
+final class GmailMailboxReader implements DeltaMailboxReader
 {
     private const API = 'https://gmail.googleapis.com/gmail/v1';
 
@@ -88,6 +92,133 @@ final class GmailMailboxReader implements MailboxReader
         }
 
         return $this->fullPage($account, $state, $profile, $identities, $identitiesComplete);
+    }
+
+    public function changesPage(MailAccount $account, ?string $cursor): MailboxChangesPage
+    {
+        $this->assertAccount($account);
+        $profile = $this->profile($account);
+        $currentHistoryId = $profile->providerMetadata['history_id'] ?? null;
+
+        if (! is_string($currentHistoryId) || $currentHistoryId === '') {
+            throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
+        }
+
+        $state = $cursor === null
+            ? ['phase' => 'history', 'history_id' => $account->provider_metadata['history_id'] ?? null, 'page_token' => null]
+            : $this->decodeCursor($cursor);
+        $recoveryCursor = $this->encodeCursor(['phase' => 'history', 'history_id' => $currentHistoryId, 'page_token' => null]);
+
+        if ($state['phase'] !== 'history' || ! is_string($state['history_id']) || $state['history_id'] === '') {
+            throw new DeltaRepairRequired($recoveryCursor);
+        }
+
+        $this->labels[$account->id] = $this->fetchLabels($account);
+        $containers = array_values(array_map(
+            fn (array $label): MailboxContainerState => new MailboxContainerState(
+                $account->id,
+                $label['id'],
+                $label['name'],
+                $label['kind'],
+                $label['metadata'],
+            ),
+            $this->labels[$account->id],
+        ));
+        $resourceBudget = $this->resourceLimit() - count($containers);
+
+        if ($resourceBudget < 1) {
+            throw new DeltaRepairRequired($recoveryCursor);
+        }
+
+        $query = ['startHistoryId' => $state['history_id'], 'maxResults' => $this->pageSize($resourceBudget)];
+
+        if ($state['page_token'] !== null) {
+            $query['pageToken'] = $state['page_token'];
+        }
+
+        try {
+            $payload = $this->request($account, 'GET', self::API.'/users/me/history', $query);
+        } catch (MailImportFailure $failure) {
+            if (in_array($failure->safeCode, [MailImportCode::HistoryExpired, MailImportCode::StateMismatch], true)) {
+                throw new DeltaRepairRequired($recoveryCursor);
+            }
+
+            throw $failure;
+        }
+
+        /** @var array<string, ProviderDeletionEvidence|null> $finalStates */
+        $finalStates = [];
+        $history = $payload['history'] ?? [];
+
+        if (! is_array($history)) {
+            throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
+        }
+
+        foreach ($history as $record) {
+            if (! is_array($record)) {
+                throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
+            }
+
+            $recordId = $record['id'] ?? null;
+
+            if (! is_string($recordId) || $recordId === '' || mb_strlen($recordId) > 255) {
+                throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
+            }
+
+            foreach (['messagesAdded', 'labelsAdded', 'labelsRemoved'] as $key) {
+                foreach ($this->historyMessages($record[$key] ?? []) as $native) {
+                    $finalStates[$this->historyMessageId($native)] = null;
+                }
+            }
+
+            foreach ($this->historyMessages($record['messagesDeleted'] ?? []) as $native) {
+                $id = $this->historyMessageId($native);
+                $finalStates[$id] = new ProviderDeletionEvidence(
+                    $account->id,
+                    $id,
+                    'gmail_history_deleted',
+                    'gmail-history-'.hash('sha256', $recordId.':'.$id),
+                    ['history_id' => $recordId],
+                );
+            }
+        }
+
+        if (count($finalStates) > $resourceBudget) {
+            throw new DeltaRepairRequired($recoveryCursor);
+        }
+
+        $messages = [];
+
+        foreach ($finalStates as $providerMessageId => $deletion) {
+            if ($deletion === null) {
+                $messages[] = $this->changedMessageState($account, $providerMessageId);
+            }
+        }
+
+        $nextPageToken = $payload['nextPageToken'] ?? null;
+        $resultHistoryId = $payload['historyId'] ?? $currentHistoryId;
+
+        if (($nextPageToken !== null && ! is_string($nextPageToken))
+            || ! is_string($resultHistoryId) || $resultHistoryId === '') {
+            throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::MalformedPayload);
+        }
+
+        return new MailboxChangesPage(
+            $messages,
+            array_values(array_filter($finalStates)),
+            $containers,
+            true,
+            $this->encodeCursor([
+                'phase' => 'history',
+                'history_id' => $nextPageToken === null ? $resultHistoryId : $state['history_id'],
+                'page_token' => $nextPageToken,
+            ]),
+            $nextPageToken === null,
+            new AccountProfile($profile->providerAccountId, $profile->emailAddress, array_replace(
+                $profile->providerMetadata,
+                ['history_id' => $nextPageToken === null ? $resultHistoryId : $state['history_id']],
+            )),
+        );
     }
 
     public function retrieve(MailAccount $account, MessageReference $message): RetrievedMessage
@@ -850,6 +981,58 @@ final class GmailMailboxReader implements MailboxReader
             'spam' => in_array('SPAM', $labelIds, true),
             'trash' => in_array('TRASH', $labelIds, true),
         ];
+    }
+
+    private function changedMessageState(MailAccount $account, string $providerMessageId): ChangedMessageState
+    {
+        $native = $this->request(
+            $account,
+            'GET',
+            self::API.'/users/me/messages/'.rawurlencode($providerMessageId),
+            ['format' => 'minimal'],
+        );
+        $id = $native['id'] ?? null;
+        $threadId = $native['threadId'] ?? null;
+        $historyId = $native['historyId'] ?? null;
+        $labelIds = $native['labelIds'] ?? null;
+
+        if ($id !== $providerMessageId || ! is_string($threadId) || ! is_string($historyId)
+            || ! is_array($labelIds)
+            || array_filter($labelIds, fn (mixed $labelId): bool => ! is_string($labelId)) !== []) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+        }
+
+        /** @var list<string> $labelIds */
+        $labelIds = array_values($labelIds);
+        $containers = [];
+
+        foreach ($labelIds as $labelId) {
+            $label = $this->labels[$account->id][$labelId] ?? [
+                'id' => $labelId,
+                'name' => $labelId,
+                'kind' => 'label',
+                'metadata' => [],
+            ];
+            $containers[] = [
+                'provider_id' => $label['id'],
+                'name' => $label['name'],
+                'kind' => $label['kind'],
+                'membership_id' => $providerMessageId.':'.$labelId,
+                'provider_metadata' => $label['metadata'],
+                'membership_metadata' => ['label_id' => $labelId],
+            ];
+        }
+
+        return new ChangedMessageState(
+            new MessageReference($account->id, MailDriver::Gmail, $providerMessageId, $threadId),
+            [
+                'history_id' => $historyId,
+                'label_ids' => $labelIds,
+                'mailbox_state' => $this->mailboxState($labelIds),
+                'draft' => in_array('DRAFT', $labelIds, true),
+            ],
+            $containers,
+        );
     }
 
     /** @return array{phase: string, history_id: string|null, page_token: string|null} */

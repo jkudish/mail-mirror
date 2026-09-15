@@ -218,6 +218,38 @@ it('uses Gmail history for changes and deletion evidence then performs an author
         ->and($account->refresh()->provider_metadata)->toMatchArray(['history_id' => 'history-200']);
 });
 
+it('applies Gmail history deltas without a full inventory or raw download for existing messages', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $account->forceFill(['provider_metadata' => ['history_id' => 'history-100']])->save();
+    MailMessage::query()->create([
+        'mail_account_id' => $account->id,
+        'provider_message_id' => 'gmail-message-a',
+    ]);
+    $profile = $fixture['profile'];
+    $profile['historyId'] = 'history-200';
+    $sent = [];
+
+    Http::fake(function (Request $request) use ($fixture, $profile, &$sent) {
+        $sent[] = $request->url();
+
+        return match (true) {
+            str_ends_with($request->url(), '/profile') => Http::response($profile),
+            str_ends_with($request->url(), '/labels') => Http::response($fixture['labels']),
+            str_contains($request->url(), '/history') => Http::response($fixture['history']),
+            str_contains($request->url(), '/messages/gmail-message-a') && str_contains($request->url(), 'format=minimal') => Http::response($fixture['message_a']),
+            default => Http::response(['synthetic' => 'unexpected'], 500),
+        };
+    });
+
+    $result = app(MailImportEngine::class)->syncChanges($account);
+
+    expect($result->caughtUp)->toBeTrue()
+        ->and(MailProviderDeletionEvidence::query()->forAccount($account)->where('provider_message_id', 'gmail-message-b')->exists())->toBeTrue()
+        ->and(collect($sent)->contains(fn (string $url): bool => str_contains($url, '/messages?')))->toBeFalse()
+        ->and(collect($sent)->contains(fn (string $url): bool => str_contains($url, 'format=full') || str_contains($url, 'format=raw')))->toBeFalse();
+});
+
 it('falls back to a full scan when Gmail history has expired', function (): void {
     $fixture = gmailFixture();
     $account = gmailAccount();

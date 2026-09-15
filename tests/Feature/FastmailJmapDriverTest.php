@@ -554,6 +554,26 @@ it('uses opaque Email changes for deletion evidence then performs an authoritati
         ->and($account->refresh()->provider_metadata['email_state'] ?? null)->toBe('jmap-email-state-2');
 });
 
+it('applies JMAP Email changes without Email query or raw download for existing messages', function (): void {
+    $fixture = jmapFixture();
+    $account = jmapAccount();
+    $account->forceFill(['provider_metadata' => ['email_state' => 'jmap-email-state-1']])->save();
+    MailMessage::query()->create([
+        'mail_account_id' => $account->id,
+        'provider_message_id' => 'jmap-email-a',
+    ]);
+    $calls = [];
+    fakeJmap($fixture, $calls, true);
+
+    $result = app(MailImportEngine::class)->syncChanges($account);
+
+    expect($result->caughtUp)->toBeTrue()
+        ->and(jmapCallCount($calls, 'Email/changes'))->toBe(1)
+        ->and(jmapCallCount($calls, 'Email/query'))->toBe(0)
+        ->and(jmapCallCount($calls, 'Blob/download'))->toBe(0)
+        ->and(MailProviderDeletionEvidence::query()->forAccount($account)->where('provider_message_id', 'jmap-email-gone')->exists())->toBeTrue();
+});
+
 it('uses Email changes only for evidence and excludes a changed message absent from full inventory', function (): void {
     $fixture = jmapFixture();
     $account = jmapAccount();

@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Database\QueryException;
 use Illuminate\Filesystem\FilesystemManager;
 use InvalidArgumentException;
+use Jkudish\MailMirror\Enums\MailSourceChangeKind;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\ImmutableObjectConflict;
 use Jkudish\MailMirror\Exceptions\MailObjectException;
@@ -21,6 +22,7 @@ use Jkudish\MailMirror\Models\MailLocalMessagePurge;
 use Jkudish\MailMirror\Models\MailMessage;
 use Jkudish\MailMirror\Models\MailMessageParticipant;
 use Jkudish\MailMirror\Models\MailRawObject;
+use Jkudish\MailMirror\Models\MailSourceChange;
 use Jkudish\MailMirror\Models\MailSyncCheckpoint;
 use Jkudish\MailMirror\Models\MailThread;
 use Throwable;
@@ -90,6 +92,13 @@ final class MailObjectStorage
                 $raw = MailRawObject::query()->create($attributes + [
                     'mail_account_id' => $account->id,
                     'mail_message_id' => $message->id,
+                ]);
+                MailSourceChange::query()->create([
+                    'mail_account_id' => $account->id,
+                    'kind' => MailSourceChangeKind::RawChanged,
+                    'mail_message_id' => $message->id,
+                    'mail_raw_object_id' => $raw->id,
+                    'provider_message_id' => $message->provider_message_id,
                 ]);
 
                 $this->placeCanonicalObject($disk, $staged['stream'], $key, $staged['checksum'], $staged['byte_size']);
@@ -330,6 +339,12 @@ final class MailObjectStorage
                 MailRawObject::query()->forAccount($account)
                     ->where('mail_message_id', $message->id)
                     ->delete();
+                MailSourceChange::query()->create([
+                    'mail_account_id' => $account->id,
+                    'kind' => MailSourceChangeKind::MessageDeleted,
+                    'mail_message_id' => $message->id,
+                    'provider_message_id' => $providerMessageId,
+                ]);
                 MailMessage::query()->forAccount($account)->whereKey($message->id)->delete();
                 MailLocalMessagePurge::query()->create([
                     'mail_account_id' => $account->id,

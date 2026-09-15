@@ -3,10 +3,10 @@
 Mirror Gmail and Fastmail accounts into account-scoped Laravel models and
 private object storage.
 
-MailMirror provides read-only Gmail and JMAP adapters, resumable imports,
-reconciliation reports, encrypted credential storage, and integrity-checked
-RFC 822 and attachment storage. It does not provide a UI, search, or provider
-write operations.
+MailMirror provides read-only Gmail and JMAP adapters, resumable inventory and
+changed-message imports, reconciliation reports, encrypted credential storage,
+and integrity-checked RFC 822 and attachment storage. It does not provide a UI,
+search, push transport, or provider write operations.
 
 ## Requirements
 

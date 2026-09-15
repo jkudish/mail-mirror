@@ -126,6 +126,90 @@ A successful retry resolves the error episode. You may waive an understood
 error with `MailImportError::waive()`. A later episode does not inherit the old
 waiver.
 
+## Apply provider changes
+
+After an inventory has established provider state, run a bounded changed-message
+sync independently of push hints:
+
+```php
+$result = app(MailImportEngine::class)->syncChangesAccount(
+    mailAccountId: $account->id,
+    ownerType: 'user',
+    ownerId: $user->getKey(),
+    pageLimit: 10,
+    repairPageLimit: 2,
+);
+```
+
+`DeltaSyncResult` contains `processedCount`, `caughtUp`, and `repairPending`.
+Call the method again when `caughtUp` is false. Gmail history and JMAP
+`Email/changes` update existing message state without downloading RFC 822 data.
+New or reappeared messages still pass through complete normalized and raw
+persistence.
+
+`mail_delta_checkpoints.provider_cursor` is the last applied provider cursor,
+not the last push hint received. A page commits its source records, deletion
+evidence, normalized container lifecycle, replayable source changes, and cursor
+in one database transaction. A failed new-message retrieval records a
+`MailImportError` but retains the cursor so the page is retried. An expired
+cursor stores `repair_cursor` and runs the existing authoritative inventory in
+`repairPageLimit` chunks; the applied cursor changes only after that inventory
+completes. Partial container snapshots never prove deletion.
+
+### Project source changes
+
+Every package persistence path, including the historical `syncAccount()` path,
+inserts `MailSourceChange` rows in the same transaction as the source change.
+This closes the crash gap that after-commit events alone cannot close. The
+append-only rows contain only scalar references:
+
+| `kind` | Populated values |
+| --- | --- |
+| `message_changed` | `mail_message_id`, `provider_message_id` |
+| `message_deleted` | deleted `mail_message_id`, `provider_message_id` |
+| `raw_changed` | `mail_message_id`, `mail_raw_object_id`, `provider_message_id` |
+| `container_changed` | `mail_container_id`, `provider_container_id` |
+| `container_deleted` | deleted `mail_container_id`, `provider_container_id` |
+| `provider_deletion_changed` | `provider_message_id`, `provider_deleted` |
+
+All rows also contain `id`, `mail_account_id`, `acknowledged_at`, and timestamps.
+IDs are account-qualified; message, raw object, and container IDs deliberately
+have no foreign key because deletion records must remain replayable.
+
+Read and acknowledge rows through the owner-scoped service:
+
+```php
+$changes = app(SourceChangeService::class)->pendingAccount(
+    $account->id,
+    'user',
+    $user->getKey(),
+    limit: 100,
+);
+
+DB::transaction(function () use ($changes, $account, $user): void {
+    // Apply each change idempotently to the host projection first.
+
+    app(SourceChangeService::class)->acknowledgeAccount(
+        $account->id,
+        'user',
+        $user->getKey(),
+        $changes->modelKeys(),
+    );
+});
+```
+
+`pendingAccount()` returns unacknowledged rows ordered by `id` (limit 1–500).
+`acknowledgeAccount()` accepts 1–500 positive integer IDs and updates only rows
+on the supplied account and owner path. When the host projection uses the same
+database connection, acknowledge inside the host projection transaction as
+shown. Otherwise apply idempotently and acknowledge afterward; a crash may
+replay a row but cannot lose it.
+
+The package migration creates `mail_delta_checkpoints` and
+`mail_source_changes`; existing inventory APIs and tables remain compatible.
+Deploy the migration before calling `syncChangesAccount()` or
+`SourceChangeService`.
+
 ## Read stored objects
 
 Use `MailObjectStorage` instead of reading its configured disk or persisted
