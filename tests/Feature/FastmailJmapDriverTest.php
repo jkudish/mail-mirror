@@ -370,8 +370,13 @@ it('registers the production JMAP reader and cannot contact Fastmail unless expl
 it('charges every JMAP retry attempt before sending the request', function (): void {
     $account = jmapAccount();
     Sleep::fake();
-    Http::fake(['*' => Http::response(['type' => 'serverFail'], 500)]);
-    $budget = new SyncWorkBudget(maxHttpRequests: 1);
+    $requestOptions = null;
+    Http::fake(function (Request $request, array $options) use (&$requestOptions) {
+        $requestOptions = $options;
+
+        return Http::response(['type' => 'serverFail'], 500);
+    });
+    $budget = new SyncWorkBudget(maxHttpRequests: 1, maxElapsedSeconds: 1);
 
     try {
         app(FastmailJmapMailboxReader::class)->inventoryPage($account, null, $budget);
@@ -379,7 +384,11 @@ it('charges every JMAP retry attempt before sending the request', function (): v
     } catch (SyncBudgetExhausted $failure) {
         expect($failure->dimension)->toBe('http_requests')
             ->and($failure->snapshot['http_requests'])->toBe(1)
-            ->and($failure->snapshot['downloaded_bytes'])->toBeGreaterThan(0);
+            ->and($failure->snapshot['downloaded_bytes'])->toBeGreaterThan(0)
+            ->and($requestOptions['allow_redirects'] ?? null)->toBeFalse()
+            ->and($requestOptions['timeout'] ?? null)->toBeGreaterThan(0)
+            ->toBeLessThanOrEqual(1.0)
+            ->and($requestOptions['progress'] ?? null)->toBeInstanceOf(Closure::class);
     }
 
     Http::assertSentCount(1);

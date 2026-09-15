@@ -7,6 +7,7 @@ namespace Jkudish\MailMirror\Gmail;
 use Closure;
 use DateTimeImmutable;
 use Illuminate\Http\Client\Factory;
+use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Contracts\BudgetedDeltaMailboxReader;
@@ -691,16 +692,54 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader
         $this->budget?->claimHttpRequest();
 
         try {
-            $response = $this->http->withToken($credential->accessToken())->acceptJson()
-                ->timeout($this->timeout())->send($method, $url, ['query' => $query]);
+            $response = $this->prepareRequest(
+                $this->http->withToken($credential->accessToken())->acceptJson(),
+            )->send($method, $url, ['query' => $query]);
             $this->budget?->recordDownloadedBytes(strlen($response->body()));
 
             return $response;
-        } catch (SyncBudgetExhausted $failure) {
-            throw $failure;
-        } catch (Throwable) {
+        } catch (Throwable $failure) {
+            if (($budgetFailure = $this->budgetFailure($failure)) !== null) {
+                throw $budgetFailure;
+            }
+
             throw new MailImportFailure($this->stageFor($url), MailImportCode::ProviderUnavailable, true);
         }
+    }
+
+    private function prepareRequest(PendingRequest $request): PendingRequest
+    {
+        if ($this->budget === null) {
+            return $request->timeout($this->timeout());
+        }
+
+        $remainingBytes = $this->budget->remainingDownloadedBytes();
+        $budget = $this->budget;
+
+        return $request->withoutRedirecting()
+            ->timeout(min($this->timeout(), $budget->remainingElapsedSeconds()))
+            ->withOptions([
+                'progress' => static function (int $downloadTotal, int $downloadedBytes) use ($budget, $remainingBytes): bool {
+                    if ($downloadedBytes > $remainingBytes) {
+                        $budget->recordDownloadedBytes($downloadedBytes);
+                    }
+
+                    return false;
+                },
+            ]);
+    }
+
+    private function budgetFailure(Throwable $failure): ?SyncBudgetExhausted
+    {
+        do {
+            if ($failure instanceof SyncBudgetExhausted) {
+                return $failure;
+            }
+
+            $failure = $failure->getPrevious();
+        } while ($failure !== null);
+
+        return null;
     }
 
     /** @return array{OAuthTokenSetCredential, MailAccountCredential} */
@@ -1199,8 +1238,9 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader
     {
         $size = config('mail-mirror.gmail.page_size', 100);
         $size = is_int($size) && $size >= 1 && $size <= 500 ? $size : 100;
+        $listedBudget = $this->budget?->remainingListedIds() ?? $size;
 
-        return max(1, min($size, $resourceBudget));
+        return max(1, min($size, $resourceBudget, $listedBudget));
     }
 
     private function timeout(): int

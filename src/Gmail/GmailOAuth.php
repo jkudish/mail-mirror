@@ -6,6 +6,7 @@ namespace Jkudish\MailMirror\Gmail;
 
 use DateTimeImmutable;
 use Illuminate\Http\Client\Factory;
+use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
@@ -145,15 +146,18 @@ final readonly class GmailOAuth
         ?SyncWorkBudget $budget = null,
     ): AccountProfile {
         $this->assertEnabled();
-        $budget?->claimHttpRequest();
 
         try {
-            $response = $this->http->withToken($credential->accessToken())
-                ->acceptJson()->timeout($this->timeout())->withoutRedirecting()->get(self::PROFILE_ENDPOINT);
+            $response = $this->prepareRequest(
+                $this->http->withToken($credential->accessToken())->acceptJson(),
+                $budget,
+            )->get(self::PROFILE_ENDPOINT);
             $budget?->recordDownloadedBytes(strlen($response->body()));
-        } catch (SyncBudgetExhausted $failure) {
-            throw $failure;
-        } catch (Throwable) {
+        } catch (Throwable $failure) {
+            if (($budgetFailure = $this->budgetFailure($failure)) !== null) {
+                throw $budgetFailure;
+            }
+
             throw new GmailAuthorizationException;
         }
 
@@ -190,10 +194,9 @@ final readonly class GmailOAuth
         ?SyncWorkBudget $budget = null,
     ): Response {
         $this->assertEnabled();
-        $budget?->claimHttpRequest();
 
         try {
-            $response = $this->http->asForm()->acceptJson()->timeout($this->timeout())->withoutRedirecting()->post(
+            $response = $this->prepareRequest($this->http->asForm()->acceptJson(), $budget)->post(
                 self::TOKEN_ENDPOINT,
                 $parameters + [
                     'client_id' => $this->configuration('client_id'),
@@ -203,11 +206,48 @@ final readonly class GmailOAuth
             $budget?->recordDownloadedBytes(strlen($response->body()));
 
             return $response;
-        } catch (SyncBudgetExhausted $failure) {
-            throw $failure;
-        } catch (Throwable) {
+        } catch (Throwable $failure) {
+            if (($budgetFailure = $this->budgetFailure($failure)) !== null) {
+                throw $budgetFailure;
+            }
+
             throw new GmailAuthorizationException;
         }
+    }
+
+    private function prepareRequest(PendingRequest $request, ?SyncWorkBudget $budget): PendingRequest
+    {
+        if ($budget === null) {
+            return $request->timeout($this->timeout())->withoutRedirecting();
+        }
+
+        $budget->claimHttpRequest();
+        $remainingBytes = $budget->remainingDownloadedBytes();
+
+        return $request->withoutRedirecting()
+            ->timeout(min($this->timeout(), $budget->remainingElapsedSeconds()))
+            ->withOptions([
+                'progress' => static function (int $downloadTotal, int $downloadedBytes) use ($budget, $remainingBytes): bool {
+                    if ($downloadedBytes > $remainingBytes) {
+                        $budget->recordDownloadedBytes($downloadedBytes);
+                    }
+
+                    return false;
+                },
+            ]);
+    }
+
+    private function budgetFailure(Throwable $failure): ?SyncBudgetExhausted
+    {
+        do {
+            if ($failure instanceof SyncBudgetExhausted) {
+                return $failure;
+            }
+
+            $failure = $failure->getPrevious();
+        } while ($failure !== null);
+
+        return null;
     }
 
     /** @param list<string> $fallbackScopes */
