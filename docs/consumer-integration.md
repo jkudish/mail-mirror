@@ -126,6 +126,109 @@ A successful retry resolves the error episode. You may waive an understood
 error with `MailImportError::waive()`. A later episode does not inherit the old
 waiver.
 
+## Wake synchronization from provider notifications
+
+MailMirror exposes provider-specific, finite notification primitives. The host
+owns process supervision, repeated invocation, account locking, durable job or
+wake-up creation, and fallback polling. A hint never changes
+`mail_delta_checkpoints.provider_cursor`; it only tells the host to call
+`MailImportEngine::syncChangesAccount()` from the package's applied cursor.
+
+Run the package migration before configuring either adapter. Both integrations
+are disabled by default.
+
+### Gmail watch and outbound Pub/Sub pull
+
+Configure one exact project/topic/subscription tuple under
+`mail-mirror.gmail.pubsub`. The default `PubSubAccessTokenProvider` reads a
+short-lived token at call time from the environment variable named by
+`access_token_environment`; the token is not copied into cached Laravel config.
+Consumers may bind another `PubSubAccessTokenProvider` implementation for their
+credential runtime. Pub/Sub credentials are separate from mailbox OAuth.
+
+Register a watch with an explicit setup choice:
+
+```php
+$watch = app(GmailWatchService::class)->register(
+    $account,
+    GmailWatchSetup::Create,
+);
+
+// Renewal requires the exact identity returned by the prior setup.
+$watch = app(GmailWatchService::class)->register(
+    $account,
+    GmailWatchSetup::Renew,
+    $watch->identity,
+);
+```
+
+`Create` rejects existing metadata. `Renew` requires stored and configured
+identities to match. `Replace` requires the exact prior identity and a different
+configured identity, making resource takeover explicit. The returned
+`historyIdHint` and persisted `mail_gmail_watches.history_id_hint` are diagnostic
+hints only; neither advances applied Gmail history.
+
+Pull and acknowledge are separate host calls:
+
+```php
+$batch = app(GmailPubSubService::class)->pull($gmailAccounts, maximumMessages: 20);
+
+foreach ($batch->notifications as $notification) {
+    if ($notification->accepted()) {
+        // Durably record/coalesce a wake-up for $notification->mailAccountId.
+        // historyIdHint is diagnostic only; reconcile from the applied cursor.
+    } else {
+        // Durably record a safe malformed_or_misrouted disposition.
+    }
+}
+
+// Call only after every envelope has durable host intent or disposition.
+app(GmailPubSubService::class)->acknowledge($batch->notifications);
+```
+
+`pull()` makes one unary REST Pull request and accepts 1 through the configured
+`max_messages` (at most 100). Every supplied account must exactly match its
+persisted account/owner identity and stored watch project/topic/subscription.
+Each envelope is size bounded and yields only account ID, provider message ID,
+publish time, optional history hint, and a safe rejection reason. Ack IDs remain
+inside non-serializable envelope capabilities. `acknowledge()` rejects an empty,
+oversized, or cross-subscription list.
+
+### Fastmail EventSource
+
+Each `receive()` call makes at most two authenticated requests: Session
+discovery and one finite EventSource request with `closeafter=state`. The package
+accepts only the Session-advertised level-1 template with exactly `types`,
+`closeafter`, and `ping`, an HTTPS `api.fastmail.com` origin, no userinfo,
+fragment, custom port, static query credential, or redirect. Stream, event,
+line, event-count, and request-time limits come from
+`mail-mirror.jmap.event_source`.
+
+```php
+$batch = app(FastmailEventSourceService::class)->receive($account);
+
+foreach ($batch->stateChanges as $hint) {
+    // Durably coalesce a wake-up. hint->changed contains only bounded
+    // Email, EmailDelivery, and/or Mailbox state strings for this account.
+}
+
+// After durable host intent, checkpoint SSE replay position separately.
+if ($batch->lastEventId !== null) {
+    app(FastmailEventSourceService::class)->advanceLastEventId(
+        $account,
+        expectedLastEventId: $previousLastEventId,
+        batch: $batch,
+    );
+}
+```
+
+`advanceLastEventId()` is compare-and-set. Event IDs live only in
+`mail_jmap_event_sources`; they never replace applied JMAP state in account
+metadata or the delta checkpoint. The next `receive()` sends the persisted
+value as `Last-Event-ID`. The host reconnects by invoking `receive()` again and
+uses ordinary delta reconciliation and fallback when hints are duplicate,
+missing, delayed, or interrupted.
+
 ## Apply provider changes
 
 After an inventory has established provider state, run a bounded changed-message
