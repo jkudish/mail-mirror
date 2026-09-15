@@ -222,6 +222,8 @@ rejects the next network request. Gmail `maxResults` and JMAP
 `limit`/`maxChanges` are clamped to the remaining listed-ID allowance, although
 one Gmail history record can still expand into multiple message IDs; every
 returned page is therefore validated and charged before persistence.
+All HTTP requests needed to retrieve an admitted final message remain allowed;
+the fetched-message boundary closes when that retrieval returns or throws.
 
 Budgeted credentialed requests do not follow redirects, and each request
 timeout is the smaller of provider configuration and the remaining elapsed

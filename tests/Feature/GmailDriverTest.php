@@ -26,6 +26,7 @@ use Jkudish\MailMirror\Models\MailProviderDeletionEvidence;
 use Jkudish\MailMirror\Models\MailRawObject;
 use Jkudish\MailMirror\Models\MailSyncCheckpoint;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
+use Jkudish\MailMirror\Read\MailReadService;
 use Jkudish\MailMirror\Read\MessageReference;
 use Jkudish\MailMirror\Read\SyncWorkBudget;
 use Jkudish\MailMirror\Storage\MailObjectStorage;
@@ -978,6 +979,35 @@ it('accepts Gmail raw data with valid trailing base64url padding', function (): 
         ->and(stream_get_contents($source))->toBe(file_get_contents(__DIR__.'/../Fixtures/synthetic-message.eml'));
 
     fclose($source);
+});
+
+it('permits every request for the admitted final fetched message and blocks the next fetch before HTTP', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $requestCount = 0;
+    Http::fake(function (Request $request) use ($fixture, &$requestCount) {
+        $requestCount++;
+
+        return str_contains($request->url(), 'format=raw')
+            ? Http::response(['raw' => gmailPaddedRaw()])
+            : Http::response($fixture['message_a']);
+    });
+    $reference = new MessageReference($account->id, MailDriver::Gmail, 'gmail-message-a', 'gmail-thread-1');
+    $budget = new SyncWorkBudget(maxFetchedMessages: 1);
+
+    $message = app(MailReadService::class)->retrieve($account, $reference, $budget);
+
+    try {
+        expect($message->rawSource?->stream)->toBeResource()
+            ->and($requestCount)->toBe(2)
+            ->and(fn () => app(MailReadService::class)->retrieve($account, $reference, $budget))
+            ->toThrow(SyncBudgetExhausted::class)
+            ->and($requestCount)->toBe(2);
+    } finally {
+        if (is_resource($message->rawSource?->stream)) {
+            fclose($message->rawSource->stream);
+        }
+    }
 });
 
 it('accepts bounded native Gmail attachment IDs longer than 255 characters', function (): void {

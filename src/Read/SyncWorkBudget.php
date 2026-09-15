@@ -6,6 +6,7 @@ namespace Jkudish\MailMirror\Read;
 
 use InvalidArgumentException;
 use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
+use LogicException;
 
 final class SyncWorkBudget
 {
@@ -14,6 +15,8 @@ final class SyncWorkBudget
     private int $listedIds = 0;
 
     private int $fetchedMessages = 0;
+
+    private int $activeFetchedMessages = 0;
 
     private int $downloadedBytes = 0;
 
@@ -56,6 +59,16 @@ final class SyncWorkBudget
         }
 
         $this->fetchedMessages++;
+        $this->activeFetchedMessages++;
+    }
+
+    public function finishFetchedMessage(): void
+    {
+        if ($this->activeFetchedMessages < 1) {
+            throw new LogicException('No fetched message claim is active.');
+        }
+
+        $this->activeFetchedMessages--;
     }
 
     public function recordListedIds(int $count): void
@@ -157,7 +170,10 @@ final class SyncWorkBudget
 
         foreach ([
             'listed_ids' => [$this->listedIds, $this->maxListedIds],
-            'fetched_messages' => [$this->fetchedMessages, $this->maxFetchedMessages],
+            'fetched_messages' => [
+                $this->activeFetchedMessages === 0 ? $this->fetchedMessages : 0,
+                $this->maxFetchedMessages,
+            ],
             'downloaded_bytes' => [$this->downloadedBytes, $this->maxDownloadedBytes],
         ] as $dimension => [$used, $maximum]) {
             if ($used >= $maximum) {
