@@ -35,6 +35,18 @@ return [
         'page_size' => 100,
         'timeout_seconds' => 30,
         'max_raw_bytes' => 52428800,
+
+        'pubsub' => [
+            /* Outbound pull is a separate, fail-closed integration from mailbox OAuth. */
+            'enabled' => false,
+            'project_id' => null,
+            'topic_id' => null,
+            'subscription_id' => null,
+            /* Name only: the short-lived token itself is never copied into cached config. */
+            'access_token_environment' => 'MAIL_MIRROR_GMAIL_PUBSUB_ACCESS_TOKEN',
+            'max_messages' => 20,
+            'timeout_seconds' => 10,
+        ],
     ],
 
     'jmap' => [
@@ -44,5 +56,15 @@ return [
         'timeout_seconds' => 30,
         'request_max_attempts' => 3,
         'max_raw_bytes' => 52428800,
+
+        'event_source' => [
+            /* The host owns repeated invocation and process supervision. */
+            'enabled' => false,
+            'timeout_seconds' => 35,
+            'ping_seconds' => 30,
+            'max_stream_bytes' => 262144,
+            'max_event_bytes' => 32768,
+            'max_events' => 20,
+        ],
     ],
 ];
