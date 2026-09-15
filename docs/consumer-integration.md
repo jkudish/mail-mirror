@@ -155,14 +155,72 @@ in one database transaction. A failed new-message retrieval records a
 disappears between the provider change list and state retrieval instead creates
 a `mail_delta_pending_messages` obligation while advancing past that page. A
 later deletion resolves it, or the next changed-message sync retries full
-retrieval; `caughtUp` remains false while an obligation is open.
+retrieval; `caughtUp` remains false while an obligation is open. Each call reads
+provider changes before retrying at most 25 obligations, ordered by fewest prior
+attempts and then ID, so an unavailable backlog cannot hide a later provider
+deletion page or permanently starve newer obligations.
 
 An expired cursor stores `repair_cursor` and binds `repair_scan_id` to a newly
 started authoritative inventory, run in `repairPageLimit` chunks. The repair
 remains pending when that exact scan reports transient errors, unexplained
-missing messages, or unexpected active messages. After convergence, change
-sync replays from the captured repair cursor before reporting `caughtUp`.
-Partial container snapshots never prove deletion.
+missing messages, or an inconclusive exact lookup. For unexpected local
+messages absent from a complete inventory, bounded exact provider lookup either
+confirms current presence or records deletion evidence for quarantine; it never
+purges the message. After convergence, change sync replays from the captured
+repair cursor before reporting `caughtUp`. Partial container snapshots and
+transient or authorization failures never prove deletion.
+
+### Bound one invocation
+
+Pass a caller-owned `SyncWorkBudget` when a check must stop after a finite
+allowance. Omitting it preserves the unlimited package behavior:
+
+```php
+use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
+use Jkudish\MailMirror\Read\SyncWorkBudget;
+
+$budget = new SyncWorkBudget(
+    maxHttpRequests: 200,
+    maxListedIds: 2000,
+    maxFetchedMessages: 100,
+    maxDownloadedBytes: 100 * 1024 * 1024,
+    maxElapsedSeconds: 15 * 60,
+);
+
+try {
+    $result = app(MailImportEngine::class)->syncChangesAccount(
+        mailAccountId: $account->id,
+        ownerType: 'user',
+        ownerId: $user->getKey(),
+        pageLimit: 10,
+        repairPageLimit: 2,
+        budget: $budget,
+    );
+} catch (SyncBudgetExhausted $failure) {
+    $safeCode = SyncBudgetExhausted::SAFE_CODE; // budget_exhausted
+    $dimension = $failure->dimension;
+    $usage = $failure->snapshot;
+}
+
+$usage = $budget->snapshot();
+```
+
+The default constructor values are the limits shown above. The same mutable
+object covers provider change pages, every HTTP retry and Gmail token refresh,
+listed message IDs, message retrieval attempts, and any nested expired-cursor
+inventory repair and baseline replay. `snapshot()` and the exception snapshot
+contain only scalar counters and limits; they contain no account, message, or
+credential data. A budget exception does not reset a durable cursor: work
+committed before it remains resumable.
+
+HTTP attempts and fetched-message attempts are reserved before work starts.
+Listed IDs and downloaded response bytes are charged at their actual count after
+each buffered provider response. Laravel's HTTP client currently buffers each
+response, so a single response can cross the byte or elapsed limit before the
+exception is raised; the existing provider response-size limit and request
+timeout still bound that overshoot. Custom readers keep their existing API and
+unlimited behavior, but must implement `BudgetedMailboxReader` (and
+`BudgetedDeltaMailboxReader` for deltas) before accepting a finite budget.
 
 ### Project source changes
 
