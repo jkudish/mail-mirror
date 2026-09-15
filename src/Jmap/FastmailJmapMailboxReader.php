@@ -4,12 +4,13 @@ declare(strict_types=1);
 
 namespace Jkudish\MailMirror\Jmap;
 
+use Closure;
 use DateTimeImmutable;
 use Illuminate\Http\Client\Factory;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Sleep;
 use InvalidArgumentException;
-use Jkudish\MailMirror\Contracts\DeltaMailboxReader;
+use Jkudish\MailMirror\Contracts\BudgetedDeltaMailboxReader;
 use Jkudish\MailMirror\Credentials\ApiTokenCredential;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Enums\MailDriver;
@@ -18,6 +19,7 @@ use Jkudish\MailMirror\Enums\MailImportStage;
 use Jkudish\MailMirror\Exceptions\DeltaRepairRequired;
 use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
+use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAccountCredential;
 use Jkudish\MailMirror\Read\AccountProfile;
@@ -31,9 +33,10 @@ use Jkudish\MailMirror\Read\ProviderDeletionEvidence;
 use Jkudish\MailMirror\Read\ProviderDeletionResolution;
 use Jkudish\MailMirror\Read\RawMessageSource;
 use Jkudish\MailMirror\Read\RetrievedMessage;
+use Jkudish\MailMirror\Read\SyncWorkBudget;
 use Throwable;
 
-final class FastmailJmapMailboxReader implements DeltaMailboxReader
+final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader
 {
     private const CORE = 'urn:ietf:params:jmap:core';
 
@@ -52,6 +55,8 @@ final class FastmailJmapMailboxReader implements DeltaMailboxReader
     /** @var array<int, array<string, string>> */
     private array $profileMetadata = [];
 
+    private ?SyncWorkBudget $budget = null;
+
     public function __construct(
         private readonly Factory $http,
         private readonly MailAccountConnection $connections,
@@ -62,7 +67,16 @@ final class FastmailJmapMailboxReader implements DeltaMailboxReader
         return MailDriver::Jmap;
     }
 
-    public function inventoryPage(MailAccount $account, ?string $cursor): InventoryPage
+    public function inventoryPage(
+        MailAccount $account,
+        ?string $cursor,
+        ?SyncWorkBudget $budget = null,
+    ): InventoryPage {
+        /** @var InventoryPage */
+        return $this->withinBudget($budget, fn (): InventoryPage => $this->readInventoryPage($account, $cursor));
+    }
+
+    private function readInventoryPage(MailAccount $account, ?string $cursor): InventoryPage
     {
         $this->assertAccount($account);
         $session = $this->session($account, true);
@@ -84,7 +98,16 @@ final class FastmailJmapMailboxReader implements DeltaMailboxReader
         return $this->fullPage($account, $session, $state);
     }
 
-    public function changesPage(MailAccount $account, ?string $cursor): MailboxChangesPage
+    public function changesPage(
+        MailAccount $account,
+        ?string $cursor,
+        ?SyncWorkBudget $budget = null,
+    ): MailboxChangesPage {
+        /** @var MailboxChangesPage */
+        return $this->withinBudget($budget, fn (): MailboxChangesPage => $this->readChangesPage($account, $cursor));
+    }
+
+    private function readChangesPage(MailAccount $account, ?string $cursor): MailboxChangesPage
     {
         $this->assertAccount($account);
         $session = $this->session($account, true);
@@ -173,7 +196,16 @@ final class FastmailJmapMailboxReader implements DeltaMailboxReader
         );
     }
 
-    public function retrieve(MailAccount $account, MessageReference $message): RetrievedMessage
+    public function retrieve(
+        MailAccount $account,
+        MessageReference $message,
+        ?SyncWorkBudget $budget = null,
+    ): RetrievedMessage {
+        /** @var RetrievedMessage */
+        return $this->withinBudget($budget, fn (): RetrievedMessage => $this->readMessage($account, $message));
+    }
+
+    private function readMessage(MailAccount $account, MessageReference $message): RetrievedMessage
     {
         $this->assertAccount($account);
 
@@ -790,9 +822,14 @@ final class FastmailJmapMailboxReader implements DeltaMailboxReader
         $maximum = is_int($maximum) && $maximum >= 1 && $maximum <= 5 ? $maximum : 3;
 
         for ($attempt = 1; $attempt <= $maximum; $attempt++) {
+            $this->budget?->claimHttpRequest();
+
             try {
                 $pending = $this->http->withToken($credential->token())->acceptJson()->timeout($this->timeout());
                 $response = $pending->send($method, $url, $body === null ? [] : ['json' => $body]);
+                $this->budget?->recordDownloadedBytes(strlen($response->body()));
+            } catch (SyncBudgetExhausted $failure) {
+                throw $failure;
             } catch (Throwable) {
                 if ($attempt === $maximum) {
                     throw new MailImportFailure($stage, MailImportCode::ProviderUnavailable, true, $attempt);
@@ -1392,6 +1429,20 @@ final class FastmailJmapMailboxReader implements DeltaMailboxReader
         rewind($stream);
 
         return $stream;
+    }
+
+    private function withinBudget(?SyncWorkBudget $budget, Closure $operation): mixed
+    {
+        $previous = $this->budget;
+        $this->budget = $budget;
+
+        try {
+            $budget?->assertElapsed();
+
+            return $operation();
+        } finally {
+            $this->budget = $previous;
+        }
     }
 
     private function assertAccount(MailAccount $account): void

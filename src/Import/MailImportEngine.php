@@ -8,6 +8,7 @@ use Closure;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Database\Query\Builder;
+use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Sleep;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
@@ -21,6 +22,7 @@ use Jkudish\MailMirror\Exceptions\DeltaRepairRequired;
 use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\StaleCheckpoint;
+use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAddress;
 use Jkudish\MailMirror\Models\MailAttachment;
@@ -48,11 +50,14 @@ use Jkudish\MailMirror\Read\MailboxChangesPage;
 use Jkudish\MailMirror\Read\MailReadService;
 use Jkudish\MailMirror\Read\MessageReference;
 use Jkudish\MailMirror\Read\RetrievedMessage;
+use Jkudish\MailMirror\Read\SyncWorkBudget;
 use Jkudish\MailMirror\Storage\MailObjectStorage;
 use Throwable;
 
 final readonly class MailImportEngine
 {
+    private const DELTA_PENDING_RETRY_LIMIT = 25;
+
     public function __construct(
         private MailReadService $reads,
         private ReconciliationService $reconciliation,
@@ -143,7 +148,7 @@ final readonly class MailImportEngine
                     ->values()
                     ->all();
 
-                $outcomes = $this->retrieveReferences($account, $references);
+                $outcomes = $this->retrieveReferences($account, $references, null);
                 $successful = 0;
 
                 foreach ($references as $reference) {
@@ -172,6 +177,7 @@ final readonly class MailImportEngine
         ?int $pageLimit = null,
         int $repairPageLimit = 1,
         ?Closure $afterDurablePage = null,
+        ?SyncWorkBudget $budget = null,
     ): DeltaSyncResult {
         try {
             $account = MailAccount::query()->whereKey($mailAccountId)
@@ -182,7 +188,7 @@ final readonly class MailImportEngine
             throw new AccountResourceMismatch('The requested account does not match the supplied owner tuple.');
         }
 
-        return $this->syncChanges($account, $pageLimit, $repairPageLimit, $afterDurablePage);
+        return $this->syncChanges($account, $pageLimit, $repairPageLimit, $afterDurablePage, $budget);
     }
 
     public function syncChanges(
@@ -190,33 +196,45 @@ final readonly class MailImportEngine
         ?int $pageLimit = null,
         int $repairPageLimit = 1,
         ?Closure $afterDurablePage = null,
+        ?SyncWorkBudget $budget = null,
     ): DeltaSyncResult {
         if (($pageLimit !== null && $pageLimit < 1) || $repairPageLimit < 1) {
             throw new InvalidArgumentException('Delta and repair page limits must be at least one.');
         }
 
         $account = $this->reacquire($suppliedAccount);
+        $budget?->assertElapsed();
         $checkpoint = MailDeltaCheckpoint::query()->forAccount($account)->first();
 
         if ($checkpoint?->repair_cursor !== null) {
-            return $this->continueDeltaRepair($account, $checkpoint, $pageLimit, $repairPageLimit, $afterDurablePage);
+            return $this->continueDeltaRepair($account, $checkpoint, $pageLimit, $repairPageLimit, $afterDurablePage, $budget);
         }
 
-        $this->retryDeltaPendingMessages($account);
-
+        /** @var list<string> $pendingRetryIds */
+        $pendingRetryIds = MailDeltaPendingMessage::query()->forAccount($account)
+            ->leftJoin('mail_import_errors as retry_errors', function (JoinClause $join): void {
+                $join->on('retry_errors.mail_account_id', '=', 'mail_delta_pending_messages.mail_account_id')
+                    ->on('retry_errors.provider_message_id', '=', 'mail_delta_pending_messages.provider_message_id')
+                    ->where('retry_errors.stage', MailImportStage::Retrieve->value);
+            })
+            ->orderByRaw('COALESCE(retry_errors.attempt_count, 0)')
+            ->orderBy('mail_delta_pending_messages.id')
+            ->limit(self::DELTA_PENDING_RETRY_LIMIT)
+            ->pluck('mail_delta_pending_messages.provider_message_id')
+            ->all();
         $processed = 0;
         $pages = 0;
 
         while ($pageLimit === null || $pages < $pageLimit) {
             try {
-                $page = $this->reads->changesPage($account, $checkpoint?->provider_cursor);
+                $page = $this->reads->changesPage($account, $checkpoint?->provider_cursor, $budget);
             } catch (DeltaRepairRequired $repair) {
                 $checkpoint = $this->beginDeltaRepair($account, $checkpoint, $repair->recoveryCursor);
 
-                return $this->continueDeltaRepair($account, $checkpoint, $pageLimit, $repairPageLimit, $afterDurablePage);
+                return $this->continueDeltaRepair($account, $checkpoint, $pageLimit, $repairPageLimit, $afterDurablePage, $budget);
             }
 
-            $outcomes = $this->retrieveNewChanges($account, $page);
+            $outcomes = $this->retrieveNewChanges($account, $page, $budget);
 
             try {
                 $checkpoint = $this->persistChangesPage($account, $checkpoint, $page, $outcomes);
@@ -227,17 +245,23 @@ final readonly class MailImportEngine
             $processed += count($page->messages) + count($page->unavailableMessages) + count($page->deletions);
             $pages++;
             $afterDurablePage?->__invoke($checkpoint);
+            $budget?->assertElapsed();
 
-            if (collect($outcomes)->contains(fn (RetrievedMessage|MailImportFailure $outcome): bool => $outcome instanceof MailImportFailure)) {
+            if (collect($outcomes)->contains(fn (RetrievedMessage|MailImportFailure $outcome): bool => $this->isBlockingDeltaFailure($outcome))) {
                 return new DeltaSyncResult($processed, false, false);
             }
 
             if ($page->complete) {
+                $this->retryDeltaPendingMessages($account, $pendingRetryIds, $budget);
+                $budget?->assertElapsed();
                 $pending = MailDeltaPendingMessage::query()->forAccount($account)->exists();
 
                 return new DeltaSyncResult($processed, ! $pending, false);
             }
         }
+
+        $this->retryDeltaPendingMessages($account, $pendingRetryIds, $budget);
+        $budget?->assertElapsed();
 
         return new DeltaSyncResult($processed, false, false);
     }
@@ -246,12 +270,14 @@ final readonly class MailImportEngine
         MailAccount $suppliedAccount,
         ?int $pageLimit = null,
         ?Closure $afterDurablePage = null,
+        ?SyncWorkBudget $budget = null,
     ): ?MailReconciliationReport {
         if ($pageLimit !== null && $pageLimit < 1) {
             throw new InvalidArgumentException('The page limit must be at least one.');
         }
 
         $account = $this->reacquire($suppliedAccount);
+        $budget?->assertElapsed();
         $checkpoint = MailSyncCheckpoint::query()->forAccount($account)->first();
 
         if ($checkpoint !== null && $checkpoint->scan_completed_at !== null) {
@@ -271,7 +297,7 @@ final readonly class MailImportEngine
 
         while ($pageLimit === null || $pages < $pageLimit) {
             try {
-                $page = $this->reads->inventoryPage($account, $checkpoint->provider_cursor);
+                $page = $this->reads->inventoryPage($account, $checkpoint->provider_cursor, $budget);
             } catch (InventoryRestartRequired $restart) {
                 if ($restarts >= $maximumRestarts) {
                     throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::StateMismatch);
@@ -282,7 +308,7 @@ final readonly class MailImportEngine
 
                 continue;
             }
-            $outcomes = $this->retrieve($account, $page);
+            $outcomes = $this->retrieve($account, $page, $budget);
 
             try {
                 $checkpoint = $this->persistPage($account, $checkpoint, $page, $outcomes);
@@ -291,6 +317,7 @@ final readonly class MailImportEngine
             }
             $pages++;
             $afterDurablePage?->__invoke($checkpoint);
+            $budget?->assertElapsed();
 
             if ($checkpoint->scan_completed_at !== null) {
                 return $this->reconciliation->reconcile($account, $checkpoint->scan_id);
@@ -301,8 +328,11 @@ final readonly class MailImportEngine
     }
 
     /** @return array<string, RetrievedMessage|MailImportFailure> */
-    private function retrieveNewChanges(MailAccount $account, MailboxChangesPage $page): array
-    {
+    private function retrieveNewChanges(
+        MailAccount $account,
+        MailboxChangesPage $page,
+        ?SyncWorkBudget $budget,
+    ): array {
         $references = [];
 
         foreach ($page->messages as $change) {
@@ -313,27 +343,42 @@ final readonly class MailImportEngine
             }
         }
 
-        return $this->retrieveReferences($account, $references);
+        return $this->retrieveReferences($account, $references, $budget);
     }
 
-    private function retryDeltaPendingMessages(MailAccount $account): void
-    {
+    /** @param list<string> $providerMessageIds */
+    private function retryDeltaPendingMessages(
+        MailAccount $account,
+        array $providerMessageIds,
+        ?SyncWorkBudget $budget,
+    ): void {
+        if ($providerMessageIds === []) {
+            return;
+        }
+
         $pending = MailDeltaPendingMessage::query()->forAccount($account)
-            ->orderBy('id')
-            ->limit(500)
-            ->get();
+            ->whereIn('provider_message_id', $providerMessageIds)
+            ->get()
+            ->keyBy('provider_message_id');
 
         if ($pending->isEmpty()) {
             return;
         }
 
-        $references = array_values($pending->map(fn (MailDeltaPendingMessage $message): MessageReference => new MessageReference(
-            $account->id,
-            $account->driver,
-            $message->provider_message_id,
-            $message->provider_thread_id,
-        ))->all());
-        $outcomes = $this->retrieveReferences($account, $references);
+        $references = array_values(array_filter(array_map(
+            function (string $providerMessageId) use ($account, $pending): ?MessageReference {
+                $message = $pending->get($providerMessageId);
+
+                return $message instanceof MailDeltaPendingMessage ? new MessageReference(
+                    $account->id,
+                    $account->driver,
+                    $message->provider_message_id,
+                    $message->provider_thread_id,
+                ) : null;
+            },
+            $providerMessageIds,
+        )));
+        $outcomes = $this->retrieveReferences($account, $references, $budget);
         /** @var list<string> $rollbackObjectKeys */
         $rollbackObjectKeys = [];
 
@@ -383,7 +428,7 @@ final readonly class MailImportEngine
             return $account->getConnection()->transaction(function () use ($account, $expected, $page, $outcomes, &$rollbackObjectKeys): MailDeltaCheckpoint {
                 $durableAccount = MailAccount::query()->whereKey($account->id)->lockForUpdate()->firstOrFail();
                 $checkpoint = $this->lockDeltaCheckpoint($account, $expected);
-                $hasFailures = collect($outcomes)->contains(fn (RetrievedMessage|MailImportFailure $outcome): bool => $outcome instanceof MailImportFailure);
+                $hasFailures = collect($outcomes)->contains(fn (RetrievedMessage|MailImportFailure $outcome): bool => $this->isBlockingDeltaFailure($outcome));
 
                 if ($page->accountProfile !== null && ! $hasFailures) {
                     if ($page->accountProfile->providerAccountId !== $durableAccount->provider_account_id) {
@@ -396,18 +441,7 @@ final readonly class MailImportEngine
                 $this->persistContainerSnapshot($account, $page);
 
                 foreach ($page->unavailableMessages as $reference) {
-                    MailDeltaPendingMessage::query()->updateOrCreate(
-                        [
-                            'mail_account_id' => $account->id,
-                            'provider_message_id' => $reference->providerMessageId,
-                        ],
-                        ['provider_thread_id' => $reference->providerThreadId],
-                    );
-                    $this->recordFailure(
-                        $account,
-                        $reference->providerMessageId,
-                        new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MessageUnavailable),
-                    );
+                    $this->recordDeltaPendingMessage($account, $reference);
                 }
 
                 foreach ($page->messages as $change) {
@@ -416,12 +450,19 @@ final readonly class MailImportEngine
                         ->first();
 
                     if ($message === null) {
-                        $this->persistOutcome(
-                            $account,
-                            $change->reference,
-                            $outcomes[$change->reference->providerMessageId],
-                            $rollbackObjectKeys,
-                        );
+                        $outcome = $outcomes[$change->reference->providerMessageId];
+
+                        if ($outcome instanceof MailImportFailure
+                            && $outcome->safeCode === MailImportCode::MessageUnavailable) {
+                            $this->recordDeltaPendingMessage($account, $change->reference, $outcome);
+                        } else {
+                            $this->persistOutcome(
+                                $account,
+                                $change->reference,
+                                $outcome,
+                                $rollbackObjectKeys,
+                            );
+                        }
                     } else {
                         $this->applyChangedState($account, $message, $change);
                     }
@@ -485,6 +526,31 @@ final readonly class MailImportEngine
         }
     }
 
+    private function recordDeltaPendingMessage(
+        MailAccount $account,
+        MessageReference $reference,
+        ?MailImportFailure $failure = null,
+    ): void {
+        MailDeltaPendingMessage::query()->updateOrCreate(
+            [
+                'mail_account_id' => $account->id,
+                'provider_message_id' => $reference->providerMessageId,
+            ],
+            ['provider_thread_id' => $reference->providerThreadId],
+        );
+        $this->recordFailure(
+            $account,
+            $reference->providerMessageId,
+            $failure ?? new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MessageUnavailable),
+        );
+    }
+
+    private function isBlockingDeltaFailure(RetrievedMessage|MailImportFailure $outcome): bool
+    {
+        return $outcome instanceof MailImportFailure
+            && $outcome->safeCode !== MailImportCode::MessageUnavailable;
+    }
+
     private function beginDeltaRepair(
         MailAccount $account,
         ?MailDeltaCheckpoint $expected,
@@ -522,6 +588,7 @@ final readonly class MailImportEngine
         ?int $pageLimit,
         int $repairPageLimit,
         ?Closure $afterDurablePage,
+        ?SyncWorkBudget $budget,
     ): DeltaSyncResult {
         $inventory = MailSyncCheckpoint::query()->forAccount($account)->first();
 
@@ -530,7 +597,7 @@ final readonly class MailImportEngine
         }
 
         $report = $inventory->scan_completed_at === null
-            ? $this->sync($account, $repairPageLimit)
+            ? $this->sync($account, $repairPageLimit, budget: $budget)
             : (MailReconciliationReport::query()->forAccount($account)
                 ->where('scan_id', $inventory->scan_id)
                 ->first() ?? $this->reconciliation->reconcile($account, $inventory->scan_id));
@@ -543,13 +610,23 @@ final readonly class MailImportEngine
             throw new StaleCheckpoint;
         }
 
+        $budget?->assertElapsed();
+
         if ($report->transient_error_count > 0
-            || $report->unexplained_missing_count > 0
-            || $report->unexpected_active_count > 0) {
+            || $report->unexplained_missing_count > 0) {
             $this->restartDeltaRepairScan($account, $expected);
 
             return new DeltaSyncResult(0, false, true);
         }
+
+        if ($report->unexpected_active_count > 0
+            && ! $this->resolveRepairUnexpectedActive($account, $expected, $report, $budget)) {
+            $this->restartDeltaRepairScan($account, $expected);
+
+            return new DeltaSyncResult(0, false, true);
+        }
+
+        $budget?->assertElapsed();
 
         $account->getConnection()->transaction(function () use ($account, $expected): void {
             MailAccount::query()->whereKey($account->id)->lockForUpdate()->firstOrFail();
@@ -568,7 +645,7 @@ final readonly class MailImportEngine
             ])->save();
         }, 1);
 
-        return $this->syncChanges($account, $pageLimit, $repairPageLimit, $afterDurablePage);
+        return $this->syncChanges($account, $pageLimit, $repairPageLimit, $afterDurablePage, $budget);
     }
 
     private function restartDeltaRepairScan(MailAccount $account, MailDeltaCheckpoint $expected): void
@@ -581,12 +658,110 @@ final readonly class MailImportEngine
                 throw new StaleCheckpoint;
             }
 
+            $previousScanId = $checkpoint->repair_scan_id;
+            $nextScanId = $this->startFreshInventoryScan($account);
+
+            MailProviderDeletionEvidence::query()->forAccount($account)
+                ->where('scan_id', $previousScanId)
+                ->update(['scan_id' => $nextScanId]);
+
             $checkpoint->forceFill([
                 'version' => $checkpoint->version + 1,
-                'repair_scan_id' => $this->startFreshInventoryScan($account),
+                'repair_scan_id' => $nextScanId,
                 'repair_started_at' => now(),
             ])->save();
         }, 1);
+    }
+
+    private function resolveRepairUnexpectedActive(
+        MailAccount $account,
+        MailDeltaCheckpoint $expected,
+        MailReconciliationReport $report,
+        ?SyncWorkBudget $budget,
+    ): bool {
+        $limit = config('mail-mirror.inventory_page_max_messages', 500);
+        $limit = is_int($limit) && $limit > 0 ? $limit : 500;
+        $messages = MailMessage::query()->forAccount($account)
+            ->whereNotExists(function (Builder $query) use ($account, $report): void {
+                $query->selectRaw('1')->from('mail_inventory_items as repair_inventory')
+                    ->where('repair_inventory.mail_account_id', $account->id)
+                    ->where('repair_inventory.scan_id', $report->scan_id)
+                    ->whereColumn('repair_inventory.provider_message_id', 'mail_messages.provider_message_id');
+            })
+            ->whereNotExists(function (Builder $query) use ($account, $report): void {
+                $query->selectRaw('1')->from('mail_provider_deletion_evidence as repair_deletions')
+                    ->where('repair_deletions.mail_account_id', $account->id)
+                    ->where('repair_deletions.scan_id', $report->scan_id)
+                    ->whereColumn('repair_deletions.provider_message_id', 'mail_messages.provider_message_id');
+            })
+            ->orderBy('provider_message_id')
+            ->limit($limit + 1)
+            ->get(['provider_message_id']);
+
+        if ($messages->count() !== $report->unexpected_active_count || $messages->count() > $limit) {
+            return false;
+        }
+
+        $references = array_values($messages->map(fn (MailMessage $message): MessageReference => new MessageReference(
+            $account->id,
+            $account->driver,
+            $message->provider_message_id,
+        ))->all());
+        $outcomes = $this->retrieveReferences($account, $references, $budget);
+        $resolved = ! collect($outcomes)->contains(
+            fn (RetrievedMessage|MailImportFailure $outcome): bool => $outcome instanceof MailImportFailure
+                && $outcome->safeCode !== MailImportCode::MessageUnavailable,
+        );
+
+        try {
+            $account->getConnection()->transaction(function () use ($account, $expected, $outcomes, $report): void {
+                MailAccount::query()->whereKey($account->id)->lockForUpdate()->firstOrFail();
+                $checkpoint = $this->lockDeltaCheckpoint($account, $expected);
+
+                if ($checkpoint === null || $checkpoint->repair_scan_id !== $report->scan_id) {
+                    throw new StaleCheckpoint;
+                }
+
+                foreach ($outcomes as $providerMessageId => $outcome) {
+                    if (! $outcome instanceof MailImportFailure
+                        || $outcome->safeCode !== MailImportCode::MessageUnavailable) {
+                        continue;
+                    }
+
+                    $evidence = MailProviderDeletionEvidence::query()->firstOrNew([
+                        'mail_account_id' => $account->id,
+                        'provider_message_id' => $providerMessageId,
+                    ]);
+                    $evidence->fill([
+                        'scan_id' => $report->scan_id,
+                        'proof_code' => 'exact_source_absent',
+                        'audit_reference' => 'repair-absence-'.hash('sha256', $report->scan_id.':'.$providerMessageId),
+                        'provider_metadata' => [],
+                    ])->save();
+
+                    if ($evidence->wasRecentlyCreated) {
+                        $this->recordDeletionChange($account, $providerMessageId, true);
+                        $this->events->dispatch(new ProviderDeletionStateChanged(
+                            $account->id,
+                            $providerMessageId,
+                            true,
+                        ));
+                    }
+
+                    MailDeltaPendingMessage::query()->forAccount($account)
+                        ->where('provider_message_id', $providerMessageId)
+                        ->delete();
+                    MailImportError::query()->forAccount($account)
+                        ->where('provider_message_id', $providerMessageId)
+                        ->whereNull('resolved_at')
+                        ->update(['resolved_at' => now()]);
+                }
+            }, 1);
+        } finally {
+            $this->closeRawSources($outcomes);
+        }
+
+        return $resolved;
     }
 
     private function startFreshInventoryScan(MailAccount $account): string
@@ -715,17 +890,23 @@ final readonly class MailImportEngine
     }
 
     /** @return array<string, RetrievedMessage|MailImportFailure> */
-    private function retrieve(MailAccount $account, InventoryPage $page): array
-    {
-        return $this->retrieveReferences($account, $page->messages);
+    private function retrieve(
+        MailAccount $account,
+        InventoryPage $page,
+        ?SyncWorkBudget $budget,
+    ): array {
+        return $this->retrieveReferences($account, $page->messages, $budget);
     }
 
     /**
      * @param  list<MessageReference>  $references
      * @return array<string, RetrievedMessage|MailImportFailure>
      */
-    private function retrieveReferences(MailAccount $account, array $references): array
-    {
+    private function retrieveReferences(
+        MailAccount $account,
+        array $references,
+        ?SyncWorkBudget $budget,
+    ): array {
         $outcomes = [];
         $maxAttempts = config('mail-mirror.import_max_attempts', 3);
         $maxAttempts = is_int($maxAttempts) && $maxAttempts > 0 ? $maxAttempts : 3;
@@ -737,10 +918,14 @@ final readonly class MailImportEngine
                 $attempt++;
 
                 try {
-                    $message = $this->reads->retrieve($account, $reference);
+                    $message = $this->reads->retrieve($account, $reference, $budget);
                     $this->assertRetrieved($reference, $message);
                     $outcomes[$reference->providerMessageId] = $message;
                     break;
+                } catch (SyncBudgetExhausted $failure) {
+                    $this->closeRawSources($outcomes);
+
+                    throw $failure;
                 } catch (MailImportFailure $failure) {
                     if (! $failure->retryable || $attempt >= $maxAttempts) {
                         $outcomes[$reference->providerMessageId] = new MailImportFailure(

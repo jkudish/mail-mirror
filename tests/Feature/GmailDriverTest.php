@@ -12,6 +12,7 @@ use Jkudish\MailMirror\Enums\ConnectionStatus;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
+use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
 use Jkudish\MailMirror\Gmail\GmailMailboxReader;
 use Jkudish\MailMirror\Gmail\GmailOAuth;
 use Jkudish\MailMirror\Import\MailImportEngine;
@@ -26,6 +27,7 @@ use Jkudish\MailMirror\Models\MailRawObject;
 use Jkudish\MailMirror\Models\MailSyncCheckpoint;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
 use Jkudish\MailMirror\Read\MessageReference;
+use Jkudish\MailMirror\Read\SyncWorkBudget;
 use Jkudish\MailMirror\Storage\MailObjectStorage;
 
 final class GmailRefreshState
@@ -102,6 +104,70 @@ it('registers the production Gmail reader by its closed enum key and fails close
     }
 
     Http::assertNothingSent();
+});
+
+it('charges Gmail response bytes and refuses the next HTTP request before sending it', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $account->forceFill(['provider_metadata' => ['history_id' => 'history-before-budget']])->save();
+    Http::fake(fn (Request $request) => str_ends_with($request->url(), '/profile')
+        ? Http::response($fixture['profile'])
+        : Http::response(['synthetic' => 'unexpected'], 500));
+    $budget = new SyncWorkBudget(maxHttpRequests: 1);
+
+    try {
+        app(GmailMailboxReader::class)->changesPage($account, null, $budget);
+        throw new RuntimeException('The Gmail HTTP allowance was not enforced.');
+    } catch (SyncBudgetExhausted $failure) {
+        expect($failure->dimension)->toBe('http_requests')
+            ->and($failure->snapshot['http_requests'])->toBe(1)
+            ->and($failure->snapshot['downloaded_bytes'])->toBeGreaterThan(0)
+            ->and($budget->snapshot()['http_requests'])->toBe(1);
+    }
+
+    Http::assertSentCount(1);
+    Http::assertSent(fn (Request $request): bool => str_ends_with($request->url(), '/profile'));
+});
+
+it('charges an expiring Gmail credential refresh as an HTTP request', function (): void {
+    $account = gmailAccount(expiresAt: new DateTimeImmutable('-1 minute'));
+    Http::fake([
+        'https://oauth2.googleapis.com/token' => Http::response([
+            'access_token' => 'synthetic-refreshed-access',
+            'expires_in' => 3600,
+        ]),
+    ]);
+    $budget = new SyncWorkBudget(maxHttpRequests: 1);
+
+    try {
+        app(GmailMailboxReader::class)->changesPage($account, null, $budget);
+        throw new RuntimeException('The post-refresh Gmail request exceeded its allowance.');
+    } catch (SyncBudgetExhausted $failure) {
+        expect($failure->dimension)->toBe('http_requests')
+            ->and($failure->snapshot['http_requests'])->toBe(1);
+    }
+
+    Http::assertSentCount(1);
+    Http::assertSent(fn (Request $request): bool => $request->url() === 'https://oauth2.googleapis.com/token');
+});
+
+it('reports actual buffered Gmail bytes when a response crosses the allowance', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $account->forceFill(['provider_metadata' => ['history_id' => 'history-before-budget']])->save();
+    Http::fake(['*' => Http::response($fixture['profile'])]);
+    $budget = new SyncWorkBudget(maxDownloadedBytes: 0);
+
+    try {
+        app(GmailMailboxReader::class)->changesPage($account, null, $budget);
+        throw new RuntimeException('The Gmail byte allowance was not enforced.');
+    } catch (SyncBudgetExhausted $failure) {
+        expect($failure->dimension)->toBe('downloaded_bytes')
+            ->and($failure->snapshot['downloaded_bytes'])->toBeGreaterThan(0)
+            ->and($failure->snapshot['max_downloaded_bytes'])->toBe(0);
+    }
+
+    Http::assertSentCount(1);
 });
 
 it('keeps the separately named live lane unreachable without its explicit opt-in', function (): void {

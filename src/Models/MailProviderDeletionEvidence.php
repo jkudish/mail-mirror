@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace Jkudish\MailMirror\Models;
 
-/** @property string $scan_id */
+/**
+ * @property string $scan_id
+ * @property string $proof_code
+ */
 final class MailProviderDeletionEvidence extends AccountScopedModel
 {
     /** @return list<string> */

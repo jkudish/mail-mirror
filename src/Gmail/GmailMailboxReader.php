@@ -4,11 +4,12 @@ declare(strict_types=1);
 
 namespace Jkudish\MailMirror\Gmail;
 
+use Closure;
 use DateTimeImmutable;
 use Illuminate\Http\Client\Factory;
 use Illuminate\Http\Client\Response;
 use InvalidArgumentException;
-use Jkudish\MailMirror\Contracts\DeltaMailboxReader;
+use Jkudish\MailMirror\Contracts\BudgetedDeltaMailboxReader;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
 use Jkudish\MailMirror\Enums\MailDriver;
@@ -18,6 +19,7 @@ use Jkudish\MailMirror\Exceptions\DeltaRepairRequired;
 use Jkudish\MailMirror\Exceptions\GmailAuthorizationException;
 use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
+use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAccountCredential;
 use Jkudish\MailMirror\Read\AccountProfile;
@@ -31,16 +33,19 @@ use Jkudish\MailMirror\Read\ProviderDeletionEvidence;
 use Jkudish\MailMirror\Read\ProviderDeletionResolution;
 use Jkudish\MailMirror\Read\RawMessageSource;
 use Jkudish\MailMirror\Read\RetrievedMessage;
+use Jkudish\MailMirror\Read\SyncWorkBudget;
 use Throwable;
 use ZBateson\MailMimeParser\Header\AddressHeader;
 use ZBateson\MailMimeParser\MailMimeParser;
 
-final class GmailMailboxReader implements DeltaMailboxReader
+final class GmailMailboxReader implements BudgetedDeltaMailboxReader
 {
     private const API = 'https://gmail.googleapis.com/gmail/v1';
 
     /** @var array<int, array<string, array{id: string, name: string, kind: string, metadata: array<string, mixed>}>> */
     private array $labels = [];
+
+    private ?SyncWorkBudget $budget = null;
 
     public function __construct(
         private readonly Factory $http,
@@ -54,7 +59,16 @@ final class GmailMailboxReader implements DeltaMailboxReader
         return MailDriver::Gmail;
     }
 
-    public function inventoryPage(MailAccount $account, ?string $cursor): InventoryPage
+    public function inventoryPage(
+        MailAccount $account,
+        ?string $cursor,
+        ?SyncWorkBudget $budget = null,
+    ): InventoryPage {
+        /** @var InventoryPage */
+        return $this->withinBudget($budget, fn (): InventoryPage => $this->readInventoryPage($account, $cursor));
+    }
+
+    private function readInventoryPage(MailAccount $account, ?string $cursor): InventoryPage
     {
         $this->assertAccount($account);
         $profile = null;
@@ -94,7 +108,16 @@ final class GmailMailboxReader implements DeltaMailboxReader
         return $this->fullPage($account, $state, $profile, $identities, $identitiesComplete);
     }
 
-    public function changesPage(MailAccount $account, ?string $cursor): MailboxChangesPage
+    public function changesPage(
+        MailAccount $account,
+        ?string $cursor,
+        ?SyncWorkBudget $budget = null,
+    ): MailboxChangesPage {
+        /** @var MailboxChangesPage */
+        return $this->withinBudget($budget, fn (): MailboxChangesPage => $this->readChangesPage($account, $cursor));
+    }
+
+    private function readChangesPage(MailAccount $account, ?string $cursor): MailboxChangesPage
     {
         $this->assertAccount($account);
         $profile = $this->profile($account);
@@ -235,7 +258,16 @@ final class GmailMailboxReader implements DeltaMailboxReader
         );
     }
 
-    public function retrieve(MailAccount $account, MessageReference $message): RetrievedMessage
+    public function retrieve(
+        MailAccount $account,
+        MessageReference $message,
+        ?SyncWorkBudget $budget = null,
+    ): RetrievedMessage {
+        /** @var RetrievedMessage */
+        return $this->withinBudget($budget, fn (): RetrievedMessage => $this->readMessage($account, $message));
+    }
+
+    private function readMessage(MailAccount $account, MessageReference $message): RetrievedMessage
     {
         $this->assertAccount($account);
 
@@ -493,7 +525,7 @@ final class GmailMailboxReader implements DeltaMailboxReader
         [$credential, $stored] = $this->credential($account);
 
         try {
-            $profile = $this->oauth->profile($credential);
+            $profile = $this->oauth->profile($credential, $this->budget);
         } catch (GmailAuthorizationException $failure) {
             if (! $failure->accessRejected) {
                 throw new MailImportFailure(
@@ -656,9 +688,16 @@ final class GmailMailboxReader implements DeltaMailboxReader
     /** @param array<string, int|string|null> $query */
     private function send(OAuthTokenSetCredential $credential, string $method, string $url, array $query): Response
     {
+        $this->budget?->claimHttpRequest();
+
         try {
-            return $this->http->withToken($credential->accessToken())->acceptJson()
+            $response = $this->http->withToken($credential->accessToken())->acceptJson()
                 ->timeout($this->timeout())->send($method, $url, ['query' => $query]);
+            $this->budget?->recordDownloadedBytes(strlen($response->body()));
+
+            return $response;
+        } catch (SyncBudgetExhausted $failure) {
+            throw $failure;
         } catch (Throwable) {
             throw new MailImportFailure($this->stageFor($url), MailImportCode::ProviderUnavailable, true);
         }
@@ -697,7 +736,7 @@ final class GmailMailboxReader implements DeltaMailboxReader
         $attemptedVersion = $stored->version;
 
         try {
-            $replacement = $this->oauth->refresh($account, $stored, $credential);
+            $replacement = $this->oauth->refresh($account, $stored, $credential, $this->budget);
 
             return $replacement;
         } catch (GmailAuthorizationException $failure) {
@@ -1133,6 +1172,20 @@ final class GmailMailboxReader implements DeltaMailboxReader
         rewind($stream);
 
         return $stream;
+    }
+
+    private function withinBudget(?SyncWorkBudget $budget, Closure $operation): mixed
+    {
+        $previous = $this->budget;
+        $this->budget = $budget;
+
+        try {
+            $budget?->assertElapsed();
+
+            return $operation();
+        } finally {
+            $this->budget = $previous;
+        }
     }
 
     private function assertAccount(MailAccount $account): void

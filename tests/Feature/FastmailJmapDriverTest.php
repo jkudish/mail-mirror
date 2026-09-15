@@ -12,6 +12,7 @@ use Jkudish\MailMirror\Enums\ConnectionStatus;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
+use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
 use Jkudish\MailMirror\Import\MailImportEngine;
 use Jkudish\MailMirror\Jmap\FastmailJmapMailboxReader;
 use Jkudish\MailMirror\Models\MailAccount;
@@ -27,6 +28,7 @@ use Jkudish\MailMirror\Models\MailSyncCheckpoint;
 use Jkudish\MailMirror\Models\MailThread;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
 use Jkudish\MailMirror\Read\MessageReference;
+use Jkudish\MailMirror\Read\SyncWorkBudget;
 
 final class JmapRequestState
 {
@@ -363,6 +365,24 @@ it('registers the production JMAP reader and cannot contact Fastmail unless expl
     }
 
     Http::assertNothingSent();
+});
+
+it('charges every JMAP retry attempt before sending the request', function (): void {
+    $account = jmapAccount();
+    Sleep::fake();
+    Http::fake(['*' => Http::response(['type' => 'serverFail'], 500)]);
+    $budget = new SyncWorkBudget(maxHttpRequests: 1);
+
+    try {
+        app(FastmailJmapMailboxReader::class)->inventoryPage($account, null, $budget);
+        throw new RuntimeException('The JMAP retry exceeded its HTTP allowance.');
+    } catch (SyncBudgetExhausted $failure) {
+        expect($failure->dimension)->toBe('http_requests')
+            ->and($failure->snapshot['http_requests'])->toBe(1)
+            ->and($failure->snapshot['downloaded_bytes'])->toBeGreaterThan(0);
+    }
+
+    Http::assertSentCount(1);
 });
 
 it('accepts Fastmail regional API and content hosts', function (): void {
