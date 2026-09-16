@@ -320,8 +320,11 @@ final readonly class FastmailEventSourceService
             $safeChanges = [];
 
             foreach ($accountChanges as $type => $state) {
-                if (! in_array($type, self::TYPES, true) || ! is_string($state)
-                    || $state === '' || strlen($state) > 255) {
+                if (! in_array($type, self::TYPES, true)) {
+                    continue;
+                }
+
+                if (! is_string($state) || $state === '' || strlen($state) > 255) {
                     throw new ProviderNotificationException('malformed_payload');
                 }
 
@@ -329,7 +332,7 @@ final readonly class FastmailEventSourceService
             }
 
             if ($safeChanges === []) {
-                throw new ProviderNotificationException('malformed_payload');
+                continue;
             }
 
             $changes[] = new FastmailEventHint($eventId ?? $lastEventId, $safeChanges);

@@ -13,6 +13,7 @@ use Jkudish\MailMirror\Enums\MailImportStage;
 use Jkudish\MailMirror\Enums\MailSourceChangeKind;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\DeltaRepairRequired;
+use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\StaleCheckpoint;
 use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
@@ -49,7 +50,7 @@ final class DeterministicDeltaReader implements BudgetedDeltaMailboxReader
     /** @var array<string, MailboxChangesPage> */
     public array $changePages = [];
 
-    /** @var array<string, InventoryPage> */
+    /** @var array<string, InventoryPage|InventoryRestartRequired> */
     public array $inventoryPages = [];
 
     /** @var list<string> */
@@ -75,7 +76,13 @@ final class DeterministicDeltaReader implements BudgetedDeltaMailboxReader
         ?string $cursor,
         ?SyncWorkBudget $budget = null,
     ): InventoryPage {
-        return $this->inventoryPages[$cursor ?? 'start'];
+        $page = $this->inventoryPages[$cursor ?? 'start'];
+
+        if ($page instanceof InventoryRestartRequired) {
+            throw $page;
+        }
+
+        return $page;
     }
 
     public function changesPage(
@@ -329,6 +336,77 @@ it('keeps an expired cursor pending until bounded inventory repair completes', f
         ->and($second->repairPending)->toBeFalse()
         ->and($checkpoint->refresh()->provider_cursor)->toBe('cursor-after-replay')
         ->and($checkpoint->repair_cursor)->toBeNull();
+});
+
+it('keeps repair bound to a restarted inventory even when the restart allowance is exhausted', function (bool $exhaust): void {
+    $account = deltaAccount('repair-inventory-restart');
+    $reader = new DeterministicDeltaReader;
+    $reader->repairCursor = 'original-baseline';
+    $reader->inventoryPages = [
+        'start' => new InventoryPage([], 'stale-inventory', false),
+        'stale-inventory' => new InventoryRestartRequired('fresh-inventory'),
+        'fresh-inventory' => $exhaust
+            ? new InventoryRestartRequired('another-inventory')
+            : new InventoryPage([], null, true),
+    ];
+    $reader->changePages['original-baseline'] = new MailboxChangesPage([], [], [], false, 'replayed-baseline', true);
+    $engine = deltaEngine($reader);
+    $engine->syncChanges($account);
+    $delta = MailDeltaCheckpoint::query()->forAccount($account)->firstOrFail();
+    $oldScan = $delta->repair_scan_id;
+
+    if ($exhaust) {
+        expect(fn () => $engine->syncChanges($account))->toThrow(MailImportFailure::class);
+    } else {
+        expect($engine->syncChanges($account)->repairPending)->toBeTrue();
+    }
+
+    expect($delta->refresh()->repair_scan_id)->not->toBe($oldScan)
+        ->and($delta->repair_scan_id)->toBe(MailSyncCheckpoint::query()->forAccount($account)->value('scan_id'))
+        ->and($delta->version)->toBe(1)
+        ->and($delta->repair_cursor)->toBe('original-baseline')
+        ->and($delta->provider_cursor)->toBeNull();
+
+    $reader->inventoryPages['fresh-inventory'] = new InventoryPage([], null, true);
+    expect($engine->syncChanges($account)->caughtUp)->toBeTrue()
+        ->and($delta->refresh()->provider_cursor)->toBe('replayed-baseline')
+        ->and($delta->repair_cursor)->toBeNull();
+})->with([false, true]);
+
+it('recovers a detached repair scan without adopting unrelated inventory or touching another owner', function (): void {
+    $account = deltaAccount('detached-repair');
+    $other = deltaAccount('other-repair', 'owner-two');
+    $reader = new DeterministicDeltaReader;
+    $reader->repairCursor = 'original-baseline';
+    $reader->inventoryPages['start'] = new InventoryPage([], 'page-two', false);
+    $engine = deltaEngine($reader);
+    $engine->syncChanges($account);
+    $delta = MailDeltaCheckpoint::query()->forAccount($account)->firstOrFail();
+    $originalScan = $delta->repair_scan_id;
+    $unrelatedScan = '00000000-0000-4000-8000-000000000001';
+    MailSyncCheckpoint::query()->forAccount($account)->update(['scan_id' => $unrelatedScan, 'scan_completed_at' => now()]);
+    $otherCheckpoint = MailDeltaCheckpoint::query()->create([
+        'mail_account_id' => $other->id, 'version' => 7,
+        'repair_cursor' => 'other-baseline', 'repair_scan_id' => '00000000-0000-4000-8000-000000000002',
+    ]);
+    $beforeOther = $otherCheckpoint->refresh()->getAttributes();
+
+    $result = $engine->syncChanges($account);
+    $inventory = MailSyncCheckpoint::query()->forAccount($account)->firstOrFail();
+    expect($result->repairPending)->toBeTrue()
+        ->and($result->caughtUp)->toBeFalse()
+        ->and($delta->refresh()->repair_cursor)->toBe('original-baseline')
+        ->and($delta->provider_cursor)->toBeNull()
+        ->and($delta->repair_scan_id)->not->toBeIn([$originalScan, $unrelatedScan])
+        ->and($delta->repair_scan_id)->toBe($inventory->scan_id)
+        ->and($inventory->scan_completed_at)->toBeNull()
+        ->and($inventory->provider_cursor)->toBeNull()
+        ->and($otherCheckpoint->refresh()->getAttributes())->toBe($beforeOther);
+
+    $reader->inventoryPages['start'] = new InventoryPage([], null, true);
+    $reader->changePages['original-baseline'] = new MailboxChangesPage([], [], [], false, 'replayed-baseline', true);
+    expect($engine->syncChanges($account)->caughtUp)->toBeTrue()
+        ->and($delta->refresh()->provider_cursor)->toBe('replayed-baseline');
 });
 
 it('binds repair to a fresh scan and keeps repair pending when that scan does not converge', function (): void {

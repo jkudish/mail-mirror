@@ -87,8 +87,9 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader
             return $this->resourcePage($account, $session);
         }
 
-        if ($state['account_id'] !== $account->provider_account_id
-            || $state['session_state'] !== $session['session_state']) {
+        // Session state describes metadata, not the Email collection. The
+        // freshly validated Session may change without invalidating this cursor.
+        if ($state['account_id'] !== $account->provider_account_id) {
             throw new InventoryRestartRequired($this->resourceRestartCursor($account, $session));
         }
 
@@ -728,7 +729,7 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader
      * @param  array<string, mixed>  $arguments
      * @return array<string, mixed>
      */
-    private function call(MailAccount $account, array $session, string $method, array $arguments, string $callId, MailImportStage $stage): array
+    private function call(MailAccount $account, array &$session, string $method, array $arguments, string $callId, MailImportStage $stage): array
     {
         $payload = $this->jsonRequest($account, 'POST', $session['api_url'], [
             'using' => [self::CORE, self::MAIL, self::SUBMISSION],
@@ -739,11 +740,16 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader
         if ($responseSessionState !== $session['session_state']) {
             $freshSession = $this->session($account, true);
 
-            if ($stage === MailImportStage::Inventory) {
-                throw new InventoryRestartRequired($this->resourceRestartCursor($account, $freshSession));
+            if ($freshSession['api_url'] !== $session['api_url']
+                || $freshSession['download_url'] !== $session['download_url']) {
+                if ($stage === MailImportStage::Inventory) {
+                    throw new InventoryRestartRequired($this->resourceRestartCursor($account, $freshSession));
+                }
+
+                throw new MailImportFailure($stage, MailImportCode::StateMismatch, true);
             }
 
-            throw new MailImportFailure($stage, MailImportCode::StateMismatch, true);
+            $session = $freshSession;
         }
 
         $responses = $payload['methodResponses'] ?? null;

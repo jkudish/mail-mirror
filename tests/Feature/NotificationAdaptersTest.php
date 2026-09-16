@@ -339,6 +339,37 @@ it('parses one bounded Fastmail EventSource response and advances resume state o
         && ! $request->hasHeader('Last-Event-ID'));
 });
 
+it('filters unrelated Fastmail state types without discarding valid mail hints', function (array $changed, array $expected): void {
+    $account = notificationAccount(MailDriver::Jmap, 'jmap-account-3208');
+    $payload = json_encode(['@type' => 'StateChange', 'changed' => ['jmap-account-3208' => $changed]], JSON_THROW_ON_ERROR);
+    Http::fake(fn (Request $request) => $request->url() === 'https://api.fastmail.com/jmap/session'
+        ? Http::response([
+            'eventSourceUrl' => 'https://api.fastmail.com/events?types={types}&closeafter={closeafter}&ping={ping}',
+            'accounts' => ['jmap-account-3208' => []],
+        ])
+        : Http::response("event: state\ndata: {$payload}\n\n", 200, ['Content-Type' => 'text/event-stream']));
+
+    $batch = app(FastmailEventSourceService::class)->receive($account);
+
+    expect(array_map(fn ($hint) => $hint->changed, $batch->stateChanges))->toBe($expected);
+})->with([
+    'mixed' => [['Thread' => 'thread-3', 'Email' => 'email-4', 'Identity' => 'identity-2', 'Mailbox' => 'mailbox-7'], [['Email' => 'email-4', 'Mailbox' => 'mailbox-7']]],
+    'unrelated only' => [['Thread' => 'thread-3'], []],
+]);
+
+it('still rejects malformed mail state when unrelated Fastmail types are present', function (): void {
+    $account = notificationAccount(MailDriver::Jmap, 'jmap-account-3208');
+    Http::fake(fn (Request $request) => $request->url() === 'https://api.fastmail.com/jmap/session'
+        ? Http::response([
+            'eventSourceUrl' => 'https://api.fastmail.com/events?types={types}&closeafter={closeafter}&ping={ping}',
+            'accounts' => ['jmap-account-3208' => []],
+        ])
+        : Http::response("event: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"jmap-account-3208\":{\"Thread\":\"thread-3\",\"Email\":12}}}\n\n", 200, ['Content-Type' => 'text/event-stream']));
+
+    expect(fn () => app(FastmailEventSourceService::class)->receive($account))
+        ->toThrow(ProviderNotificationException::class);
+});
+
 it('accepts the exact Session-advertised Fastmail Philadelphia EventSource origin', function (): void {
     $account = notificationAccount(MailDriver::Jmap, 'jmap-account-3208');
     Http::fake(function (Request $request) {

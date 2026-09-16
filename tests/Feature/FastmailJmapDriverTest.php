@@ -11,6 +11,7 @@ use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
 use Jkudish\MailMirror\Enums\ConnectionStatus;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
+use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
 use Jkudish\MailMirror\Import\MailImportEngine;
@@ -85,6 +86,8 @@ final class JmapInventoryState
     public string $sessionState = 'jmap-session-state-3207';
 
     public ?string $nextResponseSessionState = null;
+
+    public bool $sessionChurn = false;
 }
 
 /** @return array<string, mixed> */
@@ -160,7 +163,7 @@ function fakeJmap(
             $calls['Session/get'] = ($calls['Session/get'] ?? 0) + 1;
 
             $session = jmapFixturePart($fixture, 'session');
-            $session['state'] = $state->sessionState;
+            $session['state'] = $state->sessionChurn ? 'session-'.$calls['Session/get'] : $state->sessionState;
 
             return Http::response($session);
         }
@@ -182,6 +185,9 @@ function fakeJmap(
         assert(is_string($method) && is_array($arguments) && is_string($callId));
         $calls[$method] = ($calls[$method] ?? 0) + 1;
         $responseSessionState = $state->nextResponseSessionState ?? $state->sessionState;
+        if ($state->sessionChurn) {
+            $responseSessionState = 'api-session';
+        }
 
         if ($state->nextResponseSessionState !== null) {
             $state->sessionState = $state->nextResponseSessionState;
@@ -765,7 +771,7 @@ it('rejects an oversized Identity list before parsing nested identity fields', f
         ->and($calls['Email/query'] ?? 0)->toBe(0);
 });
 
-it('refreshes changed Session state in the same reader and restarts without stale inventory effects', function (): void {
+it('refreshes changed Session metadata without restarting the mailbox inventory', function (): void {
     $fixture = jmapFixture();
     $account = jmapAccount();
     $calls = [];
@@ -781,13 +787,64 @@ it('refreshes changed Session state in the same reader and restarts without stal
     expect($engine->sync($account, 1))->toBeNull();
     $restarted = MailSyncCheckpoint::query()->forAccount($account)->firstOrFail();
 
-    expect($restarted->scan_id)->not->toBe($firstScan)
+    expect($restarted->scan_id)->toBe($firstScan)
         ->and($restarted->provider_cursor)->not->toBeNull()
-        ->and(MailInventoryItem::query()->forAccount($account)->count())->toBe(0)
-        ->and(MailMessage::query()->forAccount($account)->count())->toBe(0)
+        ->and(MailInventoryItem::query()->forAccount($account)->count())->toBeGreaterThan(0)
+        ->and(MailMessage::query()->forAccount($account)->count())->toBeGreaterThan(0)
         ->and($account->refresh()->provider_metadata['session_state'] ?? null)->toBe('jmap-session-state-refreshed')
-        ->and($calls['Session/get'] ?? 0)->toBeGreaterThanOrEqual(4);
+        ->and($calls['Session/get'] ?? 0)->toBeGreaterThanOrEqual(3);
 });
+
+it('continues inventory across distinct Session and API metadata states on every response', function (): void {
+    $account = jmapAccount();
+    $calls = [];
+    $state = new JmapInventoryState;
+    $state->sessionChurn = true;
+    fakeJmap(jmapFixture(), $calls, inventoryState: $state);
+    $reader = app(FastmailJmapMailboxReader::class);
+    $budget = new SyncWorkBudget(maxHttpRequests: 30);
+    $resources = $reader->inventoryPage($account, null, $budget);
+    $page = $reader->inventoryPage($account, $resources->nextCursor, $budget);
+
+    expect($resources->identitiesComplete)->toBeTrue()
+        ->and(array_map(fn ($message) => $message->providerMessageId, $page->messages))->toBe(['jmap-email-a'])
+        ->and($calls['Mailbox/get'])->toBe(1)
+        ->and($calls['Email/query'])->toBe(1)
+        ->and($budget->snapshot()['http_requests'])->toBeGreaterThan(5);
+});
+
+it('rejects unsafe Session changes before using a mismatched API response', function (string $change): void {
+    $account = jmapAccount();
+    $fixture = jmapFixture();
+    $sessions = 0;
+    Http::fake(function (Request $request) use ($fixture, $change, &$sessions) {
+        if ($request->method() === 'GET') {
+            $session = jmapFixturePart($fixture, 'session');
+            if (++$sessions > 1) {
+                if ($change === 'account') {
+                    $session['accounts'] = [];
+                } elseif ($change === 'capability') {
+                    $session['capabilities'] = [];
+                } else {
+                    $session[$change] = $change === 'apiUrl'
+                        ? 'https://phl.api.fastmail.com/jmap/api/'
+                        : 'https://nyc-www.fastmailusercontent.com/jmap/download/{accountId}/{blobId}/{name}?type={type}';
+                }
+            }
+
+            return Http::response($session);
+        }
+
+        return Http::response(jmapResponse('Mailbox/get', jmapFixturePart($fixture, 'mailboxes'), 'mailboxes', 'different-session'));
+    });
+
+    try {
+        app(FastmailJmapMailboxReader::class)->inventoryPage($account, null);
+        throw new RuntimeException('Changed Session boundary was accepted.');
+    } catch (InventoryRestartRequired|MailImportFailure) {
+        Http::assertSentCount(3);
+    }
+})->with(['account', 'capability', 'apiUrl', 'downloadUrl']);
 
 it('preserves a wrong local credential type without destructive revocation', function (): void {
     $account = MailAccount::query()->create([

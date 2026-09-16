@@ -593,7 +593,9 @@ final readonly class MailImportEngine
         $inventory = MailSyncCheckpoint::query()->forAccount($account)->first();
 
         if ($inventory === null || $inventory->scan_id !== $expected->repair_scan_id) {
-            throw new StaleCheckpoint;
+            $this->restartDeltaRepairScan($account, $expected);
+
+            return new DeltaSyncResult(0, false, true);
         }
 
         $report = $inventory->scan_completed_at === null
@@ -607,6 +609,16 @@ final readonly class MailImportEngine
         }
 
         if ($report->scan_id !== $expected->repair_scan_id) {
+            // A provider-requested inventory restart moves the repair binding
+            // transactionally. Resume its new version on the next invocation.
+            if (MailDeltaCheckpoint::query()->forAccount($account)
+                ->whereKey($expected->id)
+                ->where('repair_cursor', $expected->repair_cursor)
+                ->where('repair_scan_id', $report->scan_id)
+                ->where('version', '>', $expected->version)->exists()) {
+                return new DeltaSyncResult(0, false, true);
+            }
+
             throw new StaleCheckpoint;
         }
 
@@ -856,6 +868,18 @@ final readonly class MailImportEngine
 
             $previousScanId = $checkpoint->scan_id;
             $nextScanId = (string) Str::uuid();
+            $repair = MailDeltaCheckpoint::query()->forAccount($account)
+                ->whereNotNull('repair_cursor')
+                ->where('repair_scan_id', $previousScanId)
+                ->lockForUpdate()->first();
+
+            if ($repair !== null) {
+                $repair->forceFill([
+                    'repair_scan_id' => $nextScanId,
+                    'version' => $repair->version + 1,
+                ])->save();
+            }
+
             MailProviderDeletionEvidence::query()->forAccount($account)
                 ->where('scan_id', $previousScanId)
                 ->update(['scan_id' => $nextScanId]);
