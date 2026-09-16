@@ -676,14 +676,17 @@ it('accepts a complete Fastmail event after more than one quiet second', functio
     $batch = app(FastmailEventSourceService::class)->receive($account);
     $eventSourceRequest = $history[1] ?? null;
 
-    if (! is_array($eventSourceRequest) || ! is_array($eventSourceRequest['options'] ?? null)) {
+    if (! is_array($eventSourceRequest)) {
         throw new RuntimeException('EventSource request options were not recorded.');
     }
 
+    /** @var array<string, mixed> $options */
+    $options = $eventSourceRequest['options'];
+
     expect($batch->stateChanges)->toHaveCount(1)
         ->and($batch->stateChanges[0]->changed)->toBe(['Email' => 'email-after-quiet'])
-        ->and($eventSourceRequest['options']['stream'] ?? false)->toBeFalse()
-        ->and($eventSourceRequest['options']['timeout'] ?? null)->toBeGreaterThan(2.0)
+        ->and($options['stream'] ?? false)->toBeFalse()
+        ->and($options['timeout'] ?? null)->toBeGreaterThan(2.0)
         ->and($stream->closed)->toBeTrue();
 });
 
