@@ -3,6 +3,8 @@
 declare(strict_types=1);
 
 use GuzzleHttp\Middleware;
+use GuzzleHttp\Promise\Create;
+use GuzzleHttp\Psr7\Response as PsrResponse;
 use GuzzleHttp\Psr7\StreamDecoratorTrait;
 use GuzzleHttp\Psr7\Utils;
 use Illuminate\Http\Client\Factory;
@@ -558,7 +560,7 @@ it('bounds a Fastmail stream that keeps sending pings without ending', function 
                 'eventSourceUrl' => 'https://api.fastmail.com/events?types={types}&closeafter={closeafter}&ping={ping}',
                 'accounts' => ['jmap-account-3208' => []],
             ])
-            : Http::response($stream, 200, ['Content-Type' => 'text/event-stream']);
+            : Create::promiseFor(new PsrResponse(200, ['Content-Type' => 'text/event-stream'], $stream));
     });
     $started = hrtime(true);
 
@@ -670,7 +672,7 @@ it('accepts a complete Fastmail event after more than one quiet second', functio
                 'eventSourceUrl' => 'https://api.fastmail.com/events?types={types}&closeafter={closeafter}&ping={ping}',
                 'accounts' => ['jmap-account-3208' => []],
             ])
-            : Http::response($stream, 200, ['Content-Type' => 'text/event-stream']);
+            : Create::promiseFor(new PsrResponse(200, ['Content-Type' => 'text/event-stream'], $stream));
     });
 
     $batch = app(FastmailEventSourceService::class)->receive($account);
@@ -728,7 +730,7 @@ it('sanitizes a Fastmail stream failure and always closes its body', function ()
                 'eventSourceUrl' => 'https://api.fastmail.com/events?types={types}&closeafter={closeafter}&ping={ping}',
                 'accounts' => ['jmap-account-3208' => []],
             ])
-            : Http::response($stream, 200, ['Content-Type' => 'text/event-stream']);
+            : Create::promiseFor(new PsrResponse(200, ['Content-Type' => 'text/event-stream'], $stream));
     });
 
     try {
