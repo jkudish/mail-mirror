@@ -126,6 +126,290 @@ A successful retry resolves the error episode. You may waive an understood
 error with `MailImportError::waive()`. A later episode does not inherit the old
 waiver.
 
+## Wake synchronization from provider notifications
+
+MailMirror exposes provider-specific, finite notification primitives. The host
+owns process supervision, repeated invocation, account locking, durable job or
+wake-up creation, and fallback polling. A hint never changes
+`mail_delta_checkpoints.provider_cursor`; it only tells the host to call
+`MailImportEngine::syncChangesAccount()` from the package's applied cursor.
+
+Run the package migration before configuring either adapter. Both integrations
+are disabled by default.
+
+### Gmail watch and outbound Pub/Sub pull
+
+Configure one exact project/topic/subscription tuple under
+`mail-mirror.gmail.pubsub`. The default `PubSubAccessTokenProvider` reads a
+short-lived token at call time from the environment variable named by
+`access_token_environment`; the token is not copied into cached Laravel config.
+Consumers may bind another `PubSubAccessTokenProvider` implementation for their
+credential runtime. Pub/Sub credentials are separate from mailbox OAuth.
+
+Register a watch with an explicit setup choice:
+
+```php
+$watch = app(GmailWatchService::class)->register(
+    $account,
+    GmailWatchSetup::Create,
+);
+
+// Renewal requires the exact identity returned by the prior setup.
+$watch = app(GmailWatchService::class)->register(
+    $account,
+    GmailWatchSetup::Renew,
+    $watch->identity,
+);
+```
+
+`Create` rejects existing metadata. `Renew` requires stored and configured
+identities to match. `Replace` requires the exact prior identity and a different
+configured identity, making resource takeover explicit. The returned
+`historyIdHint` and persisted `mail_gmail_watches.history_id_hint` are diagnostic
+hints only; neither advances applied Gmail history.
+
+Pull and acknowledge are separate host calls:
+
+```php
+$batch = app(GmailPubSubService::class)->pull($gmailAccounts, maximumMessages: 20);
+
+foreach ($batch->notifications as $notification) {
+    if ($notification->accepted()) {
+        // Durably record/coalesce a wake-up for $notification->mailAccountId.
+        // historyIdHint is diagnostic only; reconcile from the applied cursor.
+    } else {
+        // Durably record a safe malformed_or_misrouted disposition.
+    }
+}
+
+// Call only after every envelope has durable host intent or disposition.
+app(GmailPubSubService::class)->acknowledge($batch->notifications);
+```
+
+`pull()` makes one unary REST Pull request and accepts 1 through the configured
+`max_messages` (at most 100). Every supplied account must exactly match its
+persisted account/owner identity and stored watch project/topic/subscription.
+Each envelope is size bounded and yields only account ID, provider message ID,
+publish time, optional history hint, and a safe rejection reason. Ack IDs remain
+inside non-serializable envelope capabilities. `acknowledge()` rejects an empty,
+oversized, or cross-subscription list. Gmail history IDs encoded as either
+decimal strings or exact positive JSON integers are normalized to decimal
+strings; zero, negative, fractional, and imprecise numeric values are rejected.
+
+### Fastmail EventSource
+
+Each `receive()` call makes at most two authenticated requests: Session
+discovery and one finite EventSource request with `closeafter=state`. The package
+accepts only the Session-advertised level-1 template with exactly `types`,
+`closeafter`, and `ping`, an HTTPS origin in the package's finite Fastmail
+allowlist (`api.fastmail.com` or `phl.api.fastmail.com`), no userinfo, fragment,
+custom port, static query credential, or redirect. The first accepted origin is
+persisted and later Session responses must match it. Stream, event, line,
+event-count, and request-time limits come from
+`mail-mirror.jmap.event_source`. The timeout is a wall-time limit shared by
+Session discovery and the complete finite `closeafter=state` transfer. The
+EventSource response is buffered by the HTTP transport rather than returned as a
+live PHP stream, so its total timeout remains active during quiet periods and
+continuous pings. Transfer and read failures are content-safe and retryable, and
+the response body is always closed after a successful transfer. An event is
+exposed only after its terminating blank line arrives; a partial final event is
+discarded and replayed after reconnect.
+
+```php
+$batch = app(FastmailEventSourceService::class)->receive($account);
+
+foreach ($batch->stateChanges as $hint) {
+    // Durably coalesce a wake-up. hint->changed contains only bounded
+    // Email, EmailDelivery, and/or Mailbox state strings for this account.
+}
+
+// After durable host intent, checkpoint SSE replay position separately.
+if ($batch->lastEventId !== null) {
+    app(FastmailEventSourceService::class)->advanceLastEventId(
+        $account,
+        expectedLastEventId: $previousLastEventId,
+        batch: $batch,
+    );
+}
+```
+
+`advanceLastEventId()` is compare-and-set. Event IDs live only in
+`mail_jmap_event_sources`; they never replace applied JMAP state in account
+metadata or the delta checkpoint. The next `receive()` sends the persisted
+value as `Last-Event-ID`. The host reconnects by invoking `receive()` again and
+uses ordinary delta reconciliation and fallback when hints are duplicate,
+missing, delayed, or interrupted.
+
+## Apply provider changes
+
+After an inventory has established provider state, run a bounded changed-message
+sync independently of push hints:
+
+```php
+$result = app(MailImportEngine::class)->syncChangesAccount(
+    mailAccountId: $account->id,
+    ownerType: 'user',
+    ownerId: $user->getKey(),
+    pageLimit: 10,
+    repairPageLimit: 2,
+);
+```
+
+`DeltaSyncResult` contains `processedCount`, `caughtUp`, and `repairPending`.
+Call the method again when `caughtUp` is false. Gmail history and JMAP
+`Email/changes` update existing message state without downloading RFC 822 data.
+New or reappeared messages still pass through complete normalized and raw
+persistence.
+
+`mail_delta_checkpoints.provider_cursor` is the last applied provider cursor,
+not the last push hint received. A page commits its source records, deletion
+evidence, normalized container lifecycle, replayable source changes, and cursor
+in one database transaction. A failed new-message retrieval records a
+`MailImportError` but retains the cursor so the page is retried. A message that
+disappears between the provider change list and state retrieval instead creates
+a `mail_delta_pending_messages` obligation while advancing past that page. A
+later deletion resolves it, or the next changed-message sync retries full
+retrieval; `caughtUp` remains false while an obligation is open. Each call reads
+provider changes before retrying at most 25 obligations, ordered by fewest prior
+attempts and then ID, so an unavailable backlog cannot hide a later provider
+deletion page or permanently starve newer obligations.
+
+An expired cursor stores `repair_cursor` and binds `repair_scan_id` to a newly
+started authoritative inventory, run in `repairPageLimit` chunks. The repair
+remains pending when that exact scan reports transient errors, unexplained
+missing messages, or an inconclusive exact lookup. For unexpected local
+messages absent from a complete inventory, bounded exact provider lookup either
+confirms current presence or records deletion evidence for quarantine; it never
+purges the message. Each exact outcome is committed under the existing repair
+scan before the next lookup, so a large set or exhausted invocation resumes from
+its remaining messages instead of restarting the scan. After convergence,
+change sync replays from the captured repair cursor before reporting `caughtUp`.
+Partial container snapshots and transient or authorization failures never prove
+deletion.
+
+### Bound one invocation
+
+Pass a caller-owned `SyncWorkBudget` when a check must stop after a finite
+allowance. Omitting it preserves the unlimited package behavior:
+
+```php
+use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
+use Jkudish\MailMirror\Read\SyncWorkBudget;
+
+$budget = new SyncWorkBudget(
+    maxHttpRequests: 200,
+    maxListedIds: 2000,
+    maxFetchedMessages: 100,
+    maxDownloadedBytes: 100 * 1024 * 1024,
+    maxElapsedSeconds: 15 * 60,
+);
+
+try {
+    $result = app(MailImportEngine::class)->syncChangesAccount(
+        mailAccountId: $account->id,
+        ownerType: 'user',
+        ownerId: $user->getKey(),
+        pageLimit: 10,
+        repairPageLimit: 2,
+        budget: $budget,
+    );
+} catch (SyncBudgetExhausted $failure) {
+    $safeCode = SyncBudgetExhausted::SAFE_CODE; // budget_exhausted
+    $dimension = $failure->dimension;
+    $usage = $failure->snapshot;
+}
+
+$usage = $budget->snapshot();
+```
+
+The default constructor values are the limits shown above. The same mutable
+object covers provider change pages, every HTTP retry and Gmail token refresh,
+listed message IDs, message retrieval attempts, and any nested expired-cursor
+inventory repair and baseline replay. `snapshot()` and the exception snapshot
+contain only scalar counters and limits; they contain no account, message, or
+credential data. A budget exception does not reset a durable cursor: work
+committed before it remains resumable.
+
+HTTP attempts and fetched-message attempts are reserved before work starts. An
+exactly consumed HTTP, listed-ID, fetched-message, or downloaded-byte allowance
+rejects the next network request. Gmail `maxResults` and JMAP
+`limit`/`maxChanges` are clamped to the remaining listed-ID allowance, although
+one Gmail history record can still expand into multiple message IDs; every
+returned page is therefore validated and charged before persistence.
+All HTTP requests needed to retrieve an admitted final message remain allowed;
+the fetched-message boundary closes when that retrieval returns or throws.
+
+Budgeted credentialed requests do not follow redirects, and each request
+timeout is the smaller of provider configuration and the remaining elapsed
+allowance. With Guzzle's normal cURL handler, its native `progress` callback
+aborts at the first reported downloaded-byte count beyond the remaining
+allowance. Guzzle does not specify callback granularity, its stream handler
+ignores callback return values, compressed transport bytes can differ from the
+decoded body, and Laravel test fakes do not drive transfer progress. The final
+buffered body length is therefore still charged as a fallback. This is not a
+strict wire-byte guarantee: a response can overshoot until the cURL callback or,
+without cURL progress support, until buffering completes. Provider request
+timeouts and raw-message decoded-size limits remain independent bounds; JSON
+responses have no separate per-response byte cap.
+
+Custom readers keep their existing API and unlimited behavior, but must
+implement `BudgetedMailboxReader` (and `BudgetedDeltaMailboxReader` for deltas)
+before accepting a finite budget.
+
+### Project source changes
+
+Every package persistence path, including the historical `syncAccount()` path,
+inserts `MailSourceChange` rows in the same transaction as the source change.
+This closes the crash gap that after-commit events alone cannot close. The
+append-only rows contain only scalar references:
+
+| `kind` | Populated values |
+| --- | --- |
+| `message_changed` | `mail_message_id`, `provider_message_id` |
+| `message_deleted` | deleted `mail_message_id`, `provider_message_id` |
+| `raw_changed` | `mail_message_id`, `mail_raw_object_id`, `provider_message_id` |
+| `container_changed` | `mail_container_id`, `provider_container_id` |
+| `container_deleted` | deleted `mail_container_id`, `provider_container_id` |
+| `provider_deletion_changed` | `provider_message_id`, `provider_deleted` |
+
+All rows also contain `id`, `mail_account_id`, `acknowledged_at`, and timestamps.
+IDs are account-qualified; message, raw object, and container IDs deliberately
+have no foreign key because deletion records must remain replayable.
+
+Read and acknowledge rows through the owner-scoped service:
+
+```php
+$changes = app(SourceChangeService::class)->pendingAccount(
+    $account->id,
+    'user',
+    $user->getKey(),
+    limit: 100,
+);
+
+DB::transaction(function () use ($changes, $account, $user): void {
+    // Apply each change idempotently to the host projection first.
+
+    app(SourceChangeService::class)->acknowledgeAccount(
+        $account->id,
+        'user',
+        $user->getKey(),
+        $changes->modelKeys(),
+    );
+});
+```
+
+`pendingAccount()` returns unacknowledged rows ordered by `id` (limit 1–500).
+`acknowledgeAccount()` accepts 1–500 positive integer IDs and updates only rows
+on the supplied account and owner path. When the host projection uses the same
+database connection, acknowledge inside the host projection transaction as
+shown. Otherwise apply idempotently and acknowledge afterward; a crash may
+replay a row but cannot lose it.
+
+The package migration creates `mail_delta_checkpoints`,
+`mail_delta_pending_messages`, and `mail_source_changes`; existing inventory
+APIs and tables remain compatible. Deploy the migration before calling
+`syncChangesAccount()` or `SourceChangeService`.
+
 ## Read stored objects
 
 Use `MailObjectStorage` instead of reading its configured disk or persisted

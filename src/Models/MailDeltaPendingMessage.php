@@ -5,10 +5,10 @@ declare(strict_types=1);
 namespace Jkudish\MailMirror\Models;
 
 /**
- * @property string $scan_id
- * @property string $proof_code
+ * @property string $provider_message_id
+ * @property string|null $provider_thread_id
  */
-final class MailProviderDeletionEvidence extends AccountScopedModel
+final class MailDeltaPendingMessage extends AccountScopedModel
 {
     /** @return list<string> */
     protected function immutableAttributes(): array

@@ -102,6 +102,18 @@ final class MailAccount extends Model
         return $this->hasMany(MailAccountCredentialHistory::class);
     }
 
+    /** @return HasOne<MailGmailWatch, $this> */
+    public function gmailWatch(): HasOne
+    {
+        return $this->hasOne(MailGmailWatch::class);
+    }
+
+    /** @return HasOne<MailJmapEventSource, $this> */
+    public function jmapEventSource(): HasOne
+    {
+        return $this->hasOne(MailJmapEventSource::class);
+    }
+
     /** @param Builder<static> $query */
     public function scopeOwnedBy(Builder $query, string $ownerType, string|int $ownerId): void
     {

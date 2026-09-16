@@ -8,6 +8,7 @@ use Illuminate\Filesystem\FilesystemManager;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Jkudish\MailMirror\Enums\MailDriver;
+use Jkudish\MailMirror\Enums\MailSourceChangeKind;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\ImmutableObjectConflict;
 use Jkudish\MailMirror\Exceptions\MailObjectException;
@@ -21,6 +22,7 @@ use Jkudish\MailMirror\Models\MailMessage;
 use Jkudish\MailMirror\Models\MailMessageHeader;
 use Jkudish\MailMirror\Models\MailMessageParticipant;
 use Jkudish\MailMirror\Models\MailRawObject;
+use Jkudish\MailMirror\Models\MailSourceChange;
 use Jkudish\MailMirror\Models\MailSyncCheckpoint;
 use Jkudish\MailMirror\Models\MailThread;
 use Jkudish\MailMirror\Storage\MailObjectStorage;
@@ -307,6 +309,8 @@ it('purges the matched normalized message and objects while preserving shared re
         ->and(MailThread::query()->forAccount($account)->whereKey($thread->id)->exists())->toBeTrue()
         ->and(MailAddress::query()->forAccount($account)->whereKey($sharedAddress->id)->exists())->toBeTrue()
         ->and(MailAddress::query()->forAccount($account)->whereKey($orphanedAddress->id)->exists())->toBeFalse()
+        ->and(MailSourceChange::query()->forAccount($account)->where('kind', MailSourceChangeKind::RawChanged)->where('mail_raw_object_id', $raw->id)->exists())->toBeTrue()
+        ->and(MailSourceChange::query()->forAccount($account)->where('kind', MailSourceChangeKind::MessageDeleted)->where('mail_message_id', $message->id)->exists())->toBeTrue()
         ->and($checkpoint->refresh()->version)->toBe(8);
     Storage::disk('mail-mirror-test')->assertMissing([$rawKey, $attachmentKey]);
 

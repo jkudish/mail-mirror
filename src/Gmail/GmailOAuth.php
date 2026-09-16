@@ -6,15 +6,18 @@ namespace Jkudish\MailMirror\Gmail;
 
 use DateTimeImmutable;
 use Illuminate\Http\Client\Factory;
+use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
 use Jkudish\MailMirror\Enums\ConnectionStatus;
 use Jkudish\MailMirror\Exceptions\ConnectionCredentialException;
 use Jkudish\MailMirror\Exceptions\GmailAuthorizationException;
+use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAccountCredential;
 use Jkudish\MailMirror\Read\AccountProfile;
+use Jkudish\MailMirror\Read\SyncWorkBudget;
 use SensitiveParameter;
 use Throwable;
 
@@ -95,6 +98,7 @@ final readonly class GmailOAuth
         MailAccount $account,
         MailAccountCredential $stored,
         OAuthTokenSetCredential $current,
+        ?SyncWorkBudget $budget = null,
     ): OAuthTokenSetCredential {
         $refreshToken = $current->refreshToken();
 
@@ -105,7 +109,7 @@ final readonly class GmailOAuth
         $response = $this->tokenRequest([
             'refresh_token' => $refreshToken,
             'grant_type' => 'refresh_token',
-        ]);
+        ], $budget);
 
         $replacement = $this->credentialFromResponse($response, $refreshToken, false, $current->scopes());
         $attemptedVersion = $stored->version;
@@ -137,14 +141,23 @@ final readonly class GmailOAuth
         return $replacement;
     }
 
-    public function profile(OAuthTokenSetCredential $credential): AccountProfile
-    {
+    public function profile(
+        OAuthTokenSetCredential $credential,
+        ?SyncWorkBudget $budget = null,
+    ): AccountProfile {
         $this->assertEnabled();
 
         try {
-            $response = $this->http->withToken($credential->accessToken())
-                ->acceptJson()->timeout($this->timeout())->withoutRedirecting()->get(self::PROFILE_ENDPOINT);
-        } catch (Throwable) {
+            $response = $this->prepareRequest(
+                $this->http->withToken($credential->accessToken())->acceptJson(),
+                $budget,
+            )->get(self::PROFILE_ENDPOINT);
+            $budget?->recordDownloadedBytes(strlen($response->body()));
+        } catch (Throwable $failure) {
+            if (($budgetFailure = $this->budgetFailure($failure)) !== null) {
+                throw $budgetFailure;
+            }
+
             throw new GmailAuthorizationException;
         }
 
@@ -176,21 +189,65 @@ final readonly class GmailOAuth
     }
 
     /** @param array<string, string> $parameters */
-    private function tokenRequest(#[SensitiveParameter] array $parameters): Response
-    {
+    private function tokenRequest(
+        #[SensitiveParameter] array $parameters,
+        ?SyncWorkBudget $budget = null,
+    ): Response {
         $this->assertEnabled();
 
         try {
-            return $this->http->asForm()->acceptJson()->timeout($this->timeout())->withoutRedirecting()->post(
+            $response = $this->prepareRequest($this->http->asForm()->acceptJson(), $budget)->post(
                 self::TOKEN_ENDPOINT,
                 $parameters + [
                     'client_id' => $this->configuration('client_id'),
                     'client_secret' => $this->clientSecret(),
                 ],
             );
-        } catch (Throwable) {
+            $budget?->recordDownloadedBytes(strlen($response->body()));
+
+            return $response;
+        } catch (Throwable $failure) {
+            if (($budgetFailure = $this->budgetFailure($failure)) !== null) {
+                throw $budgetFailure;
+            }
+
             throw new GmailAuthorizationException;
         }
+    }
+
+    private function prepareRequest(PendingRequest $request, ?SyncWorkBudget $budget): PendingRequest
+    {
+        if ($budget === null) {
+            return $request->timeout($this->timeout())->withoutRedirecting();
+        }
+
+        $budget->claimHttpRequest();
+        $remainingBytes = $budget->remainingDownloadedBytes();
+
+        return $request->withoutRedirecting()
+            ->timeout(min($this->timeout(), $budget->remainingElapsedSeconds()))
+            ->withOptions([
+                'progress' => static function (int $downloadTotal, int $downloadedBytes) use ($budget, $remainingBytes): bool {
+                    if ($downloadedBytes > $remainingBytes) {
+                        $budget->recordDownloadedBytes($downloadedBytes);
+                    }
+
+                    return false;
+                },
+            ]);
+    }
+
+    private function budgetFailure(Throwable $failure): ?SyncBudgetExhausted
+    {
+        do {
+            if ($failure instanceof SyncBudgetExhausted) {
+                return $failure;
+            }
+
+            $failure = $failure->getPrevious();
+        } while ($failure !== null);
+
+        return null;
     }
 
     /** @param list<string> $fallbackScopes */

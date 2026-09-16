@@ -12,11 +12,13 @@ use Jkudish\MailMirror\Enums\ConnectionStatus;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
+use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
 use Jkudish\MailMirror\Gmail\GmailMailboxReader;
 use Jkudish\MailMirror\Gmail\GmailOAuth;
 use Jkudish\MailMirror\Import\MailImportEngine;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAttachment;
+use Jkudish\MailMirror\Models\MailDeltaPendingMessage;
 use Jkudish\MailMirror\Models\MailIdentity;
 use Jkudish\MailMirror\Models\MailInventoryItem;
 use Jkudish\MailMirror\Models\MailMessage;
@@ -24,7 +26,9 @@ use Jkudish\MailMirror\Models\MailProviderDeletionEvidence;
 use Jkudish\MailMirror\Models\MailRawObject;
 use Jkudish\MailMirror\Models\MailSyncCheckpoint;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
+use Jkudish\MailMirror\Read\MailReadService;
 use Jkudish\MailMirror\Read\MessageReference;
+use Jkudish\MailMirror\Read\SyncWorkBudget;
 use Jkudish\MailMirror\Storage\MailObjectStorage;
 
 final class GmailRefreshState
@@ -101,6 +105,127 @@ it('registers the production Gmail reader by its closed enum key and fails close
     }
 
     Http::assertNothingSent();
+});
+
+it('charges Gmail response bytes and refuses the next HTTP request before sending it', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $account->forceFill(['provider_metadata' => ['history_id' => 'history-before-budget']])->save();
+    $requestOptions = null;
+    Http::fake(function (Request $request, array $options) use ($fixture, &$requestOptions) {
+        $requestOptions = $options;
+
+        return str_ends_with($request->url(), '/profile')
+            ? Http::response($fixture['profile'])
+            : Http::response(['synthetic' => 'unexpected'], 500);
+    });
+    $budget = new SyncWorkBudget(maxHttpRequests: 1, maxElapsedSeconds: 1);
+
+    try {
+        app(GmailMailboxReader::class)->changesPage($account, null, $budget);
+        throw new RuntimeException('The Gmail HTTP allowance was not enforced.');
+    } catch (SyncBudgetExhausted $failure) {
+        expect($failure->dimension)->toBe('http_requests')
+            ->and($failure->snapshot['http_requests'])->toBe(1)
+            ->and($failure->snapshot['downloaded_bytes'])->toBeGreaterThan(0)
+            ->and($budget->snapshot()['http_requests'])->toBe(1)
+            ->and($requestOptions['allow_redirects'] ?? null)->toBeFalse()
+            ->and($requestOptions['timeout'] ?? null)->toBeGreaterThan(0)
+            ->toBeLessThanOrEqual(1.0)
+            ->and($requestOptions['progress'] ?? null)->toBeInstanceOf(Closure::class);
+    }
+
+    Http::assertSentCount(1);
+    Http::assertSent(fn (Request $request): bool => str_ends_with($request->url(), '/profile'));
+});
+
+it('charges an expiring Gmail credential refresh as an HTTP request', function (): void {
+    $account = gmailAccount(expiresAt: new DateTimeImmutable('-1 minute'));
+    Http::fake([
+        'https://oauth2.googleapis.com/token' => Http::response([
+            'access_token' => 'synthetic-refreshed-access',
+            'expires_in' => 3600,
+        ]),
+    ]);
+    $budget = new SyncWorkBudget(maxHttpRequests: 1);
+
+    try {
+        app(GmailMailboxReader::class)->changesPage($account, null, $budget);
+        throw new RuntimeException('The post-refresh Gmail request exceeded its allowance.');
+    } catch (SyncBudgetExhausted $failure) {
+        expect($failure->dimension)->toBe('http_requests')
+            ->and($failure->snapshot['http_requests'])->toBe(1);
+    }
+
+    Http::assertSentCount(1);
+    Http::assertSent(fn (Request $request): bool => $request->url() === 'https://oauth2.googleapis.com/token');
+});
+
+it('refuses a Gmail request before transport when the byte allowance is already exhausted', function (): void {
+    $account = gmailAccount();
+    $account->forceFill(['provider_metadata' => ['history_id' => 'history-before-budget']])->save();
+    Http::fake();
+    $budget = new SyncWorkBudget(maxDownloadedBytes: 0);
+
+    try {
+        app(GmailMailboxReader::class)->changesPage($account, null, $budget);
+        throw new RuntimeException('The Gmail byte allowance was not enforced.');
+    } catch (SyncBudgetExhausted $failure) {
+        expect($failure->dimension)->toBe('downloaded_bytes')
+            ->and($failure->snapshot['downloaded_bytes'])->toBe(0)
+            ->and($failure->snapshot['max_downloaded_bytes'])->toBe(0);
+    }
+
+    Http::assertNothingSent();
+});
+
+it('surfaces a byte-budget abort raised by the Guzzle progress hook', function (): void {
+    $account = gmailAccount();
+    $account->forceFill(['provider_metadata' => ['history_id' => 'history-before-budget']])->save();
+    Http::fake(function (Request $request, array $options) {
+        $progress = $options['progress'] ?? null;
+
+        if (! is_callable($progress)) {
+            throw new RuntimeException('The budgeted request did not install a progress hook.');
+        }
+
+        $progress(10, 2, 0, 0);
+
+        return Http::response(['synthetic' => 'unreachable']);
+    });
+    $budget = new SyncWorkBudget(maxDownloadedBytes: 1);
+
+    try {
+        app(GmailMailboxReader::class)->changesPage($account, null, $budget);
+        throw new RuntimeException('The progress hook did not abort the oversized transfer.');
+    } catch (SyncBudgetExhausted $failure) {
+        expect($failure->dimension)->toBe('downloaded_bytes')
+            ->and($failure->snapshot['downloaded_bytes'])->toBe(2);
+    }
+});
+
+it('clamps a Gmail history request to the remaining listed-message allowance', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $account->forceFill(['provider_metadata' => ['history_id' => 'history-before-budget']])->save();
+    $historyUrl = null;
+    Http::fake(function (Request $request) use ($fixture, &$historyUrl) {
+        if (str_ends_with($request->url(), '/profile')) {
+            return Http::response($fixture['profile']);
+        }
+
+        if (str_ends_with($request->url(), '/labels')) {
+            return Http::response($fixture['labels']);
+        }
+
+        $historyUrl = $request->url();
+
+        return Http::response(['history' => [], 'historyId' => 'history-100']);
+    });
+
+    app(GmailMailboxReader::class)->changesPage($account, null, new SyncWorkBudget(maxListedIds: 1));
+
+    expect($historyUrl)->toContain('maxResults=1');
 });
 
 it('keeps the separately named live lane unreachable without its explicit opt-in', function (): void {
@@ -216,6 +341,66 @@ it('uses Gmail history for changes and deletion evidence then performs an author
         ->and(MailProviderDeletionEvidence::query()->forAccount($account)->where('provider_message_id', 'gmail-message-b')->value('proof_code'))
         ->toBe('gmail_history_deleted')
         ->and($account->refresh()->provider_metadata)->toMatchArray(['history_id' => 'history-200']);
+});
+
+it('applies Gmail history deltas without a full inventory or raw download for existing messages', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $account->forceFill(['provider_metadata' => ['history_id' => 'history-100']])->save();
+    MailMessage::query()->create([
+        'mail_account_id' => $account->id,
+        'provider_message_id' => 'gmail-message-a',
+    ]);
+    $profile = $fixture['profile'];
+    $profile['historyId'] = 'history-200';
+    $sent = [];
+
+    Http::fake(function (Request $request) use ($fixture, $profile, &$sent) {
+        $sent[] = $request->url();
+
+        return match (true) {
+            str_ends_with($request->url(), '/profile') => Http::response($profile),
+            str_ends_with($request->url(), '/labels') => Http::response($fixture['labels']),
+            str_contains($request->url(), '/history') => Http::response($fixture['history']),
+            str_contains($request->url(), '/messages/gmail-message-a') && str_contains($request->url(), 'format=minimal') => Http::response($fixture['message_a']),
+            default => Http::response(['synthetic' => 'unexpected'], 500),
+        };
+    });
+
+    $result = app(MailImportEngine::class)->syncChanges($account);
+
+    expect($result->caughtUp)->toBeTrue()
+        ->and(MailProviderDeletionEvidence::query()->forAccount($account)->where('provider_message_id', 'gmail-message-b')->exists())->toBeTrue()
+        ->and(collect($sent)->contains(fn (string $url): bool => str_contains($url, '/messages?')))->toBeFalse()
+        ->and(collect($sent)->contains(fn (string $url): bool => str_contains($url, 'format=full') || str_contains($url, 'format=raw')))->toBeFalse();
+});
+
+it('durably defers a Gmail history message that disappears before minimal retrieval', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $account->forceFill(['provider_metadata' => ['history_id' => 'history-100']])->save();
+    $profile = $fixture['profile'];
+    $profile['historyId'] = 'history-200';
+
+    Http::fake(function (Request $request) use ($fixture, $profile) {
+        $url = $request->url();
+
+        return match (true) {
+            str_ends_with($url, '/profile') => Http::response($profile),
+            str_ends_with($url, '/labels') => Http::response($fixture['labels']),
+            str_contains($url, '/history') => Http::response(['history' => [[
+                'id' => 'history-raced-message',
+                'messagesAdded' => [['message' => ['id' => 'gmail-raced-message', 'threadId' => 'gmail-raced-thread']]],
+            ]], 'historyId' => 'history-200']),
+            str_contains($url, '/messages/gmail-raced-message') => Http::response([], 404),
+            default => Http::response([], 500),
+        };
+    });
+
+    $result = app(MailImportEngine::class)->syncChanges($account);
+
+    expect($result->caughtUp)->toBeFalse()
+        ->and(MailDeltaPendingMessage::query()->forAccount($account)->where('provider_message_id', 'gmail-raced-message')->exists())->toBeTrue();
 });
 
 it('falls back to a full scan when Gmail history has expired', function (): void {
@@ -794,6 +979,35 @@ it('accepts Gmail raw data with valid trailing base64url padding', function (): 
         ->and(stream_get_contents($source))->toBe(file_get_contents(__DIR__.'/../Fixtures/synthetic-message.eml'));
 
     fclose($source);
+});
+
+it('permits every request for the admitted final fetched message and blocks the next fetch before HTTP', function (): void {
+    $fixture = gmailFixture();
+    $account = gmailAccount();
+    $requestCount = 0;
+    Http::fake(function (Request $request) use ($fixture, &$requestCount) {
+        $requestCount++;
+
+        return str_contains($request->url(), 'format=raw')
+            ? Http::response(['raw' => gmailPaddedRaw()])
+            : Http::response($fixture['message_a']);
+    });
+    $reference = new MessageReference($account->id, MailDriver::Gmail, 'gmail-message-a', 'gmail-thread-1');
+    $budget = new SyncWorkBudget(maxFetchedMessages: 1);
+
+    $message = app(MailReadService::class)->retrieve($account, $reference, $budget);
+
+    try {
+        expect($message->rawSource?->stream)->toBeResource()
+            ->and($requestCount)->toBe(2)
+            ->and(fn () => app(MailReadService::class)->retrieve($account, $reference, $budget))
+            ->toThrow(SyncBudgetExhausted::class)
+            ->and($requestCount)->toBe(2);
+    } finally {
+        if (is_resource($message->rawSource?->stream)) {
+            fclose($message->rawSource->stream);
+        }
+    }
 });
 
 it('accepts bounded native Gmail attachment IDs longer than 255 characters', function (): void {
