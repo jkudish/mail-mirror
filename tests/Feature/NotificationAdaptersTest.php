@@ -676,7 +676,7 @@ it('accepts a complete Fastmail event after more than one quiet second', functio
     $batch = app(FastmailEventSourceService::class)->receive($account);
     $eventSourceRequest = $history[1] ?? null;
 
-    if (! is_array($eventSourceRequest)) {
+    if (! is_array($eventSourceRequest) || ! is_array($eventSourceRequest['options'] ?? null)) {
         throw new RuntimeException('EventSource request options were not recorded.');
     }
 
