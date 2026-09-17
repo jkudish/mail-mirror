@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Jkudish\MailMirror\Jmap;
 
+use GuzzleHttp\TransferStats;
 use Illuminate\Http\Client\Factory;
 use Illuminate\Http\Client\Response;
 use Jkudish\MailMirror\Credentials\ApiTokenCredential;
@@ -50,6 +51,11 @@ final readonly class FastmailEventSourceService
         }
 
         $response = $this->streamRequest($credential, $url, $state?->last_event_id, $deadline);
+        if ($response === null) {
+            // A bounded, healthy SSE connection can end without a complete state event.
+            // Do not advance the resume ID or claim any applied mailbox progress.
+            return new FastmailEventBatch([], null, null);
+        }
         $body = $this->readBounded($response, $deadline);
         $this->remainingSeconds($deadline);
         $batch = $this->parse($account, $body);
@@ -120,15 +126,19 @@ final readonly class FastmailEventSourceService
         string $url,
         ?string $lastEventId,
         int $deadline,
-    ): Response {
+    ): ?Response {
         if ($lastEventId !== null && ! $this->validEventId($lastEventId)) {
             throw new ProviderNotificationException('resource_mismatch');
         }
 
+        $stats = null;
         try {
             $remaining = $this->remainingSeconds($deadline);
             $request = $this->http->withToken($credential->token())
                 ->withHeaders(['Accept' => 'text/event-stream', 'Cache-Control' => 'no-cache'])
+                ->withOptions(['on_stats' => function (TransferStats $transfer) use (&$stats): void {
+                    $stats = $transfer;
+                }])
                 ->withoutRedirecting()
                 ->timeout($remaining);
 
@@ -140,6 +150,16 @@ final readonly class FastmailEventSourceService
         } catch (ProviderNotificationException $exception) {
             throw $exception;
         } catch (Throwable) {
+            $received = $stats?->getResponse();
+            if ($stats?->getHandlerErrorData() === 28
+                && $received?->getStatusCode() === 200
+                && strtolower(trim(explode(';', $received->getHeaderLine('Content-Type'))[0])) === 'text/event-stream'
+                && $stats->getHandlerStat('size_download') <= $this->maximumStreamBytes()) {
+                $received->getBody()->close();
+
+                return null;
+            }
+
             throw new ProviderNotificationException('provider_unavailable', true);
         }
 
