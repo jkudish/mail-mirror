@@ -45,6 +45,9 @@ return [
             /* Name only: the short-lived token itself is never copied into cached config. */
             'access_token_environment' => 'MAIL_MIRROR_GMAIL_PUBSUB_ACCESS_TOKEN',
             'max_messages' => 20,
+            /* Pull may wait on an empty subscription; matches Google's PHP client deadline. */
+            'pull_timeout_seconds' => 60,
+            /* Acknowledgements do not long-poll. */
             'timeout_seconds' => 10,
         ],
     ],

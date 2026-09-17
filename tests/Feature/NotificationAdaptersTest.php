@@ -7,6 +7,8 @@ use GuzzleHttp\Promise\Create;
 use GuzzleHttp\Psr7\Response as PsrResponse;
 use GuzzleHttp\Psr7\StreamDecoratorTrait;
 use GuzzleHttp\Psr7\Utils;
+use GuzzleHttp\TransferStats;
+use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Factory;
 use Illuminate\Http\Client\Request;
 use Illuminate\Http\Client\Response;
@@ -29,6 +31,7 @@ use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailDeltaCheckpoint;
 use Jkudish\MailMirror\Models\MailGmailWatch;
 use Jkudish\MailMirror\Models\MailJmapEventSource;
+use PHPUnit\Framework\Assert;
 use Psr\Http\Message\StreamInterface;
 use Symfony\Component\Process\Process;
 
@@ -112,7 +115,16 @@ function localEventSourceServer(string $mode): array
         while (($line = fgets($connection)) !== false && $line !== "\r\n") {
         }
 
-        fwrite($connection, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
+        if ($mode === 'no-headers') {
+            usleep(4000000);
+            fclose($connection);
+            fclose($server);
+            exit(0);
+        }
+
+        $status = $mode === 'unauthorized' ? '401 Unauthorized' : '200 OK';
+        $contentType = $mode === 'wrong-content-type' ? 'text/html' : 'text/event-stream';
+        fwrite($connection, "HTTP/1.1 {$status}\r\nContent-Type: {$contentType}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
         fflush($connection);
 
         if ($mode === 'complete') {
@@ -148,13 +160,17 @@ function localEventSourceServer(string $mode): array
     return [$process, 'http://'.$address.'/events'];
 }
 
-function receiveLocalEventSource(string $url, float $seconds): string
+function receiveLocalEventSource(string $url, float $seconds): ?string
 {
     $service = app(FastmailEventSourceService::class);
     $deadline = hrtime(true) + (int) ($seconds * 1_000_000_000);
     $request = new ReflectionMethod(FastmailEventSourceService::class, 'streamRequest');
     $read = new ReflectionMethod(FastmailEventSourceService::class, 'readBounded');
     $response = $request->invoke($service, new ApiTokenCredential('synthetic-fastmail-token'), $url, null, $deadline);
+
+    if ($response === null) {
+        return null;
+    }
 
     if (! $response instanceof Response) {
         throw new RuntimeException('Local EventSource fixture returned an invalid response.');
@@ -268,6 +284,53 @@ it('pulls bounded Gmail hints, classifies misrouting, and acknowledges only on a
         && $request['ackIds'] === ['ack-1', 'ack-2']
         && $request->hasHeader('Authorization', 'Bearer synthetic-pubsub-token'));
     Http::assertSentCount(2);
+});
+
+it('allows Gmail long polling without extending acknowledgement timeouts', function (): void {
+    $account = notificationAccount(MailDriver::Gmail, 'first@invented.test');
+    storeNotificationWatch($account);
+    Http::fake(function (Request $request, array $options) {
+        if (str_ends_with($request->url(), ':pull')) {
+            expect($options['timeout'])->toBe(60)
+                ->and($request->data())->toBe(['maxMessages' => 1]);
+
+            return Http::response(['receivedMessages' => [[
+                'ackId' => 'ack-long-poll',
+                'message' => ['messageId' => 'message-long-poll', 'publishTime' => '2026-09-15T12:00:01Z', 'data' => gmailNotificationData('first@invented.test', '801')],
+            ]]]);
+        }
+
+        expect($options['timeout'])->toBe(5);
+
+        return Http::response([]);
+    });
+
+    $service = app(GmailPubSubService::class);
+    $batch = $service->pull([$account], 1);
+    expect($batch->notifications)->toHaveCount(1);
+    $service->acknowledge($batch->notifications);
+    Http::assertSentCount(2);
+});
+
+it('returns an empty Gmail batch only for successful empty pulls', function (): void {
+    $account = notificationAccount(MailDriver::Gmail, 'first@invented.test');
+    storeNotificationWatch($account);
+    config()->set('mail-mirror.gmail.pubsub.pull_timeout_seconds', 23);
+    Http::fake(function (Request $request, array $options) {
+        expect($options['timeout'])->toBe(23);
+
+        return Http::response('');
+    });
+    expect(app(GmailPubSubService::class)->pull([$account])->notifications)->toBe([]);
+    Http::assertSentCount(1);
+
+    Http::fake(['*' => Http::failedConnection()]);
+    try {
+        app(GmailPubSubService::class)->pull([$account]);
+        Assert::fail('A failed pull must not be reported as an empty batch.');
+    } catch (ProviderNotificationException $exception) {
+        expect($exception->safeCode)->toBe('provider_unavailable');
+    }
 });
 
 it('accepts exact positive numeric Gmail history IDs and rejects unsafe JSON numbers', function (): void {
@@ -577,7 +640,51 @@ it('bounds a Fastmail stream that keeps sending pings without ending', function 
         ->and($stream->closed)->toBeTrue();
 });
 
-it('enforces the whole receive deadline through the real local HTTP transport', function (string $mode): void {
+it('returns no hints and preserves the resume ID on a healthy idle deadline', function (string $partialBody): void {
+    $account = notificationAccount(MailDriver::Jmap, 'jmap-account-3208');
+    MailJmapEventSource::query()->create([
+        'mail_account_id' => $account->id, 'event_source_origin' => 'https://api.fastmail.com',
+        'last_event_id' => 'previous-event',
+    ]);
+    Http::fake(function (Request $request, array $options) use ($partialBody) {
+        if ($request->url() === 'https://api.fastmail.com/jmap/session') {
+            return Http::response([
+                'eventSourceUrl' => 'https://api.fastmail.com/events?types={types}&closeafter={closeafter}&ping={ping}',
+                'accounts' => ['jmap-account-3208' => []],
+            ]);
+        }
+        $onStats = $options['on_stats'] ?? null;
+        if (! is_callable($onStats)) {
+            throw new RuntimeException('Expected transfer statistics callback.');
+        }
+        $onStats(new TransferStats(
+            $request->toPsrRequest(), new PsrResponse(200, ['Content-Type' => 'text/event-stream'], $partialBody),
+            5.0, 28, ['size_download' => strlen($partialBody)],
+        ));
+        throw new ConnectionException('Synthetic receive deadline');
+    });
+
+    $batch = app(FastmailEventSourceService::class)->receive($account);
+    expect($batch->stateChanges)->toBe([])
+        ->and($batch->lastEventId)->toBeNull()
+        ->and(MailJmapEventSource::query()->where('mail_account_id', $account->id)->value('last_event_id'))->toBe('previous-event');
+})->with(['empty' => '', 'partial event' => "id: uncommitted-event\nevent: state\ndata: {\"changed\":"]);
+
+it('ends a healthy idle EventSource at its deadline without reporting a provider outage', function (string $mode): void {
+    [$process, $url] = localEventSourceServer($mode);
+    Http::allowStrayRequests([$url]);
+    $startedAt = hrtime(true);
+
+    try {
+        expect(receiveLocalEventSource($url, 1.0))->toBeNull()
+            ->and($process->isRunning())->toBeTrue()
+            ->and((hrtime(true) - $startedAt) / 1_000_000_000)->toBeLessThan(2.5);
+    } finally {
+        $process->stop(0.1);
+    }
+})->with(['quiet', 'continuous']);
+
+it('does not treat missing or invalid EventSource headers as a healthy idle deadline', function (string $mode): void {
     [$process, $url] = localEventSourceServer($mode);
     Http::allowStrayRequests([$url]);
     $startedAt = hrtime(true);
@@ -593,7 +700,7 @@ it('enforces the whole receive deadline through the real local HTTP transport', 
     } finally {
         $process->stop(0.1);
     }
-})->with(['quiet', 'continuous']);
+})->with(['no-headers', 'unauthorized', 'wrong-content-type']);
 
 it('receives a complete event through the real local HTTP transport', function (): void {
     $account = notificationAccount(MailDriver::Jmap, 'jmap-account-3208');

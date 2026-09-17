@@ -24,6 +24,7 @@ use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAddress;
 use Jkudish\MailMirror\Models\MailAttachment;
 use Jkudish\MailMirror\Models\MailContainer;
+use Jkudish\MailMirror\Models\MailDeltaCheckpoint;
 use Jkudish\MailMirror\Models\MailImportError;
 use Jkudish\MailMirror\Models\MailInventoryItem;
 use Jkudish\MailMirror\Models\MailLocalMessagePurge;
@@ -34,6 +35,7 @@ use Jkudish\MailMirror\Models\MailMessageParticipant;
 use Jkudish\MailMirror\Models\MailProviderDeletionEvidence;
 use Jkudish\MailMirror\Models\MailRawObject;
 use Jkudish\MailMirror\Models\MailReconciliationReport;
+use Jkudish\MailMirror\Models\MailSourceChange;
 use Jkudish\MailMirror\Models\MailSyncCheckpoint;
 use Jkudish\MailMirror\Models\MailThread;
 use Jkudish\MailMirror\Read\InventoryPage;
@@ -122,6 +124,133 @@ function importEngine(DeterministicImportReader $reader): MailImportEngine
         app(Dispatcher::class),
     );
 }
+
+it('imports one exact message without consuming inventory or repair cursors', function (): void {
+    Storage::fake('single-message');
+    config()->set('mail-mirror.storage_disk', 'single-message');
+    $account = importAccount();
+    $reader = new DeterministicImportReader;
+    $reader->retrievers['selected'] = function (MessageReference $reference) use ($account): RetrievedMessage {
+        $stream = fopen('php://temp', 'w+b');
+        if ($stream === false) {
+            throw new RuntimeException('Could not open synthetic stream.');
+        }
+        fwrite($stream, 'Subject: Selected synthetic message'."\r\n\r\n".'Invented body.');
+        rewind($stream);
+
+        return new RetrievedMessage(
+            new MessageReference($account->id, MailDriver::Gmail, $reference->providerMessageId, 'selected-thread'),
+            'Selected synthetic message',
+            rawSource: new RawMessageSource($stream, 'selected-raw'),
+        );
+    };
+    $checkpoint = MailSyncCheckpoint::query()->create([
+        'mail_account_id' => $account->id, 'scan_id' => 'selected-scan', 'version' => 7,
+        'provider_cursor' => 'inventory-position', 'processed_count' => 50, 'scan_started_at' => now(),
+    ]);
+    $delta = MailDeltaCheckpoint::query()->create([
+        'mail_account_id' => $account->id, 'version' => 3, 'provider_cursor' => 'applied-position',
+        'repair_cursor' => 'repair-position', 'repair_scan_id' => 'selected-scan',
+    ]);
+
+    $message = importEngine($reader)->importMessage($account, reference($account, 'selected'));
+
+    expect($message->subject)->toBe('Selected synthetic message')
+        ->and($message->mail_thread_id)->not->toBeNull()
+        ->and(MailRawObject::query()->forAccount($account)->where('mail_message_id', $message->id)->exists())->toBeTrue()
+        ->and(MailSourceChange::query()->forAccount($account)->where('mail_message_id', $message->id)->exists())->toBeTrue()
+        ->and($reader->requestedCursors)->toBe([])
+        ->and($reader->attempts)->toBe(['selected' => 1])
+        ->and($checkpoint->refresh()->provider_cursor)->toBe('inventory-position')
+        ->and($checkpoint->processed_count)->toBe(50)
+        ->and($checkpoint->version)->toBe(8)
+        ->and($delta->refresh()->provider_cursor)->toBe('applied-position')
+        ->and($delta->repair_cursor)->toBe('repair-position')
+        ->and($delta->repair_scan_id)->toBe('selected-scan')
+        ->and($delta->version)->toBe(4)
+        ->and(MailInventoryItem::query()->count())->toBe(0);
+});
+
+it('refreshes a selected message repeatedly without duplicating it or advancing a scan', function (): void {
+    $account = importAccount();
+    $reader = new DeterministicImportReader;
+    $reader->retrievers['selected'] = fn (MessageReference $reference, int $attempt): RetrievedMessage => new RetrievedMessage(
+        $reference, $attempt === 1 ? 'Original synthetic subject' : 'Updated synthetic subject',
+    );
+    $engine = importEngine($reader);
+    $first = $engine->importMessage($account, reference($account, 'selected'));
+    $second = $engine->importMessage($account, reference($account, 'selected'));
+    $third = $engine->importMessage($account, reference($account, 'selected'));
+
+    expect($second->id)->toBe($first->id)
+        ->and($third->id)->toBe($first->id)
+        ->and($first->refresh()->subject)->toBe('Updated synthetic subject')
+        ->and(MailMessage::query()->count())->toBe(1)
+        ->and(MailSyncCheckpoint::query()->count())->toBe(0)
+        ->and(MailDeltaCheckpoint::query()->count())->toBe(0)
+        ->and($reader->attempts)->toBe(['selected' => 3]);
+});
+
+it('rejects a different retrieved message without changing existing state and closes its stream', function (): void {
+    $account = importAccount();
+    $reader = new DeterministicImportReader;
+    $engine = importEngine($reader);
+    $original = $engine->importMessage($account, reference($account, 'selected'));
+    $checkpoint = MailSyncCheckpoint::query()->create([
+        'mail_account_id' => $account->id, 'scan_id' => 'unchanged-scan', 'version' => 7,
+        'provider_cursor' => 'unchanged-cursor', 'processed_count' => 50, 'scan_started_at' => now(),
+    ]);
+    $stream = fopen('php://temp', 'w+b');
+    if ($stream === false) {
+        throw new RuntimeException('Could not open synthetic stream.');
+    }
+    $reader->retrievers['selected'] = fn (): RetrievedMessage => new RetrievedMessage(
+        reference($account, 'wrong-message'), 'Wrong synthetic subject', rawSource: new RawMessageSource($stream, 'wrong-raw'),
+    );
+
+    expect(fn () => $engine->importMessage($account, reference($account, 'selected')))->toThrow(MailImportFailure::class)
+        ->and(is_resource($stream))->toBeFalse()
+        ->and($original->refresh()->subject)->toBe('Invented subject selected')
+        ->and(MailMessage::query()->count())->toBe(1)
+        ->and($checkpoint->refresh()->version)->toBe(7)
+        ->and($checkpoint->provider_cursor)->toBe('unchanged-cursor')
+        ->and($checkpoint->processed_count)->toBe(50);
+});
+
+it('fences an inventory page fetched before a selected-message refresh', function (): void {
+    $account = importAccount();
+    $pageReader = new DeterministicImportReader;
+    $pageReader->pages = ['start' => new InventoryPage([reference($account, 'selected')], null, true)];
+    $pageReader->onInventory = function () use ($account): void {
+        $freshReader = new DeterministicImportReader;
+        $freshReader->retrievers['selected'] = fn (MessageReference $reference): RetrievedMessage => new RetrievedMessage(
+            $reference, 'Fresh explicitly selected state',
+        );
+        importEngine($freshReader)->importMessage($account, reference($account, 'selected'));
+    };
+
+    expect(fn () => importEngine($pageReader)->sync($account))->toThrow(StaleCheckpoint::class)
+        ->and(MailMessage::query()->sole()->subject)->toBe('Fresh explicitly selected state')
+        ->and(MailInventoryItem::query()->count())->toBe(0)
+        ->and(MailSyncCheckpoint::query()->sole()->processed_count)->toBe(0)
+        ->and(MailSyncCheckpoint::query()->sole()->provider_cursor)->toBeNull()
+        ->and(MailReconciliationReport::query()->count())->toBe(0);
+});
+
+it('rejects cross-account and forged-owner single-message imports before retrieval', function (): void {
+    $account = importAccount();
+    $other = importAccount('other-account', 'other-owner');
+    $reader = new DeterministicImportReader;
+    $engine = importEngine($reader);
+    expect(fn () => $engine->importMessage($account, reference($other, 'selected')))
+        ->toThrow(AccountResourceMismatch::class);
+    $forged = clone $account;
+    $forged->owner_id = 'other-owner';
+    expect(fn () => $engine->importMessage($forged, reference($account, 'selected')))
+        ->toThrow(AccountResourceMismatch::class)
+        ->and($reader->attempts)->toBe([])
+        ->and(MailMessage::query()->count())->toBe(0);
+});
 
 it('bounds provider-requested fresh scan restarts', function (): void {
     $account = importAccount('bounded-restart-account');
@@ -872,10 +1001,16 @@ it('bounds high-cardinality reconciliation reports to configured metadata sample
         ->and(strlen((string) json_encode($report?->summary)))->toBeLessThan(1000);
 });
 
-it('removes a newly written raw object when later page work rolls back', function (): void {
+it('removes a newly written raw object when later work rolls back', function (bool $single): void {
     Storage::fake('rollback-objects');
     config()->set('mail-mirror.storage_disk', 'rollback-objects');
     $account = importAccount('raw-rollback');
+    if ($single) {
+        MailSyncCheckpoint::query()->create([
+            'mail_account_id' => $account->id, 'scan_id' => 'rollback-scan', 'version' => 7,
+            'processed_count' => 0, 'scan_started_at' => now(),
+        ]);
+    }
     $reader = new DeterministicImportReader;
     $reader->pages = ['start' => new InventoryPage([reference($account, 'raw-rollback-message')], null, true)];
     $reader->retrievers['raw-rollback-message'] = function (MessageReference $reference): RetrievedMessage {
@@ -904,7 +1039,9 @@ it('removes a newly written raw object when later page work rolls back', functio
     }
 
     try {
-        expect(fn () => importEngine($reader)->sync($account))->toThrow(QueryException::class)
+        expect(fn () => $single
+            ? importEngine($reader)->importMessage($account, reference($account, 'raw-rollback-message'))
+            : importEngine($reader)->sync($account))->toThrow(QueryException::class)
             ->and(MailMessage::query()->forAccount($account)->count())->toBe(0)
             ->and(MailRawObject::query()->forAccount($account)->count())->toBe(0)
             ->and(Storage::disk('rollback-objects')->allFiles())->toBe([]);
@@ -916,7 +1053,7 @@ it('removes a newly written raw object when later page work rolls back', functio
             DB::statement('DROP TRIGGER reject_checkpoint_after_raw');
         }
     }
-});
+})->with([false, true]);
 
 it('enforces report immutability and import paths through direct database writes', function (): void {
     $account = importAccount('database-import-protection');

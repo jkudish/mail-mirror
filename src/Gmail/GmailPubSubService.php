@@ -171,7 +171,7 @@ final readonly class GmailPubSubService
     {
         try {
             $response = $this->http->withToken($this->tokens->accessToken())->acceptJson()
-                ->withoutRedirecting()->timeout($this->timeout())
+                ->withoutRedirecting()->timeout($this->timeout($operation))
                 ->post(self::API.$identity->subscription.':'.$operation, $body);
         } catch (ProviderNotificationException $exception) {
             throw $exception;
@@ -217,11 +217,13 @@ final readonly class GmailPubSubService
         return is_int($value) && $value >= 1 && $value <= 100 ? $value : 20;
     }
 
-    private function timeout(): int
+    private function timeout(string $operation): int
     {
-        $value = config('mail-mirror.gmail.pubsub.timeout_seconds', 10);
+        $default = $operation === 'pull' ? 60 : 10;
+        $key = $operation === 'pull' ? 'pull_timeout_seconds' : 'timeout_seconds';
+        $value = config('mail-mirror.gmail.pubsub.'.$key, $default);
 
-        return is_int($value) && $value >= 1 && $value <= 60 ? $value : 10;
+        return is_int($value) && $value >= 1 && $value <= 60 ? $value : $default;
     }
 
     private function failure(Response $response): ProviderNotificationException
