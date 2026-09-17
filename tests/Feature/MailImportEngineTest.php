@@ -145,12 +145,12 @@ it('imports one exact message without consuming inventory or repair cursors', fu
         );
     };
     $checkpoint = MailSyncCheckpoint::query()->create([
-        'mail_account_id' => $account->id, 'scan_id' => 'selected-scan', 'version' => 7,
+        'mail_account_id' => $account->id, 'scan_id' => '00000000-0000-4000-8000-000000000001', 'version' => 7,
         'provider_cursor' => 'inventory-position', 'processed_count' => 50, 'scan_started_at' => now(),
     ]);
     $delta = MailDeltaCheckpoint::query()->create([
         'mail_account_id' => $account->id, 'version' => 3, 'provider_cursor' => 'applied-position',
-        'repair_cursor' => 'repair-position', 'repair_scan_id' => 'selected-scan',
+        'repair_cursor' => 'repair-position', 'repair_scan_id' => '00000000-0000-4000-8000-000000000001',
     ]);
 
     $message = importEngine($reader)->importMessage($account, reference($account, 'selected'));
@@ -166,7 +166,7 @@ it('imports one exact message without consuming inventory or repair cursors', fu
         ->and($checkpoint->version)->toBe(8)
         ->and($delta->refresh()->provider_cursor)->toBe('applied-position')
         ->and($delta->repair_cursor)->toBe('repair-position')
-        ->and($delta->repair_scan_id)->toBe('selected-scan')
+        ->and($delta->repair_scan_id)->toBe('00000000-0000-4000-8000-000000000001')
         ->and($delta->version)->toBe(4)
         ->and(MailInventoryItem::query()->count())->toBe(0);
 });
@@ -197,7 +197,7 @@ it('rejects a different retrieved message without changing existing state and cl
     $engine = importEngine($reader);
     $original = $engine->importMessage($account, reference($account, 'selected'));
     $checkpoint = MailSyncCheckpoint::query()->create([
-        'mail_account_id' => $account->id, 'scan_id' => 'unchanged-scan', 'version' => 7,
+        'mail_account_id' => $account->id, 'scan_id' => '00000000-0000-4000-8000-000000000002', 'version' => 7,
         'provider_cursor' => 'unchanged-cursor', 'processed_count' => 50, 'scan_started_at' => now(),
     ]);
     $stream = fopen('php://temp', 'w+b');
@@ -1007,7 +1007,7 @@ it('removes a newly written raw object when later work rolls back', function (bo
     $account = importAccount('raw-rollback');
     if ($single) {
         MailSyncCheckpoint::query()->create([
-            'mail_account_id' => $account->id, 'scan_id' => 'rollback-scan', 'version' => 7,
+            'mail_account_id' => $account->id, 'scan_id' => '00000000-0000-4000-8000-000000000003', 'version' => 7,
             'processed_count' => 0, 'scan_started_at' => now(),
         ]);
     }
