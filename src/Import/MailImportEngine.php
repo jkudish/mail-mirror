@@ -65,6 +65,46 @@ final readonly class MailImportEngine
         private Dispatcher $events,
     ) {}
 
+    /** Import or refresh an explicitly selected message, without consuming a sync cursor. */
+    public function importMessage(
+        MailAccount $suppliedAccount,
+        MessageReference $reference,
+        ?SyncWorkBudget $budget = null,
+    ): MailMessage {
+        $account = $this->reacquire($suppliedAccount);
+        if ($reference->mailAccountId !== $account->id || $reference->driver !== $account->driver) {
+            throw new AccountResourceMismatch('The selected message does not belong to the supplied account.');
+        }
+
+        $outcomes = [];
+        $rollbackObjectKeys = [];
+        try {
+            return $account->getConnection()->transaction(function () use ($account, $reference, $budget, &$outcomes, &$rollbackObjectKeys): MailMessage {
+                MailAccount::query()->whereKey($account->id)->lockForUpdate()->firstOrFail();
+                $retrieved = $this->reads->retrieve($account, $reference, $budget);
+                $outcomes[$reference->providerMessageId] = $retrieved;
+                $this->assertRetrieved($reference, $retrieved);
+                $budget?->assertElapsed();
+                $this->persistOutcome($account, $retrieved->reference, $retrieved, $rollbackObjectKeys);
+
+                // Fence pages fetched before this explicit refresh without skipping any inventory or delta work.
+                MailSyncCheckpoint::query()->forAccount($account)->increment('version');
+                MailDeltaCheckpoint::query()->forAccount($account)->increment('version');
+
+                return MailMessage::query()->forAccount($account)
+                    ->where('provider_message_id', $reference->providerMessageId)->firstOrFail();
+            }, 1);
+        } catch (Throwable $failure) {
+            foreach ($rollbackObjectKeys as $objectKey) {
+                $this->objects->cleanupRolledBackRaw($account, $objectKey);
+            }
+
+            throw $failure;
+        } finally {
+            $this->closeRawSources($outcomes);
+        }
+    }
+
     public function syncAccount(
         int $mailAccountId,
         ?string $ownerType,
