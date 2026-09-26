@@ -185,6 +185,12 @@ function receiveLocalEventSource(string $url, float $seconds): ?string
     return $body;
 }
 
+function gmailWatchExpirationMilliseconds(): int
+{
+    // GmailWatchService validates Gmail's absolute expiration against the system clock.
+    return (new DateTimeImmutable('+6 days'))->getTimestamp() * 1000;
+}
+
 function storeNotificationWatch(MailAccount $account): void
 {
     MailGmailWatch::query()->create([
@@ -200,7 +206,7 @@ function storeNotificationWatch(MailAccount $account): void
 it('registers and renews an explicitly identified Gmail watch without advancing delta state', function (): void {
     $account = notificationAccount(MailDriver::Gmail, 'mailbox@invented.test');
     MailDeltaCheckpoint::query()->create(['mail_account_id' => $account->id, 'provider_cursor' => 'applied-cursor-1']);
-    $expiration = (Carbon::now()->addDays(6)->getTimestamp()) * 1000;
+    $expiration = gmailWatchExpirationMilliseconds();
     Http::fake(['https://gmail.googleapis.com/gmail/v1/users/me/watch' => Http::sequence()
         ->push(['historyId' => '700', 'expiration' => (string) $expiration])
         ->push(['historyId' => '701', 'expiration' => (string) ($expiration + 60000)])]);
@@ -222,7 +228,7 @@ it('registers and renews an explicitly identified Gmail watch without advancing 
 it('refuses implicit Gmail watch takeover before making a provider call', function (): void {
     $account = notificationAccount(MailDriver::Gmail, 'mailbox@invented.test');
     $current = new GmailWatchIdentity('mirror-project-3208', 'gmail-events', 'gmail-events-pull');
-    $expiration = (Carbon::now()->addDays(6)->getTimestamp()) * 1000;
+    $expiration = gmailWatchExpirationMilliseconds();
     Http::fake(['https://gmail.googleapis.com/gmail/v1/users/me/watch' => Http::response([
         'historyId' => '700', 'expiration' => (string) $expiration,
     ])]);
