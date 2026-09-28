@@ -31,8 +31,10 @@ interface TrashRestoreDriver
      * Send exactly one provider write, without transport retries, that moves
      * only the observed message out of Trash. It does not confirm the result.
      *
-     * @throws MailImportFailure when the provider request fails
-     * @throws MailWriteFailure when the observed state cannot be restored safely
+     * @throws MailImportFailure only when a failure occurs before the write request is sent
+     * @throws MailWriteFailure when the observed state cannot be restored safely, or for any
+     *                          failure after the write request is sent; its writeSent is false
+     *                          only when the provider definitively did not apply the write
      */
     public function restoreFromTrash(MailAccount $account, TrashState $observed): void;
 }

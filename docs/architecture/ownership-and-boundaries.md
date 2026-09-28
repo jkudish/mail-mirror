@@ -49,7 +49,7 @@ When an owner is present:
 | Failures | Resolve the previous error episode after a successful import. A later episode does not inherit an old waiver. |
 | Provider deletion | Qualify evidence by scan and invalidate it when the message reappears. Evidence does not authorize retention, quarantine, or purge. |
 | Local purge | Require the account, owner tuple, and checkpoint version. Preserve references after filesystem failure. Fence stale imports with a tombstone. Never write to the provider. |
-| Provider writes | Target one provider message by account, owner tuple, and provider message ID. Resolve the tuple before any provider request. Send the write once with transport retries off. Report success only after a provider re-read confirms it. Return an already-applied write as success without writing again. Fail explicitly on ambiguous or unsupported provider semantics and never change more than the target. |
+| Provider writes | Target one provider message by account, owner tuple, and provider message ID. Resolve the tuple before any provider request. Serialize writes to one message with an account-namespaced lock. Send the write once with transport retries off. Report success only after a provider re-read confirms the destination state. Return an already-applied write as success without writing again. Fail explicitly on ambiguous or unsupported provider semantics and never change more than the target. |
 | Consumer integration | Expose contracts and events without importing `App` or another consumer namespace. Consumers register morph aliases. |
 
 MailMirror may use Laravel persistence, filesystem, HTTP, and queue services to

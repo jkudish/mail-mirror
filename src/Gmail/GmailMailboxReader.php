@@ -670,12 +670,15 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
             throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
         }
 
+        $inTrash = in_array('TRASH', $labelIds, true);
+
         /** @var list<string> $labelIds */
         return new TrashState(
             $account->id,
             MailDriver::Gmail,
             $providerMessageId,
-            in_array('TRASH', $labelIds, true),
+            $inTrash,
+            ! $inTrash,
             ['label_ids' => $labelIds, 'history_id' => $historyId],
         );
     }
@@ -688,15 +691,22 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
             throw new MailWriteFailure(MailWriteCode::UnsupportedState);
         }
 
-        $native = $this->request(
-            $account,
-            'POST',
-            self::API.'/users/me/messages/'.rawurlencode($observed->providerMessageId).'/untrash',
-            resendAfterReauthorization: false,
-        );
+        // Load, and refresh if expiring, the credential before the write so its failures are pre-send.
+        $this->credential($account);
+
+        try {
+            $native = $this->request(
+                $account,
+                'POST',
+                self::API.'/users/me/messages/'.rawurlencode($observed->providerMessageId).'/untrash',
+                resendAfterReauthorization: false,
+            );
+        } catch (MailImportFailure $failure) {
+            throw MailWriteFailure::fromProvider($failure, true);
+        }
 
         if (($native['id'] ?? null) !== $observed->providerMessageId) {
-            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+            throw new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
         }
     }
 
@@ -721,13 +731,18 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
         [$credential, $stored] = $this->credential($account);
         $response = $this->send($credential, $method, $url, $query);
 
-        if ($response->status() === 401) {
-            $credential = $this->refresh($account, $stored, $credential);
-
-            if (! $resendAfterReauthorization) {
-                throw new MailImportFailure($this->stageFor($url), MailImportCode::AuthenticationFailed, true);
+        if ($response->status() === 401 && ! $resendAfterReauthorization) {
+            try {
+                $this->refresh($account, $stored, $credential);
+            } catch (MailImportFailure) {
+                // The provider rejected the request either way; the next call reports the credential state.
             }
 
+            throw new MailImportFailure($this->stageFor($url), MailImportCode::AuthenticationFailed, true, httpStatus: 401);
+        }
+
+        if ($response->status() === 401) {
+            $credential = $this->refresh($account, $stored, $credential);
             $response = $this->send($credential, $method, $url, $query);
 
             if ($response->status() === 401) {
@@ -888,20 +903,21 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
         $stage = $this->stageFor($url);
 
         return match ($response->status()) {
-            400 => new MailImportFailure($stage, MailImportCode::StateMismatch),
-            401 => new MailImportFailure($stage, MailImportCode::AuthenticationFailed),
+            400 => new MailImportFailure($stage, MailImportCode::StateMismatch, httpStatus: $response->status()),
+            401 => new MailImportFailure($stage, MailImportCode::AuthenticationFailed, httpStatus: $response->status()),
             404 => str_contains($url, '/history')
-                ? new MailImportFailure($stage, MailImportCode::HistoryExpired)
-                : new MailImportFailure($stage, MailImportCode::MessageUnavailable),
+                ? new MailImportFailure($stage, MailImportCode::HistoryExpired, httpStatus: $response->status())
+                : new MailImportFailure($stage, MailImportCode::MessageUnavailable, httpStatus: $response->status()),
             408, 425, 429 => new MailImportFailure(
                 $stage,
                 MailImportCode::RateLimited,
                 true,
                 retryAfterSeconds: $this->retryAfter($response),
+                httpStatus: $response->status(),
             ),
-            500, 502, 503, 504 => new MailImportFailure($stage, MailImportCode::ProviderUnavailable, true),
-            403 => new MailImportFailure($stage, MailImportCode::PermissionDenied),
-            default => new MailImportFailure($stage, MailImportCode::UnexpectedFailure),
+            500, 502, 503, 504 => new MailImportFailure($stage, MailImportCode::ProviderUnavailable, true, httpStatus: $response->status()),
+            403 => new MailImportFailure($stage, MailImportCode::PermissionDenied, httpStatus: $response->status()),
+            default => new MailImportFailure($stage, MailImportCode::UnexpectedFailure, httpStatus: $response->status()),
         };
     }
 

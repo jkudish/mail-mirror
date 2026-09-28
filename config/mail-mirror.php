@@ -34,6 +34,13 @@ return [
          * message already restored returns success without writing again.
          */
         'intent_ttl_seconds' => 86400,
+
+        /*
+         * Writes to one provider message are serialized with a cache lock held
+         * for the whole read, write, and confirming re-read. A concurrent write
+         * to the same message fails with target_busy instead of waiting.
+         */
+        'lock_seconds' => 300,
     ],
 
     'gmail' => [

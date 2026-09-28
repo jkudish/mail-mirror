@@ -22,6 +22,7 @@ final class MailImportFailure extends RuntimeException
         public readonly int $attempts = 1,
         public readonly ?int $retryAfterSeconds = null,
         public readonly bool $cursorRejected = false,
+        public readonly ?int $httpStatus = null,
     ) {
         if ($attempts < 1 || ($retryAfterSeconds !== null && ($retryAfterSeconds < 1 || $retryAfterSeconds > 300))) {
             throw new InvalidArgumentException('Import failure retry metadata must be positive and bounded.');

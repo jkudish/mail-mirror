@@ -10,10 +10,14 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `MailWriteService::restoreFromTrash()`, the first provider write. Gmail
   untrashes one message; Fastmail JMAP moves one email from the Trash-role to
-  the Inbox-role mailbox. Writes resolve the owner tuple first, send once
-  without transport retries, confirm by re-reading provider state, and return
-  retries as `AlreadyApplied`.
-- `mail-mirror.writes.intent_ttl_seconds` configuration for write idempotency.
+  the Inbox-role mailbox. Writes resolve the owner tuple first, serialize
+  writes to the same message with a cache lock, send once without transport
+  retries, and confirm by re-reading the restore destination. A retry returns
+  `AlreadyApplied` only when this package may have applied the earlier write.
+- `mail-mirror.writes.intent_ttl_seconds` and `mail-mirror.writes.lock_seconds`
+  configuration. Writes require a default cache store that supports atomic
+  locks. A concurrent write to the same message fails with `target_busy`.
+- `MailImportFailure::$httpStatus`, the provider HTTP status when one exists.
 
 ## [0.1.0] - 2026-09-14
 

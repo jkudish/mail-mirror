@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Http;
+use Jkudish\MailMirror\Contracts\MailboxReader;
 use Jkudish\MailMirror\Contracts\TrashRestoreDriver;
 use Jkudish\MailMirror\Credentials\ApiTokenCredential;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
@@ -14,11 +15,16 @@ use Jkudish\MailMirror\Enums\MailWriteCode;
 use Jkudish\MailMirror\Enums\MailWriteOutcome;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
+use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
 use Jkudish\MailMirror\Gmail\GmailOAuth;
 use Jkudish\MailMirror\Models\MailAccount;
+use Jkudish\MailMirror\Read\InventoryPage;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
+use Jkudish\MailMirror\Read\MessageReference;
+use Jkudish\MailMirror\Read\RetrievedMessage;
 use Jkudish\MailMirror\Write\MailWriteService;
 use Jkudish\MailMirror\Write\MailWriteTarget;
+use Jkudish\MailMirror\Write\TrashState;
 
 /**
  * Synthetic Gmail message state keyed by access token, so two accounts can
@@ -39,6 +45,9 @@ final class TrashRestoreGmailProvider
     public bool $untrashIgnored = false;
 
     public bool $rejectWriteToken = false;
+
+    /** @var (Closure(): void)|null */
+    public ?Closure $onWrite = null;
 
     /** @return Closure(Request): mixed */
     public function handler(): Closure
@@ -62,6 +71,10 @@ final class TrashRestoreGmailProvider
             if (($matches[2] ?? '') === '/untrash') {
                 expect($request->method())->toBe('POST');
                 $this->writes[] = $token.':'.$id;
+
+                if ($this->onWrite !== null) {
+                    ($this->onWrite)();
+                }
 
                 if ($this->rejectWriteToken) {
                     return Http::response(['error' => 'synthetic unauthenticated'], 401);
@@ -130,6 +143,9 @@ final class TrashRestoreJmapProvider
     public ?array $notUpdated = null;
 
     public bool $setIgnored = false;
+
+    /** When set, the provider moves the email here instead of applying the patch. */
+    public ?string $setMovesTo = null;
 
     /** @return Closure(Request): mixed */
     public function handler(): Closure
@@ -212,7 +228,10 @@ final class TrashRestoreJmapProvider
         $update = $arguments['update'];
 
         foreach ($update as $id => $patch) {
-            if (! $this->setIgnored) {
+            if ($this->setMovesTo !== null) {
+                $this->emails[$accountId][$id] = [$this->setMovesTo => true];
+                $this->state++;
+            } elseif (! $this->setIgnored) {
                 foreach ($patch as $path => $value) {
                     $mailbox = substr($path, strlen('mailboxIds/'));
 
@@ -233,6 +252,48 @@ final class TrashRestoreJmapProvider
             'updated' => array_fill_keys(array_keys($update), null),
             'notUpdated' => null,
         ]);
+    }
+}
+
+/** A Gmail-keyed driver whose confirming read throws or answers for another message. */
+final class TrashRestoreConfirmationDriver implements MailboxReader, TrashRestoreDriver
+{
+    public int $reads = 0;
+
+    public int $writes = 0;
+
+    public function __construct(private readonly Closure $confirmation) {}
+
+    public function driver(): MailDriver
+    {
+        return MailDriver::Gmail;
+    }
+
+    public function inventoryPage(MailAccount $account, ?string $cursor): InventoryPage
+    {
+        throw new LogicException('Not used by write tests.');
+    }
+
+    public function retrieve(MailAccount $account, MessageReference $message): RetrievedMessage
+    {
+        throw new LogicException('Not used by write tests.');
+    }
+
+    public function trashState(MailAccount $account, string $providerMessageId): TrashState
+    {
+        if (++$this->reads === 1) {
+            return new TrashState($account->id, MailDriver::Gmail, $providerMessageId, true, false, ['label_ids' => ['TRASH']]);
+        }
+
+        $state = ($this->confirmation)($account, $providerMessageId);
+        assert($state instanceof TrashState);
+
+        return $state;
+    }
+
+    public function restoreFromTrash(MailAccount $account, TrashState $observed): void
+    {
+        $this->writes++;
     }
 }
 
@@ -270,6 +331,12 @@ function restoreJmapAccount(string $owner, string $providerAccountId): MailAccou
 function restoreTarget(MailAccount $account, string $providerMessageId): MailWriteTarget
 {
     return new MailWriteTarget($account->id, $account->owner_type, $account->owner_id, $providerMessageId);
+}
+
+/** Mirrors MailWriteService's account-namespaced intent key so tests can assert cache state. */
+function restoreIntentKey(MailAccount $account, string $providerMessageId): string
+{
+    return sprintf('mail-mirror:account:%d:message:%s:intent:restore-from-trash', $account->id, hash('sha256', $providerMessageId));
 }
 
 function restoreFailure(MailWriteTarget $target): MailWriteFailure
@@ -499,6 +566,7 @@ it('refuses ambiguous JMAP mailbox roles without writing', function (array $mail
     $account = restoreJmapAccount('owner-a', 'jmap-restore-a');
 
     expect(restoreFailure(restoreTarget($account, 'jm-1'))->safeCode)->toBe(MailWriteCode::AmbiguousMailboxRole)
+        ->and(cache()->has(restoreIntentKey($account, 'jm-1')))->toBeFalse()
         ->and($jmap->writes)->toBe([])
         ->and($jmap->emails['jmap-restore-a']['jm-1'])->toBe(['mb-trash' => true]);
 })->with([
@@ -521,12 +589,20 @@ it('refuses a JMAP email that is in Trash and another mailbox without writing', 
     $jmap->emails['jmap-restore-a'] = ['jm-1' => ['mb-trash' => true, 'mb-projects' => true]];
     Http::fake($jmap->handler());
     $account = restoreJmapAccount('owner-a', 'jmap-restore-a');
+    // An intent left by an earlier restore cycle must not survive a refusal.
+    cache()->put(restoreIntentKey($account, 'jm-1'), true, 3600);
 
     $failure = restoreFailure(restoreTarget($account, 'jm-1'));
 
     expect($failure->safeCode)->toBe(MailWriteCode::UnsupportedState)
         ->and($failure->writeSent)->toBeFalse()
+        ->and(cache()->has(restoreIntentKey($account, 'jm-1')))->toBeFalse()
         ->and($jmap->writes)->toBe([]);
+
+    // Removed from Projects and Trash by someone else, it now looks restored, but this package did not restore it.
+    $jmap->emails['jmap-restore-a']['jm-1'] = ['mb-inbox' => true];
+
+    expect(restoreFailure(restoreTarget($account, 'jm-1'))->safeCode)->toBe(MailWriteCode::NotInTrash);
 });
 
 it('sends a failed provider write exactly once with transport retries off', function (): void {
@@ -553,11 +629,13 @@ it('sends a failed provider write exactly once with transport retries off', func
         ->and($jmapFailure->writeSent)->toBeTrue()
         ->and($gmail->writes)->toHaveCount(1)
         ->and($jmap->writes)->toHaveCount(1)
+        ->and(cache()->get(restoreIntentKey($gmailAccount, 'gm-1')))->toBeTrue()
+        ->and(cache()->get(restoreIntentKey($jmapAccount, 'jm-1')))->toBeTrue()
         ->and($gmail->messages['synthetic-restore-access-a']['gm-1']['labels'])->toBe(['TRASH'])
         ->and($jmap->emails['jmap-restore-a']['jm-1'])->toBe(['mb-trash' => true]);
 });
 
-it('refreshes a rejected Gmail token but never re-sends the write', function (): void {
+it('refreshes a rejected Gmail token, never re-sends the write, and reports it as not applied', function (): void {
     $gmail = new TrashRestoreGmailProvider;
     $gmail->messages['synthetic-restore-access-a'] = ['gm-1' => ['labels' => ['TRASH'], 'prior' => ['INBOX']]];
     $gmail->rejectWriteToken = true;
@@ -568,7 +646,8 @@ it('refreshes a rejected Gmail token but never re-sends the write', function ():
 
     expect($failure->safeCode)->toBe(MailWriteCode::ProviderFailed)
         ->and($failure->providerCode)->toBe(MailImportCode::AuthenticationFailed)
-        ->and($failure->writeSent)->toBeTrue()
+        ->and($failure->writeSent)->toBeFalse()
+        ->and(cache()->has(restoreIntentKey($account, 'gm-1')))->toBeFalse()
         ->and($gmail->writes)->toBe(['synthetic-restore-access-a:gm-1']);
     Http::assertSent(fn (Request $request): bool => $request->url() === 'https://oauth2.googleapis.com/token');
 });
@@ -589,13 +668,14 @@ it('fails explicitly when JMAP rejects the update or the observed state changed'
 
     expect($failure->safeCode)->toBe($code)
         ->and($failure->providerCode)->toBe($providerCode)
-        ->and($failure->writeSent)->toBeTrue()
+        ->and($failure->writeSent)->toBeFalse()
+        ->and(cache()->has(restoreIntentKey($account, 'jm-1')))->toBeFalse()
         ->and($jmap->writes)->toHaveCount(1)
         ->and($jmap->emails['jmap-restore-a']['jm-1'])->toBe(['mb-trash' => true]);
 })->with([
     'ifInState mismatch' => ['stateMismatch', MailImportCode::StateMismatch, MailWriteCode::ProviderFailed],
-    'forbidden update' => ['forbidden', null, MailWriteCode::ProviderFailed],
-    'destroyed before update' => ['notFound', null, MailWriteCode::MessageNotFound],
+    'forbidden update' => ['forbidden', MailImportCode::PermissionDenied, MailWriteCode::ProviderFailed],
+    'destroyed before update' => ['notFound', MailImportCode::MessageUnavailable, MailWriteCode::MessageNotFound],
 ]);
 
 it('reports an unconfirmed write when the provider re-read still shows Trash', function (): void {
@@ -660,3 +740,169 @@ it('keeps provider IDs and credentials out of write failure messages', function 
         ->and($failure->getMessage())->not->toContain('synthetic-restore-access-a')
         ->and($failure->getMessage())->not->toContain('restore-a@invented.test');
 });
+
+it('does not report success when the JMAP re-read shows the email outside both Trash and Inbox', function (): void {
+    $jmap = new TrashRestoreJmapProvider;
+    $jmap->emails['jmap-restore-a'] = ['jm-1' => ['mb-trash' => true]];
+    $jmap->setMovesTo = 'mb-archive';
+    Http::fake($jmap->handler());
+    $account = restoreJmapAccount('owner-a', 'jmap-restore-a');
+
+    $failure = restoreFailure(restoreTarget($account, 'jm-1'));
+
+    expect($failure->safeCode)->toBe(MailWriteCode::Unconfirmed)
+        ->and($failure->writeSent)->toBeTrue()
+        ->and($jmap->writes)->toHaveCount(1);
+
+    // The retry sees the recorded intent, but the email is not at the Inbox destination.
+    expect(restoreFailure(restoreTarget($account, 'jm-1'))->safeCode)->toBe(MailWriteCode::NotInTrash)
+        ->and($jmap->writes)->toHaveCount(1);
+});
+
+it('does not return an already applied JMAP restore once the email has left Inbox', function (): void {
+    $jmap = new TrashRestoreJmapProvider;
+    $jmap->emails['jmap-restore-a'] = ['jm-1' => ['mb-trash' => true]];
+    Http::fake($jmap->handler());
+    $account = restoreJmapAccount('owner-a', 'jmap-restore-a');
+
+    expect(app(MailWriteService::class)->restoreFromTrash(restoreTarget($account, 'jm-1'))->outcome)->toBe(MailWriteOutcome::Applied);
+
+    $jmap->emails['jmap-restore-a']['jm-1'] = ['mb-archive' => true];
+
+    expect(restoreFailure(restoreTarget($account, 'jm-1'))->safeCode)->toBe(MailWriteCode::NotInTrash)
+        ->and($jmap->writes)->toHaveCount(1);
+});
+
+it('records no intent for a Gmail write the provider rejected, so a later external restore is not claimed', function (int $status, MailImportCode $providerCode): void {
+    $gmail = new TrashRestoreGmailProvider;
+    $gmail->messages['synthetic-restore-access-a'] = ['gm-1' => ['labels' => ['TRASH'], 'prior' => ['INBOX']]];
+    $gmail->untrashStatus = $status;
+    Http::fake($gmail->handler());
+    $account = restoreGmailAccount('owner-a', 'restore-a@invented.test', 'synthetic-restore-access-a');
+
+    $failure = restoreFailure(restoreTarget($account, 'gm-1'));
+
+    expect($failure->safeCode)->toBe(MailWriteCode::ProviderFailed)
+        ->and($failure->providerCode)->toBe($providerCode)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and(cache()->has(restoreIntentKey($account, 'gm-1')))->toBeFalse();
+
+    $gmail->messages['synthetic-restore-access-a']['gm-1']['labels'] = ['INBOX'];
+
+    expect(restoreFailure(restoreTarget($account, 'gm-1'))->safeCode)->toBe(MailWriteCode::NotInTrash)
+        ->and($gmail->writes)->toHaveCount(1);
+})->with([
+    'bad request' => [400, MailImportCode::StateMismatch],
+    'forbidden' => [403, MailImportCode::PermissionDenied],
+    'rate limited' => [429, MailImportCode::RateLimited],
+    'conflict' => [409, MailImportCode::UnexpectedFailure],
+]);
+
+it('does not claim an external JMAP restore after an ifInState rejection', function (): void {
+    $jmap = new TrashRestoreJmapProvider;
+    $jmap->emails['jmap-restore-a'] = ['jm-1' => ['mb-trash' => true]];
+    $jmap->setError = ['type' => 'stateMismatch'];
+    Http::fake($jmap->handler());
+    $account = restoreJmapAccount('owner-a', 'jmap-restore-a');
+
+    expect(restoreFailure(restoreTarget($account, 'jm-1'))->writeSent)->toBeFalse();
+
+    $jmap->emails['jmap-restore-a']['jm-1'] = ['mb-inbox' => true];
+
+    expect(restoreFailure(restoreTarget($account, 'jm-1'))->safeCode)->toBe(MailWriteCode::NotInTrash)
+        ->and($jmap->writes)->toHaveCount(1);
+});
+
+it('clears the intent of an earlier restore cycle when a new attempt definitely fails', function (): void {
+    $gmail = new TrashRestoreGmailProvider;
+    $gmail->messages['synthetic-restore-access-a'] = ['gm-1' => ['labels' => ['TRASH'], 'prior' => ['INBOX']]];
+    Http::fake($gmail->handler());
+    $account = restoreGmailAccount('owner-a', 'restore-a@invented.test', 'synthetic-restore-access-a');
+    $service = app(MailWriteService::class);
+
+    expect($service->restoreFromTrash(restoreTarget($account, 'gm-1'))->outcome)->toBe(MailWriteOutcome::Applied)
+        ->and(cache()->get(restoreIntentKey($account, 'gm-1')))->toBeTrue();
+
+    $gmail->messages['synthetic-restore-access-a']['gm-1']['labels'] = ['TRASH'];
+    $gmail->untrashStatus = 403;
+
+    expect(restoreFailure(restoreTarget($account, 'gm-1'))->writeSent)->toBeFalse()
+        ->and(cache()->has(restoreIntentKey($account, 'gm-1')))->toBeFalse();
+
+    $gmail->messages['synthetic-restore-access-a']['gm-1']['labels'] = ['INBOX'];
+
+    expect(restoreFailure(restoreTarget($account, 'gm-1'))->safeCode)->toBe(MailWriteCode::NotInTrash)
+        ->and($gmail->writes)->toHaveCount(2);
+});
+
+it('serializes writes to one target and fails a concurrent write as busy before any request', function (): void {
+    $gmail = new TrashRestoreGmailProvider;
+    $gmail->messages['synthetic-restore-access-a'] = [
+        'gm-1' => ['labels' => ['TRASH'], 'prior' => ['INBOX']],
+        'gm-2' => ['labels' => ['TRASH'], 'prior' => ['INBOX']],
+    ];
+    Http::fake($gmail->handler());
+    $account = restoreGmailAccount('owner-a', 'restore-a@invented.test', 'synthetic-restore-access-a');
+    $service = app(MailWriteService::class);
+    $concurrent = null;
+    $requestsBefore = 0;
+    $requestsAfter = 0;
+    $otherTarget = null;
+    $gmail->onWrite = function () use ($service, $account, &$concurrent, &$requestsBefore, &$requestsAfter, &$otherTarget, $gmail): void {
+        if ($concurrent !== null) {
+            return;
+        }
+
+        $requestsBefore = count(Http::recorded());
+
+        try {
+            $service->restoreFromTrash(restoreTarget($account, 'gm-1'));
+        } catch (MailWriteFailure $failure) {
+            $concurrent = $failure;
+        }
+
+        $requestsAfter = count(Http::recorded());
+        $gmail->onWrite = null;
+        $otherTarget = $service->restoreFromTrash(restoreTarget($account, 'gm-2'));
+    };
+
+    expect($service->restoreFromTrash(restoreTarget($account, 'gm-1'))->outcome)->toBe(MailWriteOutcome::Applied);
+    assert($concurrent instanceof MailWriteFailure);
+
+    expect($concurrent->safeCode)->toBe(MailWriteCode::TargetBusy)
+        ->and($concurrent->writeSent)->toBeFalse()
+        ->and($requestsAfter)->toBe($requestsBefore)
+        ->and($otherTarget?->outcome)->toBe(MailWriteOutcome::Applied)
+        ->and($gmail->writes)->toBe(['synthetic-restore-access-a:gm-1', 'synthetic-restore-access-a:gm-2'])
+        // The lock is released afterwards, so the retry proceeds and confirms without writing.
+        ->and($service->restoreFromTrash(restoreTarget($account, 'gm-1'))->outcome)->toBe(MailWriteOutcome::AlreadyApplied)
+        ->and($gmail->writes)->toHaveCount(2);
+});
+
+it('reports any confirming-read exception after a sent write as unconfirmed', function (string $case): void {
+    $driver = new TrashRestoreConfirmationDriver(fn (MailAccount $account, string $providerMessageId): TrashState => match ($case) {
+        'mismatched state' => new TrashState($account->id, MailDriver::Gmail, 'another-message', false, true, []),
+        'invalid argument' => throw new InvalidArgumentException('synthetic invalid state'),
+        'budget exhausted' => throw new SyncBudgetExhausted('http_requests', [
+            'http_requests' => 1, 'max_http_requests' => 1, 'listed_ids' => 0, 'max_listed_ids' => 1,
+            'fetched_messages' => 0, 'max_fetched_messages' => 1, 'downloaded_bytes' => 0, 'max_downloaded_bytes' => 1,
+            'elapsed_milliseconds' => 0, 'max_elapsed_milliseconds' => 1,
+        ]),
+        default => throw new RuntimeException('synthetic unexpected failure'),
+    });
+    $registry = new MailDriverRegistry;
+    $registry->register(MailDriver::Gmail, $driver);
+    app()->instance(MailDriverRegistry::class, $registry);
+    app()->forgetInstance(MailWriteService::class);
+    Http::fake();
+    $account = restoreGmailAccount('owner-a', 'restore-a@invented.test', 'synthetic-restore-access-a');
+
+    $failure = restoreFailure(restoreTarget($account, 'gm-1'));
+
+    expect($failure->safeCode)->toBe(MailWriteCode::Unconfirmed)
+        ->and($failure->writeSent)->toBeTrue()
+        ->and($failure->getPrevious())->not->toBeNull()
+        ->and($driver->writes)->toBe(1)
+        ->and(cache()->get(restoreIntentKey($account, 'gm-1')))->toBeTrue();
+    Http::assertNothingSent();
+})->with(['mismatched state', 'invalid argument', 'budget exhausted', 'runtime']);

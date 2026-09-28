@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Jkudish\MailMirror\Write;
 
+use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Jkudish\MailMirror\Contracts\TrashRestoreDriver;
@@ -14,17 +15,23 @@ use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
+use LogicException;
+use Throwable;
 
 /**
  * Provider writes for one account-qualified message.
  *
  * Every write follows the same contract:
  * 1. Resolve the account through the full owner tuple before any provider request.
- * 2. Read provider state. If the desired state already holds and this package
- *    recorded an intent for the same target, return AlreadyApplied without writing.
- * 3. Record the intent under an account-namespaced cache key, then send one
- *    provider write with transport retries off.
- * 4. Re-read provider state and return Applied only when it confirms the write.
+ * 2. Hold an account-namespaced cache lock for the target message; a busy lock
+ *    fails with TargetBusy before any provider request.
+ * 3. Read provider state. If the write's destination state already holds and a
+ *    recorded intent shows this package may have applied it, return
+ *    AlreadyApplied without writing.
+ * 4. Send one provider write with transport retries off. Record the intent only
+ *    when the write may have applied; clear it when the write definitely did not.
+ * 5. Re-read provider state and return Applied only when it confirms the
+ *    destination state. Any failure of that re-read is Unconfirmed.
  */
 final readonly class MailWriteService
 {
@@ -49,32 +56,71 @@ final readonly class MailWriteService
             throw new MailWriteFailure(MailWriteCode::UnsupportedDriver);
         }
 
-        $observed = $this->trashState($driver, $account, $target->providerMessageId);
-        $intent = $this->intentKey($account, 'restore-from-trash', $target->providerMessageId);
+        $store = $this->cache->getStore();
+
+        if (! $store instanceof LockProvider) {
+            throw new LogicException('Provider writes require a cache store that supports atomic locks.');
+        }
+
+        $targetKey = $this->targetKey($account, $target->providerMessageId);
+        $lock = $store->lock($targetKey.':write-lock', $this->lockSeconds());
+
+        if (! $lock->get()) {
+            throw new MailWriteFailure(MailWriteCode::TargetBusy);
+        }
+
+        try {
+            return $this->restoreLocked($driver, $account, $target->providerMessageId, $targetKey.':intent:restore-from-trash');
+        } finally {
+            $lock->release();
+        }
+    }
+
+    private function restoreLocked(
+        TrashRestoreDriver $driver,
+        MailAccount $account,
+        string $providerMessageId,
+        string $intent,
+    ): MailWriteResult {
+        $observed = $this->trashState($driver, $account, $providerMessageId);
 
         if (! $observed->inTrash) {
-            if ($this->cache->get($intent) !== true) {
+            if (! $observed->restored || $this->cache->get($intent) !== true) {
                 throw new MailWriteFailure(MailWriteCode::NotInTrash);
             }
 
             return $this->result($account, $observed, MailWriteOutcome::AlreadyApplied);
         }
 
-        $this->cache->put($intent, true, $this->intentTtl());
+        // The message is in Trash, so any earlier intent belongs to a finished cycle.
+        $this->cache->forget($intent);
 
         try {
             $driver->restoreFromTrash($account, $observed);
         } catch (MailImportFailure $failure) {
-            throw MailWriteFailure::fromProvider($failure, true);
+            throw MailWriteFailure::fromProvider($failure, false);
+        } catch (MailWriteFailure $failure) {
+            if ($failure->writeSent) {
+                $this->cache->put($intent, true, $this->intentTtl());
+            }
+
+            throw $failure;
         }
+
+        $this->cache->put($intent, true, $this->intentTtl());
 
         try {
-            $confirmed = $this->trashState($driver, $account, $target->providerMessageId);
-        } catch (MailWriteFailure $failure) {
-            throw new MailWriteFailure(MailWriteCode::Unconfirmed, true, $failure->providerCode, $failure);
+            $confirmed = $this->trashState($driver, $account, $providerMessageId);
+        } catch (Throwable $failure) {
+            throw new MailWriteFailure(
+                MailWriteCode::Unconfirmed,
+                true,
+                $failure instanceof MailWriteFailure ? $failure->providerCode : null,
+                $failure,
+            );
         }
 
-        if ($confirmed->inTrash) {
+        if (! $confirmed->restored) {
             throw new MailWriteFailure(MailWriteCode::Unconfirmed, true);
         }
 
@@ -114,9 +160,10 @@ final readonly class MailWriteService
         }
     }
 
-    private function intentKey(MailAccount $account, string $operation, string $providerMessageId): string
+    /** Every write to one provider message shares this account-namespaced key. */
+    private function targetKey(MailAccount $account, string $providerMessageId): string
     {
-        return sprintf('mail-mirror:account:%d:write:%s:%s', $account->id, $operation, hash('sha256', $providerMessageId));
+        return sprintf('mail-mirror:account:%d:message:%s', $account->id, hash('sha256', $providerMessageId));
     }
 
     private function intentTtl(): int
@@ -124,5 +171,12 @@ final readonly class MailWriteService
         $seconds = config('mail-mirror.writes.intent_ttl_seconds', 86400);
 
         return is_int($seconds) && $seconds >= 60 && $seconds <= 2592000 ? $seconds : 86400;
+    }
+
+    private function lockSeconds(): int
+    {
+        $seconds = config('mail-mirror.writes.lock_seconds', 300);
+
+        return is_int($seconds) && $seconds >= 30 && $seconds <= 3600 ? $seconds : 300;
     }
 }

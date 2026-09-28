@@ -16,8 +16,9 @@ use Throwable;
 final class MailWriteFailure extends RuntimeException
 {
     /**
-     * @param  bool  $writeSent  Whether the provider write request was sent. When true the
-     *                           provider outcome is unknown until a later request re-reads it.
+     * @param  bool  $writeSent  True when the provider may have applied the write: the request
+     *                           was sent and the provider did not definitively reject it. False
+     *                           when no write was sent or the provider rejected it without applying.
      */
     public function __construct(
         public readonly MailWriteCode $safeCode,
@@ -28,11 +29,17 @@ final class MailWriteFailure extends RuntimeException
         parent::__construct($safeCode->summary(), 0, $previous);
     }
 
-    public static function fromProvider(MailImportFailure $failure, bool $writeSent): self
+    /**
+     * Classify a provider failure. A failure raised after the write request was
+     * sent may have applied unless the provider answered with a 4xx status.
+     */
+    public static function fromProvider(MailImportFailure $failure, bool $requestSent): self
     {
+        $rejected = $failure->httpStatus !== null && $failure->httpStatus >= 400 && $failure->httpStatus < 500;
+
         return new self(
             $failure->safeCode === MailImportCode::MessageUnavailable ? MailWriteCode::MessageNotFound : MailWriteCode::ProviderFailed,
-            $writeSent,
+            $requestSent && ! $rejected,
             $failure->safeCode,
             $failure,
         );
