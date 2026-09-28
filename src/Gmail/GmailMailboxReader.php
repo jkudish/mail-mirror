@@ -9,6 +9,7 @@ use DateTimeImmutable;
 use Illuminate\Http\Client\Factory;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
+use Illuminate\Support\Facades\Date;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Contracts\BudgetedDeltaMailboxReader;
 use Jkudish\MailMirror\Contracts\TrashRestoreDriver;
@@ -683,6 +684,12 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
         );
     }
 
+    public function prepareWrite(MailAccount $account, int $validForSeconds): void
+    {
+        $this->assertAccount($account);
+        $this->credential($account, max(30, $validForSeconds));
+    }
+
     public function restoreFromTrash(MailAccount $account, TrashState $observed): void
     {
         $this->assertAccount($account);
@@ -691,8 +698,9 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
             throw new MailWriteFailure(MailWriteCode::UnsupportedState);
         }
 
-        // Load, and refresh if expiring, the credential before the write so its failures are pre-send.
-        $this->credential($account);
+        // prepareWrite() already refreshed the credential. Load it without refreshing,
+        // so nothing before the write request can wait on the credential row lock.
+        $this->credential($account, null);
 
         try {
             $native = $this->request(
@@ -700,6 +708,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
                 'POST',
                 self::API.'/users/me/messages/'.rawurlencode($observed->providerMessageId).'/untrash',
                 resendAfterReauthorization: false,
+                refreshCredential: false,
             );
         } catch (MailImportFailure $failure) {
             throw MailWriteFailure::fromProvider($failure, true);
@@ -723,12 +732,13 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
         string $url,
         array $query = [],
         bool $resendAfterReauthorization = true,
+        bool $refreshCredential = true,
     ): array {
         if (config('mail-mirror.gmail.enabled') !== true) {
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::ProviderUnavailable);
         }
 
-        [$credential, $stored] = $this->credential($account);
+        [$credential, $stored] = $this->credential($account, $refreshCredential ? 30 : null);
         $response = $this->send($credential, $method, $url, $query);
 
         if ($response->status() === 401 && ! $resendAfterReauthorization) {
@@ -822,8 +832,13 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
         return null;
     }
 
-    /** @return array{OAuthTokenSetCredential, MailAccountCredential} */
-    private function credential(MailAccount $account): array
+    /**
+     * Refresh when the token expires within $refreshWithinSeconds. With null the
+     * credential is never refreshed, and an expired one fails instead.
+     *
+     * @return array{OAuthTokenSetCredential, MailAccountCredential}
+     */
+    private function credential(MailAccount $account, ?int $refreshWithinSeconds = 30): array
     {
         $stored = $account->credential()->first();
 
@@ -842,7 +857,14 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::PermissionDenied);
         }
 
-        if ($credential->expiresAt() !== null && $credential->expiresAt() <= new DateTimeImmutable('+30 seconds')) {
+        $expiresAt = $credential->expiresAt();
+
+        if ($expiresAt !== null && $refreshWithinSeconds === null && $expiresAt <= Date::now()->toDateTimeImmutable()) {
+            throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::AuthenticationFailed, true);
+        }
+
+        if ($expiresAt !== null && $refreshWithinSeconds !== null
+            && $expiresAt <= Date::now()->addSeconds($refreshWithinSeconds)->toDateTimeImmutable()) {
             $credential = $this->refresh($account, $stored, $credential);
             $stored->refresh();
         }

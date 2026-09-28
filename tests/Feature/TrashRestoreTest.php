@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Illuminate\Http\Client\Request;
+use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\Http;
 use Jkudish\MailMirror\Contracts\MailboxReader;
 use Jkudish\MailMirror\Contracts\TrashRestoreDriver;
@@ -49,11 +50,25 @@ final class TrashRestoreGmailProvider
     /** @var (Closure(): void)|null */
     public ?Closure $onWrite = null;
 
+    /** @var (Closure(): void)|null Runs before each message read, for example to advance the clock. */
+    public ?Closure $beforeRead = null;
+
+    /** @var (Closure(): void)|null Runs before each token refresh reply. */
+    public ?Closure $onRefresh = null;
+
+    public int $refreshes = 0;
+
     /** @return Closure(Request): mixed */
     public function handler(): Closure
     {
         return function (Request $request) {
             if ($request->url() === 'https://oauth2.googleapis.com/token') {
+                $this->refreshes++;
+
+                if ($this->onRefresh !== null) {
+                    ($this->onRefresh)();
+                }
+
                 return Http::response(['access_token' => 'synthetic-restore-refreshed', 'expires_in' => 3600, 'scope' => GmailOAuth::SCOPE]);
             }
 
@@ -97,6 +112,10 @@ final class TrashRestoreGmailProvider
             }
 
             expect($request->method())->toBe('GET')->and($request->data())->toBe(['format' => 'minimal']);
+
+            if ($this->beforeRead !== null) {
+                ($this->beforeRead)();
+            }
 
             if (! isset($this->messages[$token][$id])) {
                 return Http::response(['error' => 'synthetic not found'], 404);
@@ -147,11 +166,21 @@ final class TrashRestoreJmapProvider
     /** When set, the provider moves the email here instead of applying the patch. */
     public ?string $setMovesTo = null;
 
+    /** Session state reported by Email/set; other responses keep the discovered state. */
+    public string $setSessionState = 'synthetic-restore-session';
+
+    public int $sessionRequests = 0;
+
+    /** Runs before each Email/get reply, for example to advance the clock. */
+    public ?Closure $beforeEmailGet = null;
+
     /** @return Closure(Request): mixed */
     public function handler(): Closure
     {
         return function (Request $request) {
             if ($request->url() === 'https://api.fastmail.com/jmap/session') {
+                $this->sessionRequests++;
+
                 return Http::response([
                     'capabilities' => [
                         'urn:ietf:params:jmap:core' => [],
@@ -179,6 +208,10 @@ final class TrashRestoreJmapProvider
             assert(is_string($accountId) && is_array($ids));
             $id = $ids[0] ?? null;
             $this->methods[] = $method;
+
+            if ($method === 'Email/get' && $this->beforeEmailGet !== null) {
+                ($this->beforeEmailGet)();
+            }
 
             $reply = fn (string $name, array $result): mixed => Http::response([
                 'methodResponses' => [[$name, ['accountId' => $accountId] + $result, $callId]],
@@ -246,11 +279,15 @@ final class TrashRestoreJmapProvider
             }
         }
 
-        return $reply('Email/set', [
-            'oldState' => $oldState,
-            'newState' => 'synthetic-email-state-'.$this->state,
-            'updated' => array_fill_keys(array_keys($update), null),
-            'notUpdated' => null,
+        return Http::response([
+            'methodResponses' => [['Email/set', [
+                'accountId' => $accountId,
+                'oldState' => $oldState,
+                'newState' => 'synthetic-email-state-'.$this->state,
+                'updated' => array_fill_keys(array_keys($update), null),
+                'notUpdated' => null,
+            ], 'restore']],
+            'sessionState' => $this->setSessionState,
         ]);
     }
 }
@@ -290,6 +327,8 @@ final class TrashRestoreConfirmationDriver implements MailboxReader, TrashRestor
 
         return $state;
     }
+
+    public function prepareWrite(MailAccount $account, int $validForSeconds): void {}
 
     public function restoreFromTrash(MailAccount $account, TrashState $observed): void
     {
@@ -906,3 +945,161 @@ it('reports any confirming-read exception after a sent write as unconfirmed', fu
         ->and(cache()->get(restoreIntentKey($account, 'gm-1')))->toBeTrue();
     Http::assertNothingSent();
 })->with(['mismatched state', 'invalid argument', 'budget exhausted', 'runtime']);
+
+it('sends only while the write lock covers the whole send step', function (int $readSeconds, bool $sent): void {
+    config(['mail-mirror.jmap.timeout_seconds' => 30]);
+    Date::setTestNow('2026-01-01 12:00:00');
+    $jmap = new TrashRestoreJmapProvider;
+    $jmap->emails['jmap-restore-a'] = ['jm-1' => ['mb-trash' => true]];
+    // The 300s default lock minus the 35s JMAP send step leaves 265s for the pre-write read.
+    $jmap->beforeEmailGet = function () use ($jmap, $readSeconds): void {
+        Date::setTestNow(Date::now()->addSeconds($readSeconds));
+        $jmap->beforeEmailGet = null;
+    };
+    Http::fake($jmap->handler());
+    $account = restoreJmapAccount('owner-a', 'jmap-restore-a');
+
+    try {
+        if ($sent) {
+            expect(app(MailWriteService::class)->restoreFromTrash(restoreTarget($account, 'jm-1'))->outcome)->toBe(MailWriteOutcome::Applied);
+        } else {
+            $failure = restoreFailure(restoreTarget($account, 'jm-1'));
+            expect($failure->safeCode)->toBe(MailWriteCode::LockExpired)
+                ->and($failure->writeSent)->toBeFalse()
+                ->and(cache()->has(restoreIntentKey($account, 'jm-1')))->toBeFalse()
+                ->and($jmap->emails['jmap-restore-a']['jm-1'])->toBe(['mb-trash' => true]);
+        }
+    } finally {
+        Date::setTestNow();
+    }
+
+    expect($jmap->writes)->toHaveCount($sent ? 1 : 0);
+})->with([
+    'read ends at the deadline' => [265, true],
+    'read ends one second past it' => [266, false],
+]);
+
+it('raises a configured lock that is shorter than the send step instead of refusing every write', function (): void {
+    config(['mail-mirror.writes.lock_seconds' => 30, 'mail-mirror.jmap.timeout_seconds' => 120]);
+    $jmap = new TrashRestoreJmapProvider;
+    $jmap->emails['jmap-restore-a'] = ['jm-1' => ['mb-trash' => true]];
+    $jmap->beforeEmailGet = function () use ($jmap): void {
+        Date::setTestNow(Date::now()->addSeconds(60));
+        $jmap->beforeEmailGet = null;
+    };
+    Http::fake($jmap->handler());
+    $account = restoreJmapAccount('owner-a', 'jmap-restore-a');
+
+    try {
+        $result = app(MailWriteService::class)->restoreFromTrash(restoreTarget($account, 'jm-1'));
+    } finally {
+        Date::setTestNow();
+    }
+
+    expect($result->outcome)->toBe(MailWriteOutcome::Applied)
+        ->and($jmap->writes)->toHaveCount(1);
+});
+
+it('rediscovers the JMAP session for the confirming read when the write reports a new session state', function (): void {
+    $jmap = new TrashRestoreJmapProvider;
+    $jmap->emails['jmap-restore-a'] = ['jm-1' => ['mb-trash' => true]];
+    $jmap->setSessionState = 'synthetic-rotated-session';
+    Http::fake($jmap->handler());
+    $account = restoreJmapAccount('owner-a', 'jmap-restore-a');
+
+    $result = app(MailWriteService::class)->restoreFromTrash(restoreTarget($account, 'jm-1'));
+
+    expect($result->outcome)->toBe(MailWriteOutcome::Applied)
+        ->and($jmap->sessionRequests)->toBe(2)
+        ->and($jmap->writes)->toHaveCount(1);
+});
+
+it('classifies JMAP method errors as definitely rejected only when RFC 8620 says so', function (string $type, bool $writeSent): void {
+    $jmap = new TrashRestoreJmapProvider;
+    $jmap->emails['jmap-restore-a'] = ['jm-1' => ['mb-trash' => true]];
+    $jmap->setError = ['type' => $type];
+    Http::fake($jmap->handler());
+    $account = restoreJmapAccount('owner-a', 'jmap-restore-a');
+
+    $failure = restoreFailure(restoreTarget($account, 'jm-1'));
+
+    expect($failure->safeCode)->toBe(MailWriteCode::ProviderFailed)
+        ->and($failure->writeSent)->toBe($writeSent)
+        ->and(cache()->has(restoreIntentKey($account, 'jm-1')))->toBe($writeSent);
+})->with([
+    'invalid arguments' => ['invalidArguments', false],
+    'unknown method' => ['unknownMethod', false],
+    'request too large' => ['requestTooLarge', false],
+    'read-only account' => ['accountReadOnly', false],
+    'account not found' => ['accountNotFound', false],
+    'forbidden' => ['forbidden', false],
+    'server failure' => ['serverFail', true],
+    'unrecognized type' => ['syntheticFutureError', true],
+]);
+
+it('sends a Gmail write only while the lock covers the single write request', function (int $readSeconds, bool $sent): void {
+    config(['mail-mirror.gmail.timeout_seconds' => 30]);
+    Date::setTestNow('2026-01-01 12:00:00');
+    $gmail = new TrashRestoreGmailProvider;
+    $gmail->messages['synthetic-restore-access-a'] = ['gm-1' => ['labels' => ['TRASH'], 'prior' => ['INBOX']]];
+    // The 300s default lock minus the 35s Gmail send step leaves 265s for the pre-write read.
+    $gmail->beforeRead = function () use ($gmail, $readSeconds): void {
+        Date::setTestNow(Date::now()->addSeconds($readSeconds));
+        $gmail->beforeRead = null;
+    };
+    Http::fake($gmail->handler());
+
+    try {
+        $account = restoreGmailAccount('owner-a', 'restore-a@invented.test', 'synthetic-restore-access-a');
+        if ($sent) {
+            expect(app(MailWriteService::class)->restoreFromTrash(restoreTarget($account, 'gm-1'))->outcome)->toBe(MailWriteOutcome::Applied);
+        } else {
+            expect(restoreFailure(restoreTarget($account, 'gm-1'))->safeCode)->toBe(MailWriteCode::LockExpired);
+        }
+    } finally {
+        Date::setTestNow();
+    }
+
+    expect($gmail->writes)->toHaveCount($sent ? 1 : 0);
+})->with([
+    'read ends at the deadline' => [265, true],
+    'read ends one second past it' => [266, false],
+]);
+
+it('refreshes an expiring Gmail token before the lock deadline check, never after it', function (): void {
+    Date::setTestNow('2026-01-01 12:00:00');
+    $gmail = new TrashRestoreGmailProvider;
+    $gmail->messages['synthetic-restore-access-a'] = ['gm-1' => ['labels' => ['TRASH'], 'prior' => ['INBOX']]];
+    // The token outlives the pre-write read's 30s refresh window, then nearly expires during the read.
+    $gmail->beforeRead = function () use ($gmail): void {
+        Date::setTestNow(Date::now()->addSeconds(80));
+        $gmail->beforeRead = null;
+    };
+    // A slow refresh, such as a wait on the credential row lock, uses up the lock.
+    $gmail->onRefresh = fn () => Date::setTestNow(Date::now()->addSeconds(300));
+    Http::fake($gmail->handler());
+
+    try {
+        $account = MailAccount::query()->create([
+            'owner_type' => 'synthetic-workspace',
+            'owner_id' => 'owner-a',
+            'driver' => MailDriver::Gmail,
+            'provider_account_id' => 'restore-a@invented.test',
+        ]);
+        app(MailAccountConnection::class)->store($account, new OAuthTokenSetCredential(
+            'synthetic-restore-access-a',
+            'synthetic-restore-refresh',
+            Date::now()->addSeconds(100)->toDateTimeImmutable(),
+            [GmailOAuth::SCOPE],
+        ));
+
+        $failure = restoreFailure(restoreTarget($account, 'gm-1'));
+    } finally {
+        Date::setTestNow();
+    }
+
+    expect($gmail->refreshes)->toBe(1)
+        ->and($failure->safeCode)->toBe(MailWriteCode::LockExpired)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and($gmail->writes)->toBe([]);
+});

@@ -7,6 +7,7 @@ namespace Jkudish\MailMirror\Enums;
 enum MailWriteCode: string
 {
     case AmbiguousMailboxRole = 'ambiguous_mailbox_role';
+    case LockExpired = 'lock_expired';
     case MessageNotFound = 'message_not_found';
     case NotInTrash = 'not_in_trash';
     case ProviderFailed = 'provider_failed';
@@ -19,6 +20,7 @@ enum MailWriteCode: string
     {
         return match ($this) {
             self::AmbiguousMailboxRole => 'The provider mailbox roles do not identify exactly one source and destination.',
+            self::LockExpired => 'The write lock had too little time left to send the write safely; retry.',
             self::MessageNotFound => 'The provider message does not exist in the supplied account.',
             self::NotInTrash => 'The provider message is not in Trash and is not confirmed as restored by an earlier request.',
             self::ProviderFailed => 'The provider request failed.',

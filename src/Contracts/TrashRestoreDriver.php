@@ -28,6 +28,15 @@ interface TrashRestoreDriver
     public function trashState(MailAccount $account, string $providerMessageId): TrashState;
 
     /**
+     * Do any slow pre-send work now, before the service checks its lock deadline:
+     * refresh credentials so they stay valid for at least $validForSeconds. After
+     * this, restoreFromTrash() must do no I/O before its single write request.
+     *
+     * @throws MailImportFailure when the credential cannot be prepared
+     */
+    public function prepareWrite(MailAccount $account, int $validForSeconds): void;
+
+    /**
      * Send exactly one provider write, without transport retries, that moves
      * only the observed message out of Trash. It does not confirm the result.
      *
