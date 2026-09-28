@@ -17,6 +17,11 @@ It rejects dirty state, stale `origin/main`, and changes to HEAD or the worktree
 It writes an atomic mode-`0600` receipt at
 `.git/mail-mirror/pr-check/<sha>.json`.
 
+The receipt exists only in the `.git` of the checkout that ran `pr:check`; it
+does not travel with the branch. A lead signing off a worker's PR must check out
+the PR head on a named local branch (not a detached HEAD) and re-run
+`pr:check` there before `pr:signoff`.
+
 `composer pr:signoff -- --approved-sha <sha>` validates the full SHA, current
 receipt and plan hash, dedicated `GH_SIGNOFF_TOKEN`, installed
 `basecamp/gh-signoff`, and matching open PR. It rechecks clean HEAD immediately
