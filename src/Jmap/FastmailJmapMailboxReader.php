@@ -12,14 +12,17 @@ use Illuminate\Http\Client\Response;
 use Illuminate\Support\Sleep;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Contracts\BudgetedDeltaMailboxReader;
+use Jkudish\MailMirror\Contracts\TrashRestoreDriver;
 use Jkudish\MailMirror\Credentials\ApiTokenCredential;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
+use Jkudish\MailMirror\Enums\MailWriteCode;
 use Jkudish\MailMirror\Exceptions\DeltaRepairRequired;
 use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
+use Jkudish\MailMirror\Exceptions\MailWriteFailure;
 use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAccountCredential;
@@ -35,9 +38,10 @@ use Jkudish\MailMirror\Read\ProviderDeletionResolution;
 use Jkudish\MailMirror\Read\RawMessageSource;
 use Jkudish\MailMirror\Read\RetrievedMessage;
 use Jkudish\MailMirror\Read\SyncWorkBudget;
+use Jkudish\MailMirror\Write\TrashState;
 use Throwable;
 
-final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader
+final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, TrashRestoreDriver
 {
     private const CORE = 'urn:ietf:params:jmap:core';
 
@@ -680,6 +684,136 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader
         ];
     }
 
+    public function trashState(MailAccount $account, string $providerMessageId): TrashState
+    {
+        $this->assertAccount($account);
+        $session = $this->session($account);
+        $mailboxes = $this->fetchMailboxes($account, $session)['mailboxes'];
+        $trashMailboxId = $this->mailboxWithRole($mailboxes, 'trash');
+        $inboxMailboxId = $this->mailboxWithRole($mailboxes, 'inbox');
+        $result = $this->call($account, $session, 'Email/get', [
+            'accountId' => $account->provider_account_id,
+            'ids' => [$providerMessageId],
+            'properties' => ['id', 'mailboxIds'],
+        ], 'email', MailImportStage::Retrieve);
+        $emailState = $this->boundedString($result['state'] ?? null, 255, MailImportStage::Retrieve);
+        $email = $this->singleObject($result, $providerMessageId, MailImportStage::Retrieve);
+        $mailboxIds = array_keys($this->truthMap($email['mailboxIds'] ?? null, MailImportStage::Retrieve));
+        sort($mailboxIds);
+        $inTrash = in_array($trashMailboxId, $mailboxIds, true);
+
+        return new TrashState(
+            $account->id,
+            MailDriver::Jmap,
+            $providerMessageId,
+            $inTrash,
+            ! $inTrash && in_array($inboxMailboxId, $mailboxIds, true),
+            [
+                'mailbox_ids' => $mailboxIds,
+                'trash_mailbox_id' => $trashMailboxId,
+                'inbox_mailbox_id' => $inboxMailboxId,
+                'email_state' => $emailState,
+            ],
+        );
+    }
+
+    /**
+     * Patches only the observed Trash and Inbox memberships of one email, and
+     * only while the account's Email state still matches the observed read.
+     */
+    public function restoreFromTrash(MailAccount $account, TrashState $observed): void
+    {
+        $this->assertAccount($account);
+        $evidence = $observed->providerEvidence;
+        $trash = $evidence['trash_mailbox_id'] ?? null;
+        $inbox = $evidence['inbox_mailbox_id'] ?? null;
+        $state = $evidence['email_state'] ?? null;
+
+        if ($observed->mailAccountId !== $account->id || $observed->driver !== MailDriver::Jmap || ! $observed->inTrash
+            || ! is_string($trash) || ! is_string($inbox) || ! is_string($state) || $trash === $inbox
+            || ($evidence['mailbox_ids'] ?? null) !== [$trash]
+            || preg_match('/\A[A-Za-z0-9_-]{1,255}\z/', $trash) !== 1
+            || preg_match('/\A[A-Za-z0-9_-]{1,255}\z/', $inbox) !== 1) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedState);
+        }
+
+        $id = $observed->providerMessageId;
+        // Session discovery and credential loading are pre-send; their failures propagate unwrapped.
+        $session = $this->session($account);
+        $this->credential($account, MailImportStage::Retrieve);
+
+        try {
+            $payload = $this->jsonRequest($account, 'POST', $session['api_url'], [
+                'using' => [self::CORE, self::MAIL],
+                'methodCalls' => [['Email/set', [
+                    'accountId' => $account->provider_account_id,
+                    'ifInState' => $state,
+                    'update' => [$id => ['mailboxIds/'.$trash => null, 'mailboxIds/'.$inbox => true]],
+                ], 'restore']],
+            ], MailImportStage::Retrieve, retryTransport: false);
+        } catch (MailImportFailure $failure) {
+            throw MailWriteFailure::fromProvider($failure, true);
+        }
+
+        $responses = $payload['methodResponses'] ?? null;
+        $response = is_array($responses) && count($responses) === 1 ? ($responses[0] ?? null) : null;
+
+        if (! is_array($response) || count($response) !== 3 || ! is_array($response[1] ?? null)
+            || ($response[2] ?? null) !== 'restore') {
+            throw new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
+        }
+
+        $result = $response[1];
+
+        if ($response[0] === 'error') {
+            // Method-level errors reject the whole call, except server failures, which leave state undefined.
+            $type = $result['type'] ?? null;
+
+            throw match ($type) {
+                'serverFail', 'serverPartialFail', 'serverUnavailable' => new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::ProviderUnavailable),
+                'stateMismatch' => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::StateMismatch),
+                'forbidden', 'accountNotSupportedByMethod', 'accountReadOnly' => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::PermissionDenied),
+                'accountNotFound' => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::StateMismatch),
+                default => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::UnexpectedFailure),
+            };
+        }
+
+        if ($response[0] !== 'Email/set' || ($result['accountId'] ?? null) !== $account->provider_account_id) {
+            throw new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
+        }
+
+        $updated = $result['updated'] ?? null;
+        $notUpdated = $result['notUpdated'] ?? null;
+
+        if (is_array($updated) && array_key_exists($id, $updated)) {
+            return;
+        }
+
+        $error = is_array($notUpdated) ? ($notUpdated[$id] ?? null) : null;
+
+        if (! is_array($error)) {
+            throw new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
+        }
+
+        throw match ($error['type'] ?? null) {
+            'notFound' => new MailWriteFailure(MailWriteCode::MessageNotFound, false, MailImportCode::MessageUnavailable),
+            'forbidden' => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::PermissionDenied),
+            default => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::UnexpectedFailure),
+        };
+    }
+
+    /** @param array<string, array{id: string, name: string, role: string|null, sort_order: int, metadata: array<string, mixed>}> $mailboxes */
+    private function mailboxWithRole(array $mailboxes, string $role): string
+    {
+        $matches = array_values(array_filter($mailboxes, fn (array $mailbox): bool => $mailbox['role'] === $role));
+
+        if (count($matches) !== 1) {
+            throw new MailWriteFailure(MailWriteCode::AmbiguousMailboxRole);
+        }
+
+        return $matches[0]['id'];
+    }
+
     /** @return array{api_url: string, download_url: string, session_state: string} */
     private function session(MailAccount $account, bool $refresh = false): array
     {
@@ -793,19 +927,25 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader
      * @param  array<string, mixed>|null  $body
      * @return array<string, mixed>
      */
-    private function jsonRequest(MailAccount $account, string $method, string $url, ?array $body, MailImportStage $stage): array
-    {
+    private function jsonRequest(
+        MailAccount $account,
+        string $method,
+        string $url,
+        ?array $body,
+        MailImportStage $stage,
+        bool $retryTransport = true,
+    ): array {
         if (config('mail-mirror.jmap.enabled') !== true) {
             throw new MailImportFailure($stage, MailImportCode::ProviderUnavailable);
         }
 
         $this->assertFastmailApiUrl($url);
         [$credential, $stored] = $this->credential($account, $stage);
-        $response = $this->sendWithRetries($credential, $method, $url, $body, $stage);
+        $response = $this->sendWithRetries($credential, $method, $url, $body, $stage, $retryTransport);
 
         if ($response->status() === 401) {
             $this->revoke($account, $stored, $stage);
-            throw new MailImportFailure($stage, MailImportCode::AuthenticationFailed);
+            throw new MailImportFailure($stage, MailImportCode::AuthenticationFailed, httpStatus: 401);
         }
 
         if (! $response->successful()) {
@@ -822,11 +962,21 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader
         return $payload;
     }
 
-    /** @param array<string, mixed>|null $body */
-    private function sendWithRetries(ApiTokenCredential $credential, string $method, string $url, ?array $body, MailImportStage $stage): Response
-    {
+    /**
+     * Writes pass $retryTransport false so a provider write is sent at most once.
+     *
+     * @param  array<string, mixed>|null  $body
+     */
+    private function sendWithRetries(
+        ApiTokenCredential $credential,
+        string $method,
+        string $url,
+        ?array $body,
+        MailImportStage $stage,
+        bool $retryTransport = true,
+    ): Response {
         $maximum = config('mail-mirror.jmap.request_max_attempts', 3);
-        $maximum = is_int($maximum) && $maximum >= 1 && $maximum <= 5 ? $maximum : 3;
+        $maximum = ! $retryTransport ? 1 : (is_int($maximum) && $maximum >= 1 && $maximum <= 5 ? $maximum : 3);
 
         for ($attempt = 1; $attempt <= $maximum; $attempt++) {
             $this->budget?->claimHttpRequest();
@@ -965,12 +1115,12 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader
     private function httpFailure(Response $response, MailImportStage $stage): MailImportFailure
     {
         return match ($response->status()) {
-            401 => new MailImportFailure($stage, MailImportCode::AuthenticationFailed),
-            403 => new MailImportFailure($stage, MailImportCode::PermissionDenied),
-            404 => new MailImportFailure($stage, MailImportCode::MessageUnavailable),
-            408, 425, 429 => new MailImportFailure($stage, MailImportCode::RateLimited, true, retryAfterSeconds: $this->retryAfter($response)),
-            500, 502, 503, 504 => new MailImportFailure($stage, MailImportCode::ProviderUnavailable, true),
-            default => new MailImportFailure($stage, MailImportCode::UnexpectedFailure),
+            401 => new MailImportFailure($stage, MailImportCode::AuthenticationFailed, httpStatus: $response->status()),
+            403 => new MailImportFailure($stage, MailImportCode::PermissionDenied, httpStatus: $response->status()),
+            404 => new MailImportFailure($stage, MailImportCode::MessageUnavailable, httpStatus: $response->status()),
+            408, 425, 429 => new MailImportFailure($stage, MailImportCode::RateLimited, true, retryAfterSeconds: $this->retryAfter($response), httpStatus: $response->status()),
+            500, 502, 503, 504 => new MailImportFailure($stage, MailImportCode::ProviderUnavailable, true, httpStatus: $response->status()),
+            default => new MailImportFailure($stage, MailImportCode::UnexpectedFailure, httpStatus: $response->status()),
         };
     }
 

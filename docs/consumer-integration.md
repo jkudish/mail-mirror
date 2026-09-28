@@ -429,6 +429,86 @@ config()->set('mail-mirror.storage_disk', 'mail-mirror-test');
 It does not return content or object keys. Missing attachments can be rebuilt
 from an unchanged, verified raw message.
 
+## Restore a message from provider Trash
+
+Provider Trash is normal mailbox state, so restoring from it is a provider
+write. Authorize the owner and approve the action in your application first,
+then call the write service with the full owner tuple:
+
+```php
+use Jkudish\MailMirror\Enums\MailWriteOutcome;
+use Jkudish\MailMirror\Exceptions\MailWriteFailure;
+use Jkudish\MailMirror\Write\MailWriteService;
+use Jkudish\MailMirror\Write\MailWriteTarget;
+
+$result = app(MailWriteService::class)->restoreFromTrash(new MailWriteTarget(
+    mailAccountId: $account->id,
+    ownerType: $account->owner_type,
+    ownerId: $account->owner_id,
+    providerMessageId: $providerMessageId,
+));
+
+$result->outcome;          // Applied or AlreadyApplied
+$result->providerEvidence; // provider-native state from the confirming re-read
+```
+
+Gmail calls `users.messages.untrash`, which restores the message's prior
+labels. The evidence contains `label_ids` and `history_id`. Fastmail JMAP moves
+the email from the Trash-role mailbox to the Inbox-role mailbox, because JMAP
+keeps no record of the original mailbox. The evidence contains `mailbox_ids`,
+`trash_mailbox_id`, `inbox_mailbox_id`, and `email_state`.
+
+Every write follows the same sequence:
+
+1. Resolve the account through the full owner tuple. A mismatch throws
+   `AccountResourceMismatch` before any provider request.
+2. Acquire a cache lock for the target message. The lock covers every write to
+   that message in that account. If another write holds it, the call fails
+   immediately with `target_busy` and `writeSent` false, before any provider
+   request. The lock is held for at most `mail-mirror.writes.lock_seconds`.
+3. Read the provider state. A message already at the restore destination
+   returns `AlreadyApplied` without writing, but only when this package
+   recorded a restore intent for the same account and message. Otherwise a
+   message outside Trash fails with `not_in_trash`. For Gmail the destination is
+   any state without the `TRASH` label. For JMAP it is Inbox and not Trash.
+4. Send one write with transport retries off. JMAP sends the update with
+   `ifInState`. The package records the intent only when the write may have
+   applied, and clears it when the provider definitively did not apply it.
+5. Re-read the provider state. Only a re-read at the restore destination
+   returns `Applied`. A re-read that fails for any reason throws `unconfirmed`.
+
+Any other outcome throws `MailWriteFailure`. Its `safeCode` is one of
+`message_not_found`, `not_in_trash`, `ambiguous_mailbox_role`,
+`unsupported_state`, `provider_failed`, `target_busy`, `unconfirmed`, or
+`unsupported_driver`. `providerCode` carries the underlying provider
+classification when one exists.
+
+`writeSent` is true when the provider may have applied the write: the request
+was sent and the provider did not answer with a 4xx status or a JMAP
+method-level rejection. Call the same restore again to confirm it without a
+second write. `writeSent` is false when nothing was sent or the provider
+definitively rejected the write. A Gmail 401 on the write refreshes the token
+but does not re-send the write, and reports `writeSent` false.
+
+### Concurrency and cache dependencies
+
+Writes use your application's default cache store for both the per-message lock
+and the restore intent. The store must support atomic locks, as the `redis`,
+`database`, `file`, `array`, and `dynamodb` stores do. Otherwise the call throws
+`LogicException` before any provider request. Use a store shared by every
+process that can write, or the lock cannot serialize them.
+
+Concurrent writes to the same message do not wait. One proceeds and the others
+fail with `target_busy`; retry them after the first finishes. Writes to
+different messages or accounts do not contend.
+
+If the intent is lost, a retry of an already restored message fails closed
+with `not_in_trash` instead of reporting success. This happens when the cache
+evicts the intent, when it expires under `mail-mirror.writes.intent_ttl_seconds`,
+or when a process stops between the provider write and recording the intent.
+If a lock outlives a stopped process, the target stays busy until the lock
+expires.
+
 ## Handle events
 
 MailMirror dispatches two account-qualified events after commit:
