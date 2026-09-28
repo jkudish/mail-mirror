@@ -38,7 +38,9 @@ return [
         /*
          * Writes to one provider message are serialized with a cache lock held
          * for the whole read, write, and confirming re-read. A concurrent write
-         * to the same message fails with target_busy instead of waiting.
+         * to the same message fails with target_busy instead of waiting. The
+         * write is sent only while the lock still covers the send step; a value
+         * shorter than twice that step is raised automatically.
          */
         'lock_seconds' => 300,
     ],

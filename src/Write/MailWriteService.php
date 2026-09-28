@@ -7,7 +7,9 @@ namespace Jkudish\MailMirror\Write;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Support\Facades\Date;
 use Jkudish\MailMirror\Contracts\TrashRestoreDriver;
+use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailWriteCode;
 use Jkudish\MailMirror\Enums\MailWriteOutcome;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
@@ -28,8 +30,11 @@ use Throwable;
  * 3. Read provider state. If the write's destination state already holds and a
  *    recorded intent shows this package may have applied it, return
  *    AlreadyApplied without writing.
- * 4. Send one provider write with transport retries off. Record the intent only
- *    when the write may have applied; clear it when the write definitely did not.
+ * 4. Send one provider write with transport retries off, and only while the lock
+ *    has enough time left to cover the whole send step. Otherwise fail with
+ *    LockExpired before sending, so a writer that later acquires the lock always
+ *    reads state after this write has finished. Record the intent only when the
+ *    write may have applied; clear it when the write definitely did not.
  * 5. Re-read provider state and return Applied only when it confirms the
  *    destination state. Any failure of that re-read is Unconfirmed.
  */
@@ -63,14 +68,18 @@ final readonly class MailWriteService
         }
 
         $targetKey = $this->targetKey($account, $target->providerMessageId);
-        $lock = $store->lock($targetKey.':write-lock', $this->lockSeconds());
+        $sendSeconds = $this->sendStepSeconds($account->driver);
+        $lockSeconds = $this->lockSeconds($sendSeconds);
+        $lock = $store->lock($targetKey.':write-lock', $lockSeconds);
 
         if (! $lock->get()) {
             throw new MailWriteFailure(MailWriteCode::TargetBusy);
         }
 
+        $sendBy = Date::now()->addSeconds($lockSeconds - $sendSeconds);
+
         try {
-            return $this->restoreLocked($driver, $account, $target->providerMessageId, $targetKey.':intent:restore-from-trash');
+            return $this->restoreLocked($driver, $account, $target->providerMessageId, $targetKey.':intent:restore-from-trash', $sendBy, $sendSeconds);
         } finally {
             $lock->release();
         }
@@ -81,6 +90,8 @@ final readonly class MailWriteService
         MailAccount $account,
         string $providerMessageId,
         string $intent,
+        \DateTimeInterface $sendBy,
+        int $sendSeconds,
     ): MailWriteResult {
         $observed = $this->trashState($driver, $account, $providerMessageId);
 
@@ -94,6 +105,16 @@ final readonly class MailWriteService
 
         // The message is in Trash, so any earlier intent belongs to a finished cycle.
         $this->cache->forget($intent);
+
+        try {
+            $driver->prepareWrite($account, $sendSeconds);
+        } catch (MailImportFailure $failure) {
+            throw MailWriteFailure::fromProvider($failure, false);
+        }
+
+        if (Date::now()->greaterThan($sendBy)) {
+            throw new MailWriteFailure(MailWriteCode::LockExpired);
+        }
 
         try {
             $driver->restoreFromTrash($account, $observed);
@@ -173,10 +194,34 @@ final readonly class MailWriteService
         return is_int($seconds) && $seconds >= 60 && $seconds <= 2592000 ? $seconds : 86400;
     }
 
-    private function lockSeconds(): int
+    /**
+     * Worst-case time from the pre-send deadline check until the write request
+     * has finished. prepareWrite() does all slow work first, so the step is the
+     * single write request, bounded by the driver's timeout, plus a five-second
+     * margin. Work after a rejected write (such as a 401 token refresh) does not
+     * count: that write was not applied, so a later writer cannot duplicate it.
+     */
+    private function sendStepSeconds(MailDriver $driver): int
+    {
+        return $this->timeout(match ($driver) {
+            MailDriver::Gmail => 'mail-mirror.gmail.timeout_seconds',
+            MailDriver::Jmap => 'mail-mirror.jmap.timeout_seconds',
+        }) + 5;
+    }
+
+    private function timeout(string $key): int
+    {
+        $seconds = config($key, 30);
+
+        return is_int($seconds) && $seconds >= 1 && $seconds <= 120 ? $seconds : 30;
+    }
+
+    /** The configured lock, raised when needed so it always outlasts the send step. */
+    private function lockSeconds(int $sendSeconds): int
     {
         $seconds = config('mail-mirror.writes.lock_seconds', 300);
+        $seconds = is_int($seconds) && $seconds >= 30 && $seconds <= 3600 ? $seconds : 300;
 
-        return is_int($seconds) && $seconds >= 30 && $seconds <= 3600 ? $seconds : 300;
+        return max($seconds, 2 * $sendSeconds);
     }
 }

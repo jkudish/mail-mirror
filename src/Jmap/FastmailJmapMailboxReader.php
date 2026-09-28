@@ -717,6 +717,12 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Tra
         );
     }
 
+    /** API tokens do not expire and the pre-write read cached the session, so nothing to prepare. */
+    public function prepareWrite(MailAccount $account, int $validForSeconds): void
+    {
+        $this->assertAccount($account);
+    }
+
     /**
      * Patches only the observed Trash and Inbox memberships of one email, and
      * only while the account's Email state still matches the observed read.
@@ -755,6 +761,13 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Tra
             throw MailWriteFailure::fromProvider($failure, true);
         }
 
+        // Like call(): a changed session state means the cached session may be stale.
+        // The write outcome is already decided, so drop the cache for the confirming
+        // read to rediscover rather than failing a write that may have applied.
+        if (($payload['sessionState'] ?? null) !== $session['session_state']) {
+            unset($this->sessions[$account->id], $this->mailboxes[$account->id], $this->profileMetadata[$account->id]);
+        }
+
         $responses = $payload['methodResponses'] ?? null;
         $response = is_array($responses) && count($responses) === 1 ? ($responses[0] ?? null) : null;
 
@@ -766,15 +779,16 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Tra
         $result = $response[1];
 
         if ($response[0] === 'error') {
-            // Method-level errors reject the whole call, except server failures, which leave state undefined.
+            // RFC 8620 method errors reject the whole call. Server failures leave state
+            // undefined, and an unrecognized type might too, so both count as possibly applied.
             $type = $result['type'] ?? null;
 
             throw match ($type) {
-                'serverFail', 'serverPartialFail', 'serverUnavailable' => new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::ProviderUnavailable),
-                'stateMismatch' => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::StateMismatch),
+                'stateMismatch', 'accountNotFound' => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::StateMismatch),
                 'forbidden', 'accountNotSupportedByMethod', 'accountReadOnly' => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::PermissionDenied),
-                'accountNotFound' => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::StateMismatch),
-                default => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::UnexpectedFailure),
+                'unknownMethod', 'invalidArguments', 'invalidResultReference', 'requestTooLarge' => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::UnexpectedFailure),
+                'serverFail', 'serverPartialFail', 'serverUnavailable' => new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::ProviderUnavailable),
+                default => new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::UnexpectedFailure),
             };
         }
 

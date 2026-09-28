@@ -479,8 +479,8 @@ Every write follows the same sequence:
 
 Any other outcome throws `MailWriteFailure`. Its `safeCode` is one of
 `message_not_found`, `not_in_trash`, `ambiguous_mailbox_role`,
-`unsupported_state`, `provider_failed`, `target_busy`, `unconfirmed`, or
-`unsupported_driver`. `providerCode` carries the underlying provider
+`unsupported_state`, `provider_failed`, `target_busy`, `lock_expired`,
+`unconfirmed`, or `unsupported_driver`. `providerCode` carries the underlying provider
 classification when one exists.
 
 `writeSent` is true when the provider may have applied the write: the request
@@ -501,6 +501,15 @@ process that can write, or the lock cannot serialize them.
 Concurrent writes to the same message do not wait. One proceeds and the others
 fail with `target_busy`; retry them after the first finishes. Writes to
 different messages or accounts do not contend.
+
+Before the write, the driver's `prepareWrite()` does all slow work, such as
+refreshing a Gmail token. The write is then sent only while the lock has
+enough time left for the single write request, bounded by that driver's
+`timeout_seconds`, plus five seconds. When the read and preparation run too
+long, the call fails with `lock_expired` and `writeSent` false before sending,
+so a writer that later takes the lock always reads state after this write
+finished. The effective lock is `lock_seconds`, raised to twice the send step
+when configured shorter; retry `lock_expired` like `target_busy`.
 
 If the intent is lost, a retry of an already restored message fails closed
 with `not_in_trash` instead of reporting success. This happens when the cache

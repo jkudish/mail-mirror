@@ -18,6 +18,19 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   configuration. Writes require a default cache store that supports atomic
   locks. A concurrent write to the same message fails with `target_busy`.
 - `MailImportFailure::$httpStatus`, the provider HTTP status when one exists.
+- `lock_expired`: a write is sent only while its lock still covers the single
+  write request, and a configured lock shorter than twice that step is raised.
+- `TrashRestoreDriver::prepareWrite()`: drivers do slow pre-send work, such as
+  a Gmail token refresh, before the lock deadline check. The Gmail write no
+  longer refreshes the token itself.
+
+### Changed
+
+- A JMAP write whose response reports a new session state drops the cached
+  session, so the confirming read rediscovers it.
+- An unrecognized JMAP method-error type on a write now counts as possibly
+  applied (`writeSent` true). Only RFC 8620's definite rejections count as not
+  applied.
 
 ## [0.1.0] - 2026-09-14
 
