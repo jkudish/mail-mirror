@@ -6,6 +6,15 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Added
+
+- `MailWriteService::restoreFromTrash()`, the first provider write. Gmail
+  untrashes one message; Fastmail JMAP moves one email from the Trash-role to
+  the Inbox-role mailbox. Writes resolve the owner tuple first, send once
+  without transport retries, confirm by re-reading provider state, and return
+  retries as `AlreadyApplied`.
+- `mail-mirror.writes.intent_ttl_seconds` configuration for write idempotency.
+
 ## [0.1.0] - 2026-09-14
 
 The first public release.

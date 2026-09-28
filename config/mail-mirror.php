@@ -27,6 +27,15 @@ return [
     /* Reconciliation reports retain counts plus only this many opaque IDs per category. */
     'reconciliation_sample_limit' => 20,
 
+    'writes' => [
+        /*
+         * A restore records its intent under an account-namespaced cache key
+         * before the provider write. A retry within this window that finds the
+         * message already restored returns success without writing again.
+         */
+        'intent_ttl_seconds' => 86400,
+    ],
+
     'gmail' => [
         /* Fail closed unless provider network access is explicitly enabled by a consumer. */
         'enabled' => env('MAIL_MIRROR_GMAIL_ENABLED', false),

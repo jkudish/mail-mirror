@@ -2,10 +2,11 @@
 
 Status: canonical package contract.
 
-MailMirror owns provider connections, read adapters, mirroring,
-reconciliation, normalized records, provider-native metadata, raw messages, and
-attachments. The consumer owns users, authorization, UI, search, AI, tools,
-approvals, retention policy, and provider write operations.
+MailMirror owns provider connections, read adapters, provider write drivers,
+mirroring, reconciliation, normalized records, provider-native metadata, raw
+messages, and attachments. The consumer owns users, authorization, UI, search,
+AI, tools, approvals, retention policy, and the decision to request a provider
+write.
 
 ## Ownership roots
 
@@ -48,6 +49,7 @@ When an owner is present:
 | Failures | Resolve the previous error episode after a successful import. A later episode does not inherit an old waiver. |
 | Provider deletion | Qualify evidence by scan and invalidate it when the message reappears. Evidence does not authorize retention, quarantine, or purge. |
 | Local purge | Require the account, owner tuple, and checkpoint version. Preserve references after filesystem failure. Fence stale imports with a tombstone. Never write to the provider. |
+| Provider writes | Target one provider message by account, owner tuple, and provider message ID. Resolve the tuple before any provider request. Send the write once with transport retries off. Report success only after a provider re-read confirms it. Return an already-applied write as success without writing again. Fail explicitly on ambiguous or unsupported provider semantics and never change more than the target. |
 | Consumer integration | Expose contracts and events without importing `App` or another consumer namespace. Consumers register morph aliases. |
 
 MailMirror may use Laravel persistence, filesystem, HTTP, and queue services to
@@ -87,6 +89,7 @@ owner-related change must test those surfaces directly.
 
 ## Non-goals
 
-This contract does not add provider write APIs, consumer UI, search, retention
-policy, owner administration, or outbound actions. Each remains a separate
-consumer responsibility or package change.
+This contract does not add consumer UI, search, retention policy, owner
+administration, or outbound actions. Each remains a separate consumer
+responsibility or package change. Provider writes beyond restoring one message
+from Trash each require their own approved design.

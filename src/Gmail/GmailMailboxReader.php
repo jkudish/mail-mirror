@@ -11,15 +11,18 @@ use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Contracts\BudgetedDeltaMailboxReader;
+use Jkudish\MailMirror\Contracts\TrashRestoreDriver;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
+use Jkudish\MailMirror\Enums\MailWriteCode;
 use Jkudish\MailMirror\Exceptions\DeltaRepairRequired;
 use Jkudish\MailMirror\Exceptions\GmailAuthorizationException;
 use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
+use Jkudish\MailMirror\Exceptions\MailWriteFailure;
 use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAccountCredential;
@@ -35,11 +38,12 @@ use Jkudish\MailMirror\Read\ProviderDeletionResolution;
 use Jkudish\MailMirror\Read\RawMessageSource;
 use Jkudish\MailMirror\Read\RetrievedMessage;
 use Jkudish\MailMirror\Read\SyncWorkBudget;
+use Jkudish\MailMirror\Write\TrashState;
 use Throwable;
 use ZBateson\MailMimeParser\Header\AddressHeader;
 use ZBateson\MailMimeParser\MailMimeParser;
 
-final class GmailMailboxReader implements BudgetedDeltaMailboxReader
+final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashRestoreDriver
 {
     private const API = 'https://gmail.googleapis.com/gmail/v1';
 
@@ -648,12 +652,68 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader
         }, $nativeIdentities));
     }
 
+    public function trashState(MailAccount $account, string $providerMessageId): TrashState
+    {
+        $this->assertAccount($account);
+        $native = $this->request(
+            $account,
+            'GET',
+            self::API.'/users/me/messages/'.rawurlencode($providerMessageId),
+            ['format' => 'minimal'],
+        );
+        $historyId = $native['historyId'] ?? null;
+        $labelIds = $native['labelIds'] ?? [];
+
+        if (($native['id'] ?? null) !== $providerMessageId || ! is_string($historyId) || $historyId === ''
+            || ! is_array($labelIds) || ! array_is_list($labelIds) || count($labelIds) > 10000
+            || array_filter($labelIds, fn (mixed $labelId): bool => ! is_string($labelId)) !== []) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+        }
+
+        /** @var list<string> $labelIds */
+        return new TrashState(
+            $account->id,
+            MailDriver::Gmail,
+            $providerMessageId,
+            in_array('TRASH', $labelIds, true),
+            ['label_ids' => $labelIds, 'history_id' => $historyId],
+        );
+    }
+
+    public function restoreFromTrash(MailAccount $account, TrashState $observed): void
+    {
+        $this->assertAccount($account);
+
+        if ($observed->mailAccountId !== $account->id || $observed->driver !== MailDriver::Gmail || ! $observed->inTrash) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedState);
+        }
+
+        $native = $this->request(
+            $account,
+            'POST',
+            self::API.'/users/me/messages/'.rawurlencode($observed->providerMessageId).'/untrash',
+            resendAfterReauthorization: false,
+        );
+
+        if (($native['id'] ?? null) !== $observed->providerMessageId) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+        }
+    }
+
     /**
+     * Writes pass $resendAfterReauthorization false: a rejected token is
+     * refreshed for the next call, but the write itself is never re-sent.
+     *
      * @param  array<string, int|string|null>  $query
      * @return array<string, mixed>
      */
-    private function request(MailAccount $account, string $method, string $url, array $query = []): array
-    {
+    private function request(
+        MailAccount $account,
+        string $method,
+        string $url,
+        array $query = [],
+        bool $resendAfterReauthorization = true,
+    ): array {
         if (config('mail-mirror.gmail.enabled') !== true) {
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::ProviderUnavailable);
         }
@@ -663,6 +723,11 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader
 
         if ($response->status() === 401) {
             $credential = $this->refresh($account, $stored, $credential);
+
+            if (! $resendAfterReauthorization) {
+                throw new MailImportFailure($this->stageFor($url), MailImportCode::AuthenticationFailed, true);
+            }
+
             $response = $this->send($credential, $method, $url, $query);
 
             if ($response->status() === 401) {

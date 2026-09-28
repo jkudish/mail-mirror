@@ -429,6 +429,57 @@ config()->set('mail-mirror.storage_disk', 'mail-mirror-test');
 It does not return content or object keys. Missing attachments can be rebuilt
 from an unchanged, verified raw message.
 
+## Restore a message from provider Trash
+
+Provider Trash is normal mailbox state, so restoring from it is a provider
+write. Authorize the owner and approve the action in your application first,
+then call the write service with the full owner tuple:
+
+```php
+use Jkudish\MailMirror\Enums\MailWriteOutcome;
+use Jkudish\MailMirror\Exceptions\MailWriteFailure;
+use Jkudish\MailMirror\Write\MailWriteService;
+use Jkudish\MailMirror\Write\MailWriteTarget;
+
+$result = app(MailWriteService::class)->restoreFromTrash(new MailWriteTarget(
+    mailAccountId: $account->id,
+    ownerType: $account->owner_type,
+    ownerId: $account->owner_id,
+    providerMessageId: $providerMessageId,
+));
+
+$result->outcome;          // Applied or AlreadyApplied
+$result->providerEvidence; // provider-native state from the confirming re-read
+```
+
+Gmail calls `users.messages.untrash`, which restores the message's prior
+labels. The evidence contains `label_ids` and `history_id`. Fastmail JMAP moves
+the email from the Trash-role mailbox to the Inbox-role mailbox, because JMAP
+keeps no record of the original mailbox. The evidence contains `mailbox_ids`,
+`trash_mailbox_id`, `inbox_mailbox_id`, and `email_state`.
+
+Every write follows the same sequence:
+
+1. Resolve the account through the full owner tuple. A mismatch throws
+   `AccountResourceMismatch` before any provider request.
+2. Read the provider state. A message outside Trash returns `AlreadyApplied`
+   only when this package recorded a restore intent for the same account and
+   message within `mail-mirror.writes.intent_ttl_seconds`; otherwise it fails
+   with `not_in_trash`.
+3. Record the intent under an account-namespaced cache key, then send one write
+   with transport retries off. A rejected Gmail token is refreshed but the
+   write is not re-sent. JMAP sends the update with `ifInState`.
+4. Re-read the provider state. Only a re-read showing the message outside Trash
+   returns `Applied`.
+
+Any other outcome throws `MailWriteFailure`. Its `safeCode` is one of
+`message_not_found`, `not_in_trash`, `ambiguous_mailbox_role`,
+`unsupported_state`, `provider_failed`, `unconfirmed`, or
+`unsupported_driver`. `writeSent` is true when the provider may have applied
+the write; call the same restore again to confirm it without a second write.
+`providerCode` carries the underlying provider classification when one exists.
+The restore uses your application's default cache store for intents.
+
 ## Handle events
 
 MailMirror dispatches two account-qualified events after commit:
