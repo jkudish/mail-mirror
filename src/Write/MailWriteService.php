@@ -257,7 +257,7 @@ final readonly class MailWriteService
                 $existing = $this->draftsWithMessageId($driver, $account, $content->messageId);
 
                 if ($existing !== []) {
-                    return count($existing) === 1 && $existing[0]->rawSha256 === $content->sha256
+                    return count($existing) === 1 && $driver->holdsContent($existing[0], $content)
                         ? $this->draftResult($account, MailWriteOutcome::AlreadyApplied, $existing[0])
                         : throw new MailWriteFailure(MailWriteCode::MessageIdConflict);
                 }
@@ -271,10 +271,6 @@ final readonly class MailWriteService
                 }
 
                 $confirmed = $this->confirmDraft($driver, $account, $draftId, $content);
-
-                if ($confirmed->messageId !== $content->messageId) {
-                    throw new MailWriteFailure(MailWriteCode::Unconfirmed, true);
-                }
 
                 return $this->draftResult($account, MailWriteOutcome::Applied, $confirmed);
             },
@@ -302,62 +298,84 @@ final readonly class MailWriteService
         $intent = $draftKey.':intent';
         $intentValue = 'replace:'.$expectedRevision.':'.$content->sha256;
 
+        // Lock order: the content's Message-ID, then the draft. Creates hold the same
+        // Message-ID lock, so the duplicate check below and the write serialize with them.
         return $this->withLock(
             $account,
-            $draftKey.':write-lock',
-            function (\DateTimeInterface $sendBy, int $sendSeconds) use ($driver, $account, $target, $expectedRevision, $content, $intent, $intentValue): DraftWriteResult {
-                $current = $this->readDraft($driver, $account, $target->draftId);
-
-                if ($current === null || $current->revision !== $expectedRevision) {
-                    $replacement = $this->cache->get($intent) === $intentValue
-                        ? $this->draftsWithMessageId($driver, $account, $content->messageId)
-                        : [];
-
-                    if (count($replacement) === 1 && $replacement[0]->rawSha256 === $content->sha256
-                        && ($current === null || $current->draftId === $replacement[0]->draftId)) {
-                        return $this->draftResult($account, MailWriteOutcome::AlreadyApplied, $replacement[0]);
-                    }
-
-                    throw new MailWriteFailure($current === null ? MailWriteCode::DraftNotFound : MailWriteCode::StaleRevision);
-                }
-
-                $others = array_values(array_filter(
-                    $this->draftsWithMessageId($driver, $account, $content->messageId),
-                    fn (DraftRevision $draft): bool => $draft->draftId !== $current->draftId,
-                ));
-                // An identical draft is what an interrupted replace leaves; anything else is a conflict.
-                $imported = count($others) === 1 && $others[0]->rawSha256 === $content->sha256 ? $others[0] : null;
-
-                if ($others !== [] && $imported === null) {
-                    throw new MailWriteFailure(MailWriteCode::MessageIdConflict);
-                }
-
-                $this->cache->forget($intent);
-                $staged = $this->prepareDraftWrite($driver, $account, $sendSeconds, $sendBy, $imported === null ? $content : null);
-
-                try {
-                    $draftId = $driver->replaceDraft($account, $current, $content, $staged, $imported);
-                } catch (MailImportFailure $failure) {
-                    throw MailWriteFailure::fromProvider($failure, false);
-                } catch (MailWriteFailure $failure) {
-                    if ($failure->writeSent) {
-                        $this->cache->put($intent, $intentValue, $this->intentTtl());
-                    }
-
-                    throw $failure;
-                }
-
-                $this->cache->put($intent, $intentValue, $this->intentTtl());
-                $confirmed = $this->confirmDraft($driver, $account, $draftId, $content);
-
-                if ($draftId !== $current->draftId && $this->confirmingRead(fn () => $driver->draft($account, $current->draftId)) !== null) {
-                    throw new MailWriteFailure(MailWriteCode::Unconfirmed, true);
-                }
-
-                return $this->draftResult($account, MailWriteOutcome::Applied, $confirmed);
-            },
+            $this->messageIdKey($account, $content->messageId).':write-lock',
+            fn (\DateTimeInterface $outerSendBy): DraftWriteResult => $this->withLock(
+                $account,
+                $draftKey.':write-lock',
+                fn (\DateTimeInterface $innerSendBy, int $sendSeconds): DraftWriteResult => $this->replaceLocked(
+                    $driver, $account, $target, $expectedRevision, $content, $intent, $intentValue,
+                    min($outerSendBy, $innerSendBy), $sendSeconds,
+                ),
+                2,
+            ),
             2,
         );
+    }
+
+    private function replaceLocked(
+        DraftDriver $driver,
+        MailAccount $account,
+        DraftTarget $target,
+        string $expectedRevision,
+        DraftContent $content,
+        string $intent,
+        string $intentValue,
+        \DateTimeInterface $sendBy,
+        int $sendSeconds,
+    ): DraftWriteResult {
+        $current = $this->readDraft($driver, $account, $target->draftId);
+
+        if ($current === null || $current->revision !== $expectedRevision) {
+            $replacement = $this->cache->get($intent) === $intentValue
+                ? $this->draftsWithMessageId($driver, $account, $content->messageId)
+                : [];
+
+            if (count($replacement) === 1 && $driver->holdsContent($replacement[0], $content)
+                && ($current === null || $current->draftId === $replacement[0]->draftId)) {
+                return $this->draftResult($account, MailWriteOutcome::AlreadyApplied, $replacement[0]);
+            }
+
+            throw new MailWriteFailure($current === null ? MailWriteCode::DraftNotFound : MailWriteCode::StaleRevision);
+        }
+
+        $others = array_values(array_filter(
+            $this->draftsWithMessageId($driver, $account, $content->messageId),
+            fn (DraftRevision $draft): bool => $draft->draftId !== $current->draftId,
+        ));
+        // An identical draft is what an interrupted replace leaves; anything else is a conflict.
+        $imported = count($others) === 1 && $driver->holdsContent($others[0], $content) ? $others[0] : null;
+
+        if ($others !== [] && $imported === null) {
+            throw new MailWriteFailure(MailWriteCode::MessageIdConflict);
+        }
+
+        $this->cache->forget($intent);
+        $staged = $this->prepareDraftWrite($driver, $account, $sendSeconds, $sendBy, $imported === null ? $content : null);
+
+        try {
+            $draftId = $driver->replaceDraft($account, $current, $content, $staged, $imported);
+        } catch (MailImportFailure $failure) {
+            throw MailWriteFailure::fromProvider($failure, false);
+        } catch (MailWriteFailure $failure) {
+            if ($failure->writeSent) {
+                $this->cache->put($intent, $intentValue, $this->intentTtl());
+            }
+
+            throw $failure;
+        }
+
+        $this->cache->put($intent, $intentValue, $this->intentTtl());
+        $confirmed = $this->confirmDraft($driver, $account, $draftId, $content);
+
+        if ($draftId !== $current->draftId && $this->confirmingRead(fn () => $driver->draft($account, $current->draftId)) !== null) {
+            throw new MailWriteFailure(MailWriteCode::Unconfirmed, true);
+        }
+
+        return $this->draftResult($account, MailWriteOutcome::Applied, $confirmed);
     }
 
     /**
@@ -449,10 +467,6 @@ final readonly class MailWriteService
         }
 
         foreach ($drafts as $draft) {
-            if ($draft->messageId !== $messageId) {
-                throw new AccountResourceMismatch('The provider draft does not have the requested Message-ID.');
-            }
-
             $this->ownedDraft($account, $draft);
         }
 
@@ -499,7 +513,7 @@ final readonly class MailWriteService
             throw new MailWriteFailure(MailWriteCode::Unconfirmed, true);
         }
 
-        if ($confirmed->rawSha256 !== $content->sha256) {
+        if (! $driver->holdsContent($confirmed, $content)) {
             throw new MailWriteFailure(MailWriteCode::RevisionConflict, true);
         }
 

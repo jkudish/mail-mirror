@@ -578,6 +578,18 @@ update is detected by the confirming re-read and fails `revision_conflict`
 with `writeSent` true. Such an edit can be lost; re-read the draft before
 retrying.
 
+A create and a replace that use the same Message-ID serialize on a
+Message-ID lock (a replace takes it before its draft lock); the second fails
+`target_busy`.
+
+Content identity is provider-specific. JMAP stores an imported blob unchanged,
+so the raw SHA-256 and Message-ID of a re-read identify the bytes written.
+For Gmail, MailMirror assumes that `drafts.get` with `format=raw` returns
+exactly the bytes written, including the client Message-ID. This is not yet
+verified against live Gmail. If Gmail rewrites either, Gmail creates and
+replaces report `unconfirmed` or `revision_conflict` instead of `Applied`, and
+Message-ID lookups find nothing; nothing is written twice.
+
 A JMAP replace interrupted after the import and before the destroy leaves both
 drafts. Retrying the same replace with the same revision and bytes finishes it:
 it destroys the old draft without importing again.

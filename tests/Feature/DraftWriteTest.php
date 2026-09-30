@@ -37,6 +37,9 @@ final class DraftGmailProvider
     /** Apply the next write, then answer with this status, like a timeout after the provider applied it. */
     public ?int $statusAfterApply = null;
 
+    /** @var (Closure(): void)|null Runs while a create is in flight. */
+    public ?Closure $onCreate = null;
+
     /** @var (Closure(): void)|null Runs after an update applies, for example an external edit. */
     public ?Closure $afterUpdate = null;
 
@@ -60,6 +63,10 @@ final class DraftGmailProvider
 
             if ($path === '/gmail/v1/users/me/drafts' && $request->method() === 'POST') {
                 $this->writes[] = 'create';
+
+                if ($this->onCreate !== null) {
+                    ($this->onCreate)();
+                }
                 /** @var array{message: array{raw: string, threadId?: string}} $body */
                 $body = $request->data();
                 $this->bodies[] = $body;
@@ -755,3 +762,46 @@ it('rejects an owner or account mismatch with zero provider requests for every d
 
     Http::assertNothingSent();
 });
+
+it('serializes a create and a replace that use the same Message-ID, in either order', function (string $first): void {
+    $gmail = new DraftGmailProvider;
+    $gmail->drafts['d-old'] = ['message' => 'm-old', 'thread' => 't-old', 'raw' => draftBytes('other@invented.test')];
+    draftFake($gmail, new DraftJmapProvider);
+    $account = draftGmailAccount();
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(draftTarget($account, 'd-old'))->revision;
+    $created = new DraftContent(draftBytes('contended@invented.test', 'Created.'));
+    $replacement = new DraftContent(draftBytes('contended@invented.test', 'Replaced.'));
+    $create = fn (): mixed => $service->createDraft(draftAccountTarget($account), $created);
+    $replace = fn (): mixed => $service->replaceDraft(draftTarget($account, 'd-old'), $revision, $replacement);
+    $blocked = null;
+    $requests = [0, 0];
+    $inFlight = function () use (&$blocked, &$requests, $first, $create, $replace): void {
+        $requests[0] = count(Http::recorded());
+
+        try {
+            ($first === 'create' ? $replace : $create)();
+        } catch (MailWriteFailure $failure) {
+            $blocked = $failure;
+        }
+
+        $requests[1] = count(Http::recorded());
+    };
+
+    if ($first === 'create') {
+        $gmail->onCreate = $inFlight;
+        $create();
+    } else {
+        $gmail->afterUpdate = $inFlight;
+        $replace();
+    }
+
+    assert($blocked instanceof MailWriteFailure);
+    $withMessageId = array_filter($gmail->drafts, fn (array $draft): bool => DraftContent::messageIdOf($draft['raw']) === 'contended@invented.test');
+
+    expect($blocked->safeCode)->toBe(MailWriteCode::TargetBusy)
+        ->and($blocked->writeSent)->toBeFalse()
+        ->and($requests[1])->toBe($requests[0])
+        ->and($gmail->writes)->toBe([$first === 'create' ? 'create' : 'update:d-old'])
+        ->and($withMessageId)->toHaveCount(1);
+})->with(['create', 'replace']);

@@ -926,6 +926,12 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Dra
         }
     }
 
+    /** JMAP stores an imported blob unchanged, so identical bytes identify the content. */
+    public function holdsContent(DraftRevision $draft, DraftContent $content): bool
+    {
+        return $draft->rawSha256 === $content->sha256 && $draft->messageId === $content->messageId;
+    }
+
     /** A JMAP draft's ID is its email ID. */
     public function draftForMessage(MailAccount $account, string $providerMessageId): ?DraftRevision
     {
@@ -1028,7 +1034,7 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Dra
 
         if ($observed->mailAccountId !== $account->id || $observed->driver !== MailDriver::Jmap
             || ! is_string($state) || ! is_string($draftsMailboxId)
-            || ($imported !== null && ($imported->mailAccountId !== $account->id || $imported->rawSha256 !== $content->sha256))) {
+            || ($imported !== null && ($imported->mailAccountId !== $account->id || ! $this->holdsContent($imported, $content)))) {
             throw new MailWriteFailure(MailWriteCode::UnsupportedState);
         }
 

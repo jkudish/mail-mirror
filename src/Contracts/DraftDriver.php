@@ -30,6 +30,14 @@ interface DraftDriver
     public function draftForMessage(MailAccount $account, string $providerMessageId): ?DraftRevision;
 
     /**
+     * The provider's content-identity predicate: true when $draft holds exactly
+     * $content as written. The service uses it for every create, replace, and
+     * confirmation comparison, so a provider that stores bytes differently
+     * changes this one method.
+     */
+    public function holdsContent(DraftRevision $draft, DraftContent $content): bool;
+
+    /**
      * Every draft whose Message-ID header is exactly $messageId (without angle brackets).
      *
      * @return list<DraftRevision>

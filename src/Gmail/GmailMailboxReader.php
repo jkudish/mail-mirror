@@ -857,12 +857,29 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDrive
         foreach (array_keys($this->draftIds($native)) as $draftId) {
             $draft = $this->draft($account, $draftId);
 
-            if ($draft !== null && $draft->messageId === $messageId) {
+            if ($draft !== null && $this->sameContentIdentity($draft, $messageId, null)) {
                 $drafts[] = $draft;
             }
         }
 
         return $drafts;
+    }
+
+    public function holdsContent(DraftRevision $draft, DraftContent $content): bool
+    {
+        return $this->sameContentIdentity($draft, $content->messageId, $content->sha256);
+    }
+
+    /**
+     * Gmail content identity, in one place. ASSUMPTION, unverified against live
+     * Gmail (#3131): drafts.get format=raw returns exactly the bytes written,
+     * including the client Message-ID. If Gmail rewrites either, every Gmail
+     * create and replace reports unconfirmed or revision_conflict, and draft
+     * lookups by Message-ID find nothing; change only this method.
+     */
+    private function sameContentIdentity(DraftRevision $draft, string $messageId, ?string $sha256): bool
+    {
+        return $draft->messageId === $messageId && ($sha256 === null || $draft->rawSha256 === $sha256);
     }
 
     public function stageDraft(MailAccount $account, DraftContent $content): ?string
