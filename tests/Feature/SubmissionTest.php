@@ -1,0 +1,543 @@
+<?php
+
+declare(strict_types=1);
+
+use Illuminate\Http\Client\Request;
+use Illuminate\Support\Facades\Http;
+use Jkudish\MailMirror\Credentials\ApiTokenCredential;
+use Jkudish\MailMirror\Credentials\MailAccountConnection;
+use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
+use Jkudish\MailMirror\Enums\MailDriver;
+use Jkudish\MailMirror\Enums\MailWriteCode;
+use Jkudish\MailMirror\Enums\SubmissionOutcome;
+use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
+use Jkudish\MailMirror\Exceptions\MailWriteFailure;
+use Jkudish\MailMirror\Gmail\GmailOAuth;
+use Jkudish\MailMirror\Models\MailAccount;
+use Jkudish\MailMirror\Models\MailIdentity;
+use Jkudish\MailMirror\Write\DraftContent;
+use Jkudish\MailMirror\Write\DraftTarget;
+use Jkudish\MailMirror\Write\MailWriteService;
+
+/** Synthetic Gmail drafts and sent messages; drafts.send moves a draft to SENT and deletes it. */
+final class SubmitGmailProvider
+{
+    /** @var array<string, array{message: string, thread: string, raw: string}> */
+    public array $drafts = [];
+
+    /** @var array<string, array{thread: string, labels: list<string>, messageIdHeader: string|null}> */
+    public array $messages = [];
+
+    /** @var list<array<string, mixed>> */
+    public array $sends = [];
+
+    /** Apply the next send, then answer with this status, like a timeout after Gmail accepted it. */
+    public ?int $sendStatusAfterApply = null;
+
+    /** Answer the next send with this status without applying it. */
+    public ?int $sendStatusBeforeApply = null;
+
+    /** When set, the sent copy carries this Message-ID header instead of the draft's. */
+    public ?string $sentMessageIdHeader = null;
+
+    /** @var list<string> */
+    public array $paths = [];
+
+    /** @return Closure(Request): mixed */
+    public function handler(): Closure
+    {
+        return function (Request $request) {
+            $path = (string) parse_url($request->url(), PHP_URL_PATH);
+            parse_str((string) parse_url($request->url(), PHP_URL_QUERY), $query);
+            $this->paths[] = $request->method().' '.$path;
+
+            if ($path === '/gmail/v1/users/me/drafts/send') {
+                expect($request->method())->toBe('POST');
+                /** @var array{id: string} $body */
+                $body = $request->data();
+                $this->sends[] = $body;
+
+                if ($this->sendStatusBeforeApply !== null) {
+                    $status = $this->sendStatusBeforeApply;
+                    $this->sendStatusBeforeApply = null;
+
+                    return Http::response(['error' => 'synthetic failure'], $status);
+                }
+
+                $draft = $this->drafts[$body['id']] ?? null;
+
+                if ($draft === null) {
+                    return Http::response(['error' => 'synthetic not found'], 404);
+                }
+
+                $id = 'sent-'.$draft['message'];
+                $header = $this->sentMessageIdHeader ?? '<'.DraftContent::messageIdOf($draft['raw']).'>';
+                $this->messages[$id] = ['thread' => $draft['thread'], 'labels' => ['SENT'], 'messageIdHeader' => $header];
+                unset($this->drafts[$body['id']]);
+
+                if ($this->sendStatusAfterApply !== null) {
+                    $status = $this->sendStatusAfterApply;
+                    $this->sendStatusAfterApply = null;
+
+                    return Http::response(['error' => 'synthetic failure'], $status);
+                }
+
+                return Http::response(['id' => $id, 'threadId' => $draft['thread'], 'labelIds' => ['SENT']]);
+            }
+
+            if (preg_match('#^/gmail/v1/users/me/drafts/([^/]+)$#', $path, $matches) === 1) {
+                $draft = $this->drafts[rawurldecode($matches[1])] ?? null;
+
+                return $draft === null ? Http::response(['error' => 'synthetic not found'], 404) : Http::response(['id' => rawurldecode($matches[1]), 'message' => [
+                    'id' => $draft['message'], 'threadId' => $draft['thread'], 'labelIds' => ['DRAFT'],
+                    'raw' => rtrim(strtr(base64_encode($draft['raw']), '+/', '-_'), '='),
+                ]]);
+            }
+
+            if ($path === '/gmail/v1/users/me/messages') {
+                expect($query['labelIds'] ?? null)->toBe('SENT');
+                $q = $query['q'] ?? null;
+                $wanted = '<'.substr(is_string($q) ? $q : '', strlen('rfc822msgid:')).'>';
+
+                return Http::response(['messages' => array_map(
+                    fn (string $id): array => ['id' => $id, 'threadId' => $this->messages[$id]['thread']],
+                    array_keys(array_filter($this->messages, fn (array $message): bool => $message['messageIdHeader'] === $wanted)),
+                )]);
+            }
+
+            if (preg_match('#^/gmail/v1/users/me/messages/([^/]+)$#', $path, $matches) === 1) {
+                $id = rawurldecode($matches[1]);
+                $message = $this->messages[$id] ?? null;
+
+                if ($message === null) {
+                    return Http::response(['error' => 'synthetic not found'], 404);
+                }
+
+                return Http::response(['id' => $id, 'threadId' => $message['thread'], 'labelIds' => $message['labels']]
+                    + (($query['format'] ?? null) === 'metadata'
+                        ? ['payload' => ['headers' => $message['messageIdHeader'] === null ? [] : [['name' => 'Message-ID', 'value' => $message['messageIdHeader']]]]]
+                        : []));
+            }
+
+            return Http::response(['error' => 'synthetic unexpected path'], 418);
+        };
+    }
+}
+
+/** Synthetic Fastmail JMAP drafts with EmailSubmission. */
+final class SubmitJmapProvider
+{
+    /** @var array<string, array{blob: string, mailboxIds: array<string, true>, keywords: array<string, true>}> */
+    public array $emails = [];
+
+    /** @var array<string, string> */
+    public array $blobs = [];
+
+    /** @var array<string, array{emailId: string, undoStatus: string}> */
+    public array $submissions = [];
+
+    /** @var list<array<string, mixed>> */
+    public array $sends = [];
+
+    /** @var list<string> */
+    public array $methods = [];
+
+    public ?int $sendStatusAfterApply = null;
+
+    /** @return Closure(Request): mixed */
+    public function handler(): Closure
+    {
+        return function (Request $request) {
+            $url = $request->url();
+
+            if ($url === 'https://api.fastmail.com/jmap/session') {
+                return Http::response([
+                    'capabilities' => ['urn:ietf:params:jmap:core' => [], 'urn:ietf:params:jmap:mail' => [], 'urn:ietf:params:jmap:submission' => []],
+                    'accounts' => ['jmap-submit-a' => ['accountCapabilities' => ['urn:ietf:params:jmap:mail' => [], 'urn:ietf:params:jmap:submission' => []]]],
+                    'apiUrl' => 'https://api.fastmail.com/jmap/api/',
+                    'downloadUrl' => 'https://www.fastmailusercontent.com/jmap/download/{accountId}/{blobId}/{name}?type={type}',
+                    'uploadUrl' => 'https://api.fastmail.com/jmap/upload/{accountId}/',
+                    'state' => 'synthetic-submit-session',
+                ]);
+            }
+
+            if (str_starts_with($url, 'https://www.fastmailusercontent.com/jmap/download/jmap-submit-a/')) {
+                $blobId = rawurldecode(explode('/', substr($url, strlen('https://www.fastmailusercontent.com/jmap/download/jmap-submit-a/')))[0]);
+
+                return Http::response($this->blobs[$blobId] ?? '');
+            }
+
+            $calls = $request->data()['methodCalls'] ?? null;
+            $call = is_array($calls) ? ($calls[0] ?? null) : null;
+            assert(is_array($call) && is_string($call[0]) && is_array($call[1]) && is_string($call[2]));
+            [$method, $arguments, $callId] = $call;
+            /** @var array<string, mixed> $arguments */
+            $this->methods[] = $method;
+            $reply = fn (string $name, array $result): mixed => Http::response([
+                'methodResponses' => [[$name, ['accountId' => 'jmap-submit-a'] + $result, $callId]],
+                'sessionState' => 'synthetic-submit-session',
+            ]);
+
+            return match ($method) {
+                'Mailbox/get' => $reply('Mailbox/get', ['state' => 'mailbox-state', 'notFound' => [], 'list' => [
+                    ['id' => 'mb-inbox', 'name' => 'Inbox', 'role' => 'inbox'],
+                    ['id' => 'mb-drafts', 'name' => 'Drafts', 'role' => 'drafts'],
+                    ['id' => 'mb-sent', 'name' => 'Sent', 'role' => 'sent'],
+                ]]),
+                'Email/get' => (function () use ($arguments, $reply): mixed {
+                    /** @var list<string> $ids */
+                    $ids = $arguments['ids'];
+                    $id = $ids[0];
+                    $email = $this->emails[$id] ?? null;
+
+                    return $email === null
+                        ? $reply('Email/get', ['state' => 'email-state', 'notFound' => [$id], 'list' => []])
+                        : $reply('Email/get', ['state' => 'email-state', 'notFound' => [], 'list' => [[
+                            'id' => $id, 'blobId' => $email['blob'], 'threadId' => 'thread-'.$id,
+                            'mailboxIds' => $email['mailboxIds'], 'keywords' => $email['keywords'],
+                            'messageId' => [DraftContent::messageIdOf($this->blobs[$email['blob']])],
+                        ]]]);
+                })(),
+                'Email/query' => (function () use ($arguments, $reply): mixed {
+                    /** @var array{conditions: array{0: array{inMailbox: string}, 1: array{header: array{0: string, 1: string}}}} $filter */
+                    $filter = $arguments['filter'];
+
+                    return $reply('Email/query', ['queryState' => 'q', 'position' => 0, 'ids' => array_keys(array_filter(
+                        $this->emails,
+                        fn (array $email): bool => isset($email['mailboxIds'][$filter['conditions'][0]['inMailbox']])
+                            && '<'.DraftContent::messageIdOf($this->blobs[$email['blob']]).'>' === $filter['conditions'][1]['header'][1],
+                    ))]);
+                })(),
+                'EmailSubmission/query' => (function () use ($arguments, $reply): mixed {
+                    /** @var array{emailIds: list<string>} $filter */
+                    $filter = $arguments['filter'];
+
+                    return $reply('EmailSubmission/query', ['queryState' => 'q', 'position' => 0, 'ids' => array_keys(array_filter(
+                        $this->submissions,
+                        fn (array $submission): bool => in_array($submission['emailId'], $filter['emailIds'], true),
+                    ))]);
+                })(),
+                'EmailSubmission/get' => (function () use ($arguments, $reply): mixed {
+                    /** @var list<string> $ids */
+                    $ids = $arguments['ids'];
+
+                    return $reply('EmailSubmission/get', ['state' => 's', 'notFound' => [], 'list' => array_map(
+                        fn (string $id): array => ['id' => $id, 'threadId' => 'thread-'.$this->submissions[$id]['emailId']] + $this->submissions[$id],
+                        $ids,
+                    )]);
+                })(),
+                'EmailSubmission/set' => (function () use ($arguments, $callId): mixed {
+                    $this->sends[] = $arguments;
+                    /** @var array{send: array{identityId: string, emailId: string}} $create */
+                    $create = $arguments['create'];
+                    $emailId = $create['send']['emailId'];
+                    $this->submissions['sub-'.count($this->sends)] = ['emailId' => $emailId, 'undoStatus' => 'final'];
+                    /** @var array{'#send': array<string, true|null>} $onSuccess */
+                    $onSuccess = $arguments['onSuccessUpdateEmail'];
+
+                    foreach ($onSuccess['#send'] as $path => $value) {
+                        [$property, $key] = explode('/', $path, 2);
+                        assert($property === 'mailboxIds' || $property === 'keywords');
+
+                        if ($value === null) {
+                            unset($this->emails[$emailId][$property][$key]);
+                        } else {
+                            $this->emails[$emailId][$property][$key] = true;
+                        }
+                    }
+
+                    if ($this->sendStatusAfterApply !== null) {
+                        $status = $this->sendStatusAfterApply;
+                        $this->sendStatusAfterApply = null;
+
+                        return Http::response(['error' => 'synthetic failure'], $status);
+                    }
+
+                    return Http::response(['methodResponses' => [
+                        ['EmailSubmission/set', ['accountId' => 'jmap-submit-a', 'created' => ['send' => ['id' => 'sub-'.count($this->sends)]], 'notCreated' => null], $callId],
+                        ['Email/set', ['accountId' => 'jmap-submit-a', 'updated' => [$emailId => null]], $callId],
+                    ], 'sessionState' => 'synthetic-submit-session']);
+                })(),
+                default => Http::response(['error' => 'synthetic unexpected method'], 418),
+            };
+        };
+    }
+
+    public function put(string $id, string $raw): void
+    {
+        $this->blobs['blob-'.$id] = $raw;
+        $this->emails[$id] = ['blob' => 'blob-'.$id, 'mailboxIds' => ['mb-drafts' => true], 'keywords' => ['$draft' => true, '$seen' => true]];
+    }
+}
+
+function submitBytes(string $messageId, string $from = 'Owner <Owner@Invented.test>'): string
+{
+    return "From: {$from}\r\nTo: friend@invented.test\r\nSubject: Synthetic send\r\nMessage-ID: <{$messageId}>\r\n\r\nSynthetic body.\r\n";
+}
+
+function submitAccount(MailDriver $driver): MailAccount
+{
+    $account = MailAccount::query()->create([
+        'owner_type' => 'synthetic-workspace',
+        'owner_id' => 'owner-a',
+        'driver' => $driver,
+        'provider_account_id' => $driver === MailDriver::Gmail ? 'owner@invented.test' : 'jmap-submit-a',
+    ]);
+    app(MailAccountConnection::class)->store($account, $driver === MailDriver::Gmail
+        ? new OAuthTokenSetCredential('synthetic-submit-access', 'synthetic-submit-refresh', new DateTimeImmutable('+1 hour'), [GmailOAuth::SCOPE])
+        : new ApiTokenCredential('synthetic-submit-jmap-token'));
+    MailIdentity::query()->create(['mail_account_id' => $account->id, 'provider_identity_id' => 'identity-owner', 'email_address' => 'owner@invented.test']);
+    MailIdentity::query()->create(['mail_account_id' => $account->id, 'provider_identity_id' => 'identity-alias', 'email_address' => 'alias@invented.test']);
+
+    return $account;
+}
+
+function submitTarget(MailAccount $account, string $draftId): DraftTarget
+{
+    return new DraftTarget($account->id, $account->owner_type, $account->owner_id, $draftId);
+}
+
+function submitFailure(Closure $write): MailWriteFailure
+{
+    try {
+        $write(app(MailWriteService::class));
+    } catch (MailWriteFailure $failure) {
+        return $failure;
+    }
+
+    throw new RuntimeException('The submission reported success.');
+}
+
+/** @return array{SubmitGmailProvider, SubmitJmapProvider, MailAccount} */
+function submitSetup(MailDriver $driver, string $messageId = 'send-1@invented.test', ?string $from = null): array
+{
+    $gmail = new SubmitGmailProvider;
+    $jmap = new SubmitJmapProvider;
+    $bytes = $from === null ? submitBytes($messageId) : submitBytes($messageId, $from);
+    $gmail->drafts['d-1'] = ['message' => 'm-1', 'thread' => 't-1', 'raw' => $bytes];
+    $jmap->put('d-1', $bytes);
+    $gmailHandler = $gmail->handler();
+    $jmapHandler = $jmap->handler();
+    Http::fake(fn (Request $request) => str_contains($request->url(), 'fastmail') ? $jmapHandler($request) : $gmailHandler($request));
+
+    return [$gmail, $jmap, submitAccount($driver)];
+}
+
+beforeEach(function (): void {
+    putenv('MAIL_MIRROR_GMAIL_CLIENT_SECRET=synthetic-submit-client-secret');
+    config()->set('mail-mirror.gmail.enabled', true);
+    config()->set('mail-mirror.gmail.client_id', 'synthetic-submit-client.apps.example.test');
+    config()->set('mail-mirror.jmap.enabled', true);
+    config()->set('mail-mirror.writes.enabled', true);
+    Http::preventStrayRequests();
+});
+
+afterEach(function (): void {
+    putenv('MAIL_MIRROR_GMAIL_CLIENT_SECRET');
+});
+
+it('sends a Gmail draft with exactly one drafts.send and returns the confirmed sent message', function (): void {
+    [$gmail, , $account] = submitSetup(MailDriver::Gmail);
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
+
+    $result = $service->submit(submitTarget($account, 'd-1'), $revision);
+
+    expect($result->outcome)->toBe(SubmissionOutcome::Submitted)
+        ->and($result->providerMessageId)->toBe('sent-m-1')
+        ->and($result->threadId)->toBe('t-1')
+        ->and($result->matchedBy)->toBe('provider_id')
+        ->and($gmail->sends)->toBe([['id' => 'd-1']])
+        ->and($gmail->drafts)->toBe([])
+        ->and(array_slice($gmail->paths, -2))->toBe(['POST /gmail/v1/users/me/drafts/send', 'GET /gmail/v1/users/me/messages/sent-m-1']);
+});
+
+it('sends a JMAP draft with one EmailSubmission/set that moves it from Drafts to Sent without $draft', function (): void {
+    [, $jmap, $account] = submitSetup(MailDriver::Jmap);
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
+
+    $result = $service->submit(submitTarget($account, 'd-1'), $revision);
+
+    expect($result->outcome)->toBe(SubmissionOutcome::Submitted)
+        ->and($result->providerMessageId)->toBe('d-1')
+        ->and($result->threadId)->toBe('thread-d-1')
+        ->and($jmap->sends)->toBe([[
+            'accountId' => 'jmap-submit-a',
+            'create' => ['send' => ['identityId' => 'identity-owner', 'emailId' => 'd-1']],
+            'onSuccessUpdateEmail' => ['#send' => ['mailboxIds/mb-drafts' => null, 'mailboxIds/mb-sent' => true, 'keywords/$draft' => null]],
+        ]])
+        ->and($jmap->emails['d-1']['mailboxIds'])->toBe(['mb-sent' => true])
+        ->and($jmap->emails['d-1']['keywords'])->toBe(['$seen' => true]);
+});
+
+it('sends nothing when the draft revision is stale', function (MailDriver $driver): void {
+    [$gmail, $jmap, $account] = submitSetup($driver);
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
+    $gmail->drafts['d-1'] = ['message' => 'm-edited', 'thread' => 't-1', 'raw' => submitBytes('send-1@invented.test', 'owner@invented.test')];
+    $jmap->blobs['blob-d-1'] = submitBytes('send-1@invented.test', 'owner@invented.test');
+
+    $failure = submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision));
+
+    expect($failure->safeCode)->toBe(MailWriteCode::StaleRevision)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and($gmail->sends)->toBe([])
+        ->and($jmap->sends)->toBe([]);
+})->with([MailDriver::Gmail, MailDriver::Jmap]);
+
+it('refuses a From address that does not match exactly one identity before any submission request', function (MailDriver $driver, string $from): void {
+    [$gmail, $jmap, $account] = submitSetup($driver, 'identity@invented.test', $from);
+    MailIdentity::query()->create(['mail_account_id' => $account->id, 'provider_identity_id' => 'identity-dup', 'email_address' => 'DUP@invented.test']);
+    MailIdentity::query()->create(['mail_account_id' => $account->id, 'provider_identity_id' => 'identity-dup-2', 'email_address' => 'dup@invented.test']);
+    $other = MailAccount::query()->create(['owner_type' => 'synthetic-workspace', 'owner_id' => 'owner-a', 'driver' => $driver, 'provider_account_id' => 'other-account']);
+    MailIdentity::query()->create(['mail_account_id' => $other->id, 'provider_identity_id' => 'identity-other', 'email_address' => 'other-account@invented.test']);
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
+
+    $failure = submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision));
+
+    expect($failure->safeCode)->toBe(MailWriteCode::IdentityMismatch)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and($gmail->sends)->toBe([])
+        ->and($jmap->sends)->toBe([])
+        ->and(array_filter($gmail->paths, fn (string $path): bool => str_starts_with($path, 'POST')))->toBe([]);
+})->with([MailDriver::Gmail, MailDriver::Jmap])->with([
+    'an address with no identity' => ['Stranger <stranger@invented.test>'],
+    'an address with two identities' => ['dup@invented.test'],
+    'two From mailboxes' => ['owner@invented.test, alias@invented.test'],
+    'another account\'s identity' => ['other-account@invented.test'],
+]);
+
+it('matches the identity address through display names, quotes, and case', function (): void {
+    [$gmail, , $account] = submitSetup(MailDriver::Gmail, 'quoted@invented.test', '"Owner, Alias <x@y>" (work) <ALIAS@invented.test>');
+    $service = app(MailWriteService::class);
+
+    expect($service->submit(submitTarget($account, 'd-1'), $service->draft(submitTarget($account, 'd-1'))->revision)->outcome)
+        ->toBe(SubmissionOutcome::Submitted)
+        ->and($gmail->sends)->toHaveCount(1);
+});
+
+it('never sends again after a possibly sent submit and reconciles it from provider reads', function (MailDriver $driver): void {
+    [$gmail, $jmap, $account] = submitSetup($driver);
+    $gmail->sendStatusAfterApply = 503;
+    $jmap->sendStatusAfterApply = 503;
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
+
+    $failure = submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision));
+    $requests = count(Http::recorded());
+    $retry = submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision));
+
+    expect($failure->writeSent)->toBeTrue()
+        ->and($retry->safeCode)->toBe(MailWriteCode::SubmissionUnknown)
+        ->and($retry->writeSent)->toBeFalse()
+        ->and(count(Http::recorded()))->toBe($requests);
+
+    $reconciled = $service->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test');
+
+    expect($reconciled->outcome)->toBe(SubmissionOutcome::Submitted)
+        ->and($reconciled->providerMessageId)->toBe($driver === MailDriver::Gmail ? 'sent-m-1' : 'd-1')
+        ->and($reconciled->matchedBy)->toBe($driver === MailDriver::Gmail ? 'message_id' : 'provider_id')
+        ->and($driver === MailDriver::Gmail ? $gmail->sends : $jmap->sends)->toHaveCount(1)
+        ->and(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->safeCode)->toBe(MailWriteCode::DraftNotFound)
+        ->and($driver === MailDriver::Gmail ? $gmail->sends : $jmap->sends)->toHaveCount(1);
+})->with([MailDriver::Gmail, MailDriver::Jmap]);
+
+it('reports not_submitted only while the draft still exists at the expected revision, then allows a new submit', function (MailDriver $driver): void {
+    [$gmail, $jmap, $account] = submitSetup($driver);
+    $gmail->sendStatusBeforeApply = 503;
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
+
+    if ($driver === MailDriver::Gmail) {
+        expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->writeSent)->toBeTrue()
+            // The draft still exists, but the uncertain send blocks another until reconciled.
+            ->and(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->safeCode)->toBe(MailWriteCode::SubmissionUnknown)
+            ->and($gmail->sends)->toHaveCount(1);
+    }
+
+    $reconciled = $service->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test');
+
+    expect($reconciled->outcome)->toBe(SubmissionOutcome::NotSubmitted)
+        ->and($reconciled->providerEvidence)->toBe(['draft_exists' => true, 'draft_at_expected_revision' => true])
+        ->and($service->submit(submitTarget($account, 'd-1'), $revision)->outcome)->toBe(SubmissionOutcome::Submitted)
+        ->and($driver === MailDriver::Gmail ? $gmail->sends : $jmap->sends)->toHaveCount($driver === MailDriver::Gmail ? 2 : 1);
+})->with([MailDriver::Gmail, MailDriver::Jmap]);
+
+it('reports unknown, never not_submitted, when the Gmail draft is gone and the sent copy has another Message-ID', function (): void {
+    [$gmail, , $account] = submitSetup(MailDriver::Gmail);
+    $gmail->sendStatusAfterApply = 503;
+    // Gmail stored the sent copy under a Message-ID of its own.
+    $gmail->sentMessageIdHeader = '<rewritten-by-provider@mail.invented.test>';
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
+
+    expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->writeSent)->toBeTrue();
+
+    $reconciled = $service->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test');
+
+    expect($reconciled->outcome)->toBe(SubmissionOutcome::Unknown)
+        ->and($reconciled->providerEvidence)->toBe(['draft_exists' => false, 'draft_at_expected_revision' => false])
+        // Unknown keeps the submit blocked.
+        ->and(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->safeCode)->toBe(MailWriteCode::SubmissionUnknown)
+        ->and($gmail->sends)->toHaveCount(1);
+});
+
+it('reports unknown when the draft changed and nothing matched', function (MailDriver $driver): void {
+    [$gmail, $jmap, $account] = submitSetup($driver);
+    $revision = app(MailWriteService::class)->draft(submitTarget($account, 'd-1'))->revision;
+    $gmail->drafts['d-1']['raw'] = submitBytes('send-1@invented.test', 'owner@invented.test');
+    unset($jmap->emails['d-1']);
+
+    expect(app(MailWriteService::class)->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test')->outcome)
+        ->toBe(SubmissionOutcome::Unknown);
+})->with([MailDriver::Gmail, MailDriver::Jmap]);
+
+it('treats a Gmail Message-ID match while the draft still exists as unknown', function (): void {
+    [$gmail, , $account] = submitSetup(MailDriver::Gmail);
+    $gmail->messages['sent-elsewhere'] = ['thread' => 't-9', 'labels' => ['SENT'], 'messageIdHeader' => '<send-1@invented.test>'];
+    $revision = app(MailWriteService::class)->draft(submitTarget($account, 'd-1'))->revision;
+
+    $result = app(MailWriteService::class)->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test');
+
+    expect($result->outcome)->toBe(SubmissionOutcome::Unknown)
+        ->and($result->matchedBy)->toBe('message_id');
+});
+
+it('reconciles JMAP by EmailSubmission on the email ID, ignoring canceled submissions', function (string $undoStatus, SubmissionOutcome $outcome): void {
+    [, $jmap, $account] = submitSetup(MailDriver::Jmap);
+    $jmap->submissions['sub-x'] = ['emailId' => 'd-1', 'undoStatus' => $undoStatus];
+    $revision = app(MailWriteService::class)->draft(submitTarget($account, 'd-1'))->revision;
+
+    $result = app(MailWriteService::class)->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test');
+
+    expect($result->outcome)->toBe($outcome)
+        ->and($jmap->sends)->toBe([])
+        ->and($jmap->methods)->toContain('EmailSubmission/query');
+})->with([
+    'pending, while the email is still a draft' => ['pending', SubmissionOutcome::Submitted],
+    'final' => ['final', SubmissionOutcome::Submitted],
+    'canceled' => ['canceled', SubmissionOutcome::NotSubmitted],
+]);
+
+it('refuses submit with writes_disabled before any request while the switch is off', function (): void {
+    config()->set('mail-mirror.writes.enabled', false);
+    Http::fake();
+    $account = submitAccount(MailDriver::Gmail);
+
+    expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), str_repeat('0', 64)))->safeCode)
+        ->toBe(MailWriteCode::WritesDisabled);
+    Http::assertNothingSent();
+});
+
+it('rejects an owner mismatch for submit and reconcile with zero provider requests', function (): void {
+    Http::fake();
+    $account = submitAccount(MailDriver::Jmap);
+
+    expect(fn () => app(MailWriteService::class)->submit(new DraftTarget($account->id, 'synthetic-workspace', 'owner-b', 'd-1'), str_repeat('0', 64)))
+        ->toThrow(AccountResourceMismatch::class)
+        ->and(fn () => app(MailWriteService::class)->reconcileSubmission(new DraftTarget($account->id, null, null, 'd-1'), str_repeat('0', 64), 'm@invented.test'))
+        ->toThrow(AccountResourceMismatch::class);
+    Http::assertNothingSent();
+});

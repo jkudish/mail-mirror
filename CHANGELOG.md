@@ -43,9 +43,20 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the Drafts role with `$draft` and `$seen`; a replace imports the new email
   and, only after it is created, destroys the old one, each guarded by
   `ifInState`, and a retry finishes an interrupted replace.
+- `MailWriteService::submit()` sends one draft exactly once, only at the
+  expected revision and only when its single From address matches exactly one
+  mirrored identity (`identity_mismatch` otherwise). Gmail sends one
+  `drafts.send`; JMAP sends one `EmailSubmission/set` with `identityId` and
+  `onSuccessUpdateEmail` (Drafts to Sent, `$draft` removed). Neither retries
+  transport, and success is confirmed by re-reading the sent message.
+- `MailWriteService::reconcileSubmission()` answers `submitted`,
+  `not_submitted`, or `unknown` (`SubmissionOutcome`) from provider reads only.
+  A possibly sent submit blocks further submits of that draft with
+  `submission_unknown` until reconciliation gives a definite answer.
 - `mail-mirror.writes.max_draft_bytes` (25 MiB) and draft codes
   `invalid_draft`, `draft_too_large`, `draft_not_found`, `stale_revision`,
-  `revision_conflict`, and `message_id_conflict`.
+  `revision_conflict`, `message_id_conflict`, `identity_mismatch`, and
+  `submission_unknown`.
 - Write codes `writes_disabled`, `already_in_state` (the destination state
   already held and this package recorded no intent for it),
   `unsupported_container` (a Gmail system label or JMAP role mailbox passed as

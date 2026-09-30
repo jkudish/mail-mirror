@@ -12,6 +12,8 @@ use Jkudish\MailMirror\Enums\MailDriver;
  * token a caller passes back to replace, delete, or submit this exact draft;
  * it changes whenever the provider message or its raw bytes change.
  *
+ * $fromAddress is the lower-cased single From address, or null.
+ *
  * Gmail keeps the draft ID across updates and changes the message ID. JMAP
  * emails are immutable, so the draft ID is the email ID and changes on replace.
  */
@@ -29,6 +31,7 @@ final readonly class DraftRevision
         public string $threadId,
         public string $rawSha256,
         public array $providerEvidence,
+        public ?string $fromAddress = null,
     ) {
         foreach ([$draftId, $providerMessageId, $threadId] as $id) {
             if (trim($id) === '' || mb_strlen($id) > 255) {

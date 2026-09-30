@@ -594,6 +594,49 @@ A JMAP replace interrupted after the import and before the destroy leaves both
 drafts. Retrying the same replace with the same revision and bytes finishes it:
 it destroys the old draft without importing again.
 
+## Send a draft
+
+Approve the send in your application first, and keep your own durable record
+of the attempt; MailMirror keeps no send history. Then submit the draft at the
+revision the approver saw:
+
+```php
+$result = $writes->submit(new DraftTarget($account->id, $account->owner_type, $account->owner_id, $draft->draftId), $draft->revision);
+
+$result->outcome;           // SubmissionOutcome::Submitted
+$result->providerMessageId; // the sent message (Gmail) or email (JMAP)
+$result->threadId;
+```
+
+Before sending, MailMirror re-reads the draft under the draft lock. A changed
+revision fails `stale_revision`. The draft's single From address must match,
+case-insensitively, exactly one identity mirrored for the account by the last
+import; otherwise the call fails `identity_mismatch` before any submission
+request. Gmail sends one `drafts.send`, which deletes the draft. JMAP sends one
+`EmailSubmission/set` with that identity's `identityId` and
+`onSuccessUpdateEmail`, which moves the email from Drafts to Sent and removes
+`$draft`. Neither request is retried. `Submitted` is returned only after a
+re-read shows the message sent.
+
+When a submit fails with `writeSent` true, the provider may have sent it.
+MailMirror records that and refuses every later `submit()` of the draft with
+`submission_unknown`, without any provider request. Call
+`reconcileSubmission($target, $revision, $messageId)`; it only reads:
+
+| Evidence | Outcome |
+| --- | --- |
+| JMAP `EmailSubmission` for the email ID, `pending` or `final` | `submitted` (`matchedBy` `provider_id`) |
+| Sent message with the Message-ID, draft gone or changed | `submitted` (`matchedBy` `message_id`) |
+| Sent message with the Message-ID, draft still at the revision | `unknown` |
+| No match, draft still at the revision | `not_submitted` |
+| No match, draft gone or changed | `unknown` |
+
+`not_submitted` is never inferred from a missing Message-ID match alone, so a
+provider that rewrites Message-IDs yields `unknown`, not a second send.
+`submitted` and `not_submitted` clear the recorded attempt, after which a new
+`submit()` is allowed; `unknown` keeps it. Treat `unknown` as needing a human
+decision, and never re-send on it.
+
 ### Concurrency and cache dependencies
 
 Writes use your application's default cache store for both the per-message lock

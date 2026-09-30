@@ -12,8 +12,8 @@ use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Date;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Contracts\BudgetedDeltaMailboxReader;
-use Jkudish\MailMirror\Contracts\DraftDriver;
 use Jkudish\MailMirror\Contracts\MailboxMutationDriver;
+use Jkudish\MailMirror\Contracts\SubmissionDriver;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
 use Jkudish\MailMirror\Enums\MailboxAction;
@@ -21,6 +21,7 @@ use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
 use Jkudish\MailMirror\Enums\MailWriteCode;
+use Jkudish\MailMirror\Enums\SubmissionOutcome;
 use Jkudish\MailMirror\Exceptions\DeltaRepairRequired;
 use Jkudish\MailMirror\Exceptions\GmailAuthorizationException;
 use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
@@ -29,6 +30,7 @@ use Jkudish\MailMirror\Exceptions\MailWriteFailure;
 use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAccountCredential;
+use Jkudish\MailMirror\Models\MailIdentity;
 use Jkudish\MailMirror\Read\AccountProfile;
 use Jkudish\MailMirror\Read\ChangedMessageState;
 use Jkudish\MailMirror\Read\InventoryPage;
@@ -45,11 +47,12 @@ use Jkudish\MailMirror\Write\DraftContent;
 use Jkudish\MailMirror\Write\DraftRevision;
 use Jkudish\MailMirror\Write\MailboxChange;
 use Jkudish\MailMirror\Write\MessageState;
+use Jkudish\MailMirror\Write\SubmissionResult;
 use Throwable;
 use ZBateson\MailMimeParser\Header\AddressHeader;
 use ZBateson\MailMimeParser\MailMimeParser;
 
-final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDriver, MailboxMutationDriver
+final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMutationDriver, SubmissionDriver
 {
     private const API = 'https://gmail.googleapis.com/gmail/v1';
 
@@ -811,6 +814,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDrive
                 $threadId,
                 hash('sha256', $bytes),
                 ['label_ids' => $labelIds],
+                DraftContent::fromAddressOf($bytes),
             );
         } catch (InvalidArgumentException) {
             throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
@@ -857,7 +861,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDrive
         foreach (array_keys($this->draftIds($native)) as $draftId) {
             $draft = $this->draft($account, $draftId);
 
-            if ($draft !== null && $this->sameContentIdentity($draft, $messageId, null)) {
+            if ($draft !== null && $this->sameContentIdentity($draft->messageId, null, $messageId, null)) {
                 $drafts[] = $draft;
             }
         }
@@ -867,7 +871,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDrive
 
     public function holdsContent(DraftRevision $draft, DraftContent $content): bool
     {
-        return $this->sameContentIdentity($draft, $content->messageId, $content->sha256);
+        return $this->sameContentIdentity($draft->messageId, $draft->rawSha256, $content->messageId, $content->sha256);
     }
 
     /**
@@ -875,11 +879,13 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDrive
      * Gmail (#3131): drafts.get format=raw returns exactly the bytes written,
      * including the client Message-ID. If Gmail rewrites either, every Gmail
      * create and replace reports unconfirmed or revision_conflict, and draft
-     * lookups by Message-ID find nothing; change only this method.
+     * lookups by Message-ID find nothing; change only this method. Submission
+     * reconciliation reports not_submitted only from the draft itself, never
+     * from a missing Message-ID match, so a rewrite there yields unknown.
      */
-    private function sameContentIdentity(DraftRevision $draft, string $messageId, ?string $sha256): bool
+    private function sameContentIdentity(?string $observedMessageId, ?string $observedSha256, string $messageId, ?string $sha256): bool
     {
-        return $draft->messageId === $messageId && ($sha256 === null || $draft->rawSha256 === $sha256);
+        return $observedMessageId === $messageId && ($sha256 === null || $observedSha256 === $sha256);
     }
 
     public function stageDraft(MailAccount $account, DraftContent $content): ?string
@@ -937,6 +943,100 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDrive
         $this->assertDraft($account, $observed);
         $this->credential($account, null);
         $this->sendDraftWrite($account, 'DELETE', self::API.'/users/me/drafts/'.rawurlencode($observed->draftId), null);
+    }
+
+    /** drafts.send sends the draft's stored bytes and deletes the draft on success. */
+    public function submitDraft(MailAccount $account, DraftRevision $observed, MailIdentity $identity): string
+    {
+        $this->assertAccount($account);
+        $this->assertDraft($account, $observed);
+
+        if ($identity->mail_account_id !== $account->id) {
+            throw new MailWriteFailure(MailWriteCode::IdentityMismatch);
+        }
+
+        $this->credential($account, null);
+        $native = $this->sendDraftWrite($account, 'POST', self::API.'/users/me/drafts/send', ['id' => $observed->draftId]);
+        $messageId = $native['id'] ?? null;
+
+        return is_string($messageId) && $messageId !== '' && mb_strlen($messageId) <= 255
+            ? $messageId
+            : throw new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
+    }
+
+    public function sentMessage(MailAccount $account, string $providerMessageId): ?SubmissionResult
+    {
+        $this->assertAccount($account);
+
+        try {
+            $native = $this->request($account, 'GET', self::API.'/users/me/messages/'.rawurlencode($providerMessageId), ['format' => 'minimal']);
+        } catch (MailImportFailure $failure) {
+            if ($failure->httpStatus === 404) {
+                return null;
+            }
+
+            throw $failure;
+        }
+
+        $threadId = $native['threadId'] ?? null;
+        $labelIds = $native['labelIds'] ?? null;
+
+        if (($native['id'] ?? null) !== $providerMessageId || ! is_string($threadId) || $threadId === ''
+            || ! is_array($labelIds) || array_filter($labelIds, fn (mixed $labelId): bool => ! is_string($labelId)) !== []) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+        }
+
+        if (! in_array('SENT', $labelIds, true) || in_array('DRAFT', $labelIds, true)) {
+            return null;
+        }
+
+        return new SubmissionResult($account->id, MailDriver::Gmail, SubmissionOutcome::Submitted, $providerMessageId, $threadId, 'provider_id', [
+            'label_ids' => array_values($labelIds),
+        ]);
+    }
+
+    /**
+     * Gmail keeps no link from a sent message to the draft it came from, so the
+     * only evidence is a SENT message whose Message-ID header matches.
+     */
+    public function findSubmission(MailAccount $account, string $draftId, string $messageId): ?SubmissionResult
+    {
+        $this->assertAccount($account);
+        $native = $this->request($account, 'GET', self::API.'/users/me/messages', [
+            'q' => 'rfc822msgid:'.$messageId,
+            'labelIds' => 'SENT',
+            'maxResults' => 10,
+        ]);
+        $messages = $native['messages'] ?? [];
+
+        if (! is_array($messages) || ! array_is_list($messages)) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+        }
+
+        foreach ($messages as $message) {
+            $id = is_array($message) ? ($message['id'] ?? null) : null;
+
+            if (! is_string($id) || $id === '') {
+                throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+            }
+
+            $metadata = $this->request($account, 'GET', self::API.'/users/me/messages/'.rawurlencode($id), [
+                'format' => 'metadata',
+                'metadataHeaders' => 'Message-ID',
+            ]);
+            $threadId = $metadata['threadId'] ?? null;
+            $labelIds = $metadata['labelIds'] ?? [];
+            $header = $this->headerValue($this->headers($metadata), 'Message-ID');
+
+            if (is_string($threadId) && $threadId !== '' && is_array($labelIds) && in_array('SENT', $labelIds, true)
+                && $header !== null && $this->sameContentIdentity(DraftContent::parseMessageId($header), null, $messageId, null)) {
+                return new SubmissionResult($account->id, MailDriver::Gmail, SubmissionOutcome::Submitted, $id, $threadId, 'message_id', [
+                    'label_ids' => array_values(array_filter($labelIds, 'is_string')),
+                ]);
+            }
+        }
+
+        return null;
     }
 
     /**

@@ -11,13 +11,16 @@ use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Support\Facades\Date;
 use Jkudish\MailMirror\Contracts\DraftDriver;
 use Jkudish\MailMirror\Contracts\MailboxMutationDriver;
+use Jkudish\MailMirror\Contracts\SubmissionDriver;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailWriteCode;
 use Jkudish\MailMirror\Enums\MailWriteOutcome;
+use Jkudish\MailMirror\Enums\SubmissionOutcome;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
 use Jkudish\MailMirror\Models\MailAccount;
+use Jkudish\MailMirror\Models\MailIdentity;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
 use LogicException;
 use Throwable;
@@ -433,6 +436,156 @@ final readonly class MailWriteService
                 return $this->draftResult($account, MailWriteOutcome::Applied, null);
             },
         );
+    }
+
+    /**
+     * Send one draft exactly once, only while it still has $expectedRevision
+     * and its From address matches exactly one mirrored provider identity.
+     *
+     * A submit that may have been sent records an intent; until
+     * reconcileSubmission() answers submitted or not_submitted, every later
+     * submit of that draft fails submission_unknown without any provider
+     * request. MailMirror never re-sends on its own. Durable approval and
+     * at-most-once across processes belong to the consumer.
+     *
+     * @throws AccountResourceMismatch before any provider request
+     * @throws MailWriteFailure
+     */
+    public function submit(DraftTarget $target, string $expectedRevision): SubmissionResult
+    {
+        $this->assertWritesEnabled();
+        $account = $this->account($target);
+        $driver = $this->submissionDriver($account);
+        $draftKey = $this->draftKey($account, $target->draftId);
+        $intent = $draftKey.':intent:submit';
+
+        return $this->withLock(
+            $account,
+            $draftKey.':write-lock',
+            function (\DateTimeInterface $sendBy, int $sendSeconds) use ($driver, $account, $target, $expectedRevision, $intent): SubmissionResult {
+                if ($this->cache->get($intent) !== null) {
+                    throw new MailWriteFailure(MailWriteCode::SubmissionUnknown);
+                }
+
+                $current = $this->readDraft($driver, $account, $target->draftId)
+                    ?? throw new MailWriteFailure(MailWriteCode::DraftNotFound);
+
+                if ($current->revision !== $expectedRevision) {
+                    throw new MailWriteFailure(MailWriteCode::StaleRevision);
+                }
+
+                $identity = $this->identityFor($account, $current);
+                $this->prepareDraftWrite($driver, $account, $sendSeconds, $sendBy, null);
+
+                try {
+                    $sentMessageId = $driver->submitDraft($account, $current, $identity);
+                } catch (MailImportFailure $failure) {
+                    throw MailWriteFailure::fromProvider($failure, false);
+                } catch (MailWriteFailure $failure) {
+                    if ($failure->writeSent) {
+                        $this->cache->put($intent, $current->revision, $this->intentTtl());
+                    }
+
+                    throw $failure;
+                }
+
+                $this->cache->put($intent, $current->revision, $this->intentTtl());
+                $sent = $this->confirmingRead(fn () => $driver->sentMessage($account, $sentMessageId));
+
+                if (! $sent instanceof SubmissionResult || $sent->outcome !== SubmissionOutcome::Submitted
+                    || $sent->mailAccountId !== $account->id || $sent->driver !== $account->driver) {
+                    throw new MailWriteFailure(MailWriteCode::Unconfirmed, true);
+                }
+
+                // Confirmed sent: the draft no longer exists, so nothing can submit it again.
+                $this->cache->forget($intent);
+
+                return $sent;
+            },
+        );
+    }
+
+    /**
+     * Answer from provider reads only whether draft $target, read earlier at
+     * $expectedRevision with Message-ID $messageId, was submitted.
+     *
+     * - Evidence linked to the draft's own provider ID means submitted.
+     * - A Message-ID match alone means submitted only when the draft is gone,
+     *   and unknown while the draft still exists at the expected revision.
+     * - No match means not_submitted only while the draft still exists at the
+     *   expected revision, because a successful send removes the draft;
+     *   otherwise unknown. Absence of a Message-ID match alone never means
+     *   not_submitted.
+     *
+     * Submitted and not_submitted clear a pending submit intent; unknown keeps it.
+     *
+     * @throws AccountResourceMismatch before any provider request
+     * @throws MailWriteFailure
+     */
+    public function reconcileSubmission(DraftTarget $target, string $expectedRevision, string $messageId): SubmissionResult
+    {
+        $account = $this->account($target);
+        $driver = $this->submissionDriver($account);
+        $draftKey = $this->draftKey($account, $target->draftId);
+
+        return $this->withLock(
+            $account,
+            $draftKey.':write-lock',
+            function () use ($driver, $account, $target, $expectedRevision, $messageId, $draftKey): SubmissionResult {
+                $draft = $this->readDraft($driver, $account, $target->draftId);
+                $draftUnsent = $draft !== null && $draft->revision === $expectedRevision;
+
+                try {
+                    $found = $driver->findSubmission($account, $target->draftId, $messageId);
+                } catch (MailImportFailure $failure) {
+                    throw MailWriteFailure::fromProvider($failure, false);
+                }
+
+                if ($found !== null && ($found->mailAccountId !== $account->id || $found->driver !== $account->driver
+                    || $found->outcome !== SubmissionOutcome::Submitted)) {
+                    throw new AccountResourceMismatch('The provider submission does not belong to the supplied account.');
+                }
+
+                if ($found !== null && ($found->matchedBy === 'provider_id' || ! $draftUnsent)) {
+                    $this->cache->forget($draftKey.':intent:submit');
+
+                    return $found;
+                }
+
+                $outcome = $found === null && $draftUnsent ? SubmissionOutcome::NotSubmitted : SubmissionOutcome::Unknown;
+
+                if ($outcome === SubmissionOutcome::NotSubmitted) {
+                    $this->cache->forget($draftKey.':intent:submit');
+                }
+
+                return new SubmissionResult($account->id, $account->driver, $outcome, null, null, $found?->matchedBy, [
+                    'draft_exists' => $draft !== null,
+                    'draft_at_expected_revision' => $draftUnsent,
+                ]);
+            },
+        );
+    }
+
+    private function submissionDriver(MailAccount $account): SubmissionDriver
+    {
+        $driver = $this->drivers->reader($account->driver);
+
+        return $driver instanceof SubmissionDriver ? $driver : throw new MailWriteFailure(MailWriteCode::UnsupportedDriver);
+    }
+
+    /** The one mirrored identity whose address is the draft's single From address. */
+    private function identityFor(MailAccount $account, DraftRevision $draft): MailIdentity
+    {
+        $from = $draft->fromAddress;
+        $matches = $from === null ? [] : MailIdentity::query()
+            ->forAccount($account)
+            ->get()
+            ->filter(fn (MailIdentity $identity): bool => $identity->email_address !== null
+                && strtolower($identity->email_address) === $from)
+            ->values()
+            ->all();
+
+        return count($matches) === 1 ? $matches[0] : throw new MailWriteFailure(MailWriteCode::IdentityMismatch);
     }
 
     private function draftDriver(MailAccount $account): DraftDriver
