@@ -621,7 +621,12 @@ re-read shows the message sent.
 When a submit fails with `writeSent` true, the provider may have sent it.
 MailMirror records that and refuses every later `submit()` of the draft with
 `submission_unknown`, without any provider request. Call
-`reconcileSubmission($target, $revision, $messageId)`; it only reads:
+`reconcileSubmission($target, $revision, $messageId)`; it only reads.
+The record lives in the cache; if it is evicted, `submit()` still refuses with
+`submission_unknown` when the provider links a submission to the draft's ID
+(a JMAP `EmailSubmission`), so a draft left in Drafts after an accepted
+submission is never sent twice. Every submit makes that one read first.
+Reconciliation uses this evidence:
 
 | Evidence | Outcome |
 | --- | --- |

@@ -1162,7 +1162,7 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
      * one does not count. Only without one does a Sent-role email with the
      * Message-ID count, as weaker evidence.
      */
-    public function findSubmission(MailAccount $account, string $draftId, string $messageId): ?SubmissionResult
+    public function findSubmission(MailAccount $account, string $draftId, ?string $messageId): ?SubmissionResult
     {
         $this->assertAccount($account);
         $session = $this->session($account);
@@ -1196,6 +1196,10 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
                     );
                 }
             }
+        }
+
+        if ($messageId === null) {
+            return null;
         }
 
         $sentMailboxId = $this->mailboxWithRole($this->fetchMailboxes($account, $session)['mailboxes'], 'sent');

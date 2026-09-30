@@ -445,7 +445,8 @@ final readonly class MailWriteService
      * A submit that may have been sent records an intent; until
      * reconcileSubmission() answers submitted or not_submitted, every later
      * submit of that draft fails submission_unknown without any provider
-     * request. MailMirror never re-sends on its own. Durable approval and
+     * request. If that cache intent is lost, a provider submission linked to
+     * the draft's ID still refuses the send with submission_unknown. MailMirror never re-sends on its own. Durable approval and
      * at-most-once across processes belong to the consumer.
      *
      * @throws AccountResourceMismatch before any provider request
@@ -475,6 +476,20 @@ final readonly class MailWriteService
                 }
 
                 $identity = $this->identityFor($account, $current);
+
+                // The cache intent can be evicted. A submission the provider links to this
+                // draft means an earlier send was accepted even if the draft never left
+                // Drafts (JMAP onSuccessUpdateEmail not applied), so never send again.
+                try {
+                    $earlier = $driver->findSubmission($account, $current->draftId, $current->messageId);
+                } catch (MailImportFailure $failure) {
+                    throw MailWriteFailure::fromProvider($failure, false);
+                }
+
+                if ($earlier !== null && $earlier->matchedBy === 'provider_id') {
+                    throw new MailWriteFailure(MailWriteCode::SubmissionUnknown);
+                }
+
                 $this->prepareDraftWrite($driver, $account, $sendSeconds, $sendBy, null);
 
                 try {

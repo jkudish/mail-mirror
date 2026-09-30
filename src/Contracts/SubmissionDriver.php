@@ -40,6 +40,7 @@ interface SubmissionDriver extends DraftDriver
     /**
      * Look for evidence that draft $draftId, whose Message-ID is $messageId, was
      * submitted: a Submitted result naming how it matched, or null. Reads only.
+     * A null $messageId limits the search to evidence linked to the draft ID.
      */
-    public function findSubmission(MailAccount $account, string $draftId, string $messageId): ?SubmissionResult;
+    public function findSubmission(MailAccount $account, string $draftId, ?string $messageId): ?SubmissionResult;
 }

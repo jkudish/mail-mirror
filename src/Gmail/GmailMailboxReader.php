@@ -999,9 +999,13 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
      * Gmail keeps no link from a sent message to the draft it came from, so the
      * only evidence is a SENT message whose Message-ID header matches.
      */
-    public function findSubmission(MailAccount $account, string $draftId, string $messageId): ?SubmissionResult
+    public function findSubmission(MailAccount $account, string $draftId, ?string $messageId): ?SubmissionResult
     {
         $this->assertAccount($account);
+
+        if ($messageId === null) {
+            return null;
+        }
         $native = $this->request($account, 'GET', self::API.'/users/me/messages', [
             'q' => 'rfc822msgid:'.$messageId,
             'labelIds' => 'SENT',

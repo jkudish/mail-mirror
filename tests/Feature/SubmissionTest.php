@@ -144,6 +144,9 @@ final class SubmitJmapProvider
 
     public ?int $sendStatusAfterApply = null;
 
+    /** Accept the submission but leave the email in Drafts, as if onSuccessUpdateEmail never applied. */
+    public bool $skipOnSuccess = false;
+
     /** @return Closure(Request): mixed */
     public function handler(): Closure
     {
@@ -235,7 +238,7 @@ final class SubmitJmapProvider
                     /** @var array{'#send': array<string, true|null>} $onSuccess */
                     $onSuccess = $arguments['onSuccessUpdateEmail'];
 
-                    foreach ($onSuccess['#send'] as $path => $value) {
+                    foreach ($this->skipOnSuccess ? [] : $onSuccess['#send'] as $path => $value) {
                         [$property, $key] = explode('/', $path, 2);
                         assert($property === 'mailboxIds' || $property === 'keywords');
 
@@ -540,4 +543,28 @@ it('rejects an owner mismatch for submit and reconcile with zero provider reques
         ->and(fn () => app(MailWriteService::class)->reconcileSubmission(new DraftTarget($account->id, null, null, 'd-1'), str_repeat('0', 64), 'm@invented.test'))
         ->toThrow(AccountResourceMismatch::class);
     Http::assertNothingSent();
+});
+
+it('never sends a second JMAP submission after the submit intent is evicted', function (): void {
+    [, $jmap, $account] = submitSetup(MailDriver::Jmap);
+    $jmap->skipOnSuccess = true;
+    $jmap->sendStatusAfterApply = 503;
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
+
+    expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->writeSent)->toBeTrue();
+
+    // The submission was accepted, but the email stayed a draft at the same revision.
+    expect($service->draft(submitTarget($account, 'd-1'))->revision)->toBe($revision);
+
+    // The cache evicts the recorded attempt.
+    cache()->flush();
+    $failure = submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision));
+
+    expect($failure->safeCode)->toBe(MailWriteCode::SubmissionUnknown)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and($jmap->sends)->toHaveCount(1)
+        ->and($service->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test')->outcome)
+        ->toBe(SubmissionOutcome::Submitted)
+        ->and($jmap->sends)->toHaveCount(1);
 });

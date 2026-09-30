@@ -52,7 +52,9 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `MailWriteService::reconcileSubmission()` answers `submitted`,
   `not_submitted`, or `unknown` (`SubmissionOutcome`) from provider reads only.
   A possibly sent submit blocks further submits of that draft with
-  `submission_unknown` until reconciliation gives a definite answer.
+  `submission_unknown` until reconciliation gives a definite answer, and a
+  provider submission linked to the draft's ID blocks it even if that cached
+  record is lost.
 - `mail-mirror.writes.max_draft_bytes` (25 MiB) and draft codes
   `invalid_draft`, `draft_too_large`, `draft_not_found`, `stale_revision`,
   `revision_conflict`, `message_id_conflict`, `identity_mismatch`, and
