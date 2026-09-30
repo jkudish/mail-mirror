@@ -27,7 +27,9 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Fastmail JMAP sends one `Email/set` patch with `ifInState`; archive and spam
   resolve exactly one Archive- or Junk-role mailbox. `restoreFromTrash()` is
   now `apply()` with `MailboxChange::untrash()` and keeps its behavior,
-  evidence, and intent key.
+  evidence, and intent key. Each message has one intent slot naming the last
+  change this package may have applied, so a retry returns `AlreadyApplied`
+  only when no later write replaced it.
 - Write codes `writes_disabled`, `already_in_state` (the destination state
   already held and this package recorded no intent for it),
   `unsupported_container` (a Gmail system label or JMAP role mailbox passed as

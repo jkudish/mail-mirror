@@ -603,3 +603,35 @@ it('validates mailbox changes', function (Closure $build): void {
     'container with whitespace' => [fn () => MailboxChange::addContainer('Label 5')],
     'oversized container' => [fn () => MailboxChange::addContainer(str_repeat('a', 256))],
 ]);
+
+it('does not let an intent survive a later write to the same message', function (array $applied, array $external, MailboxChange $retry, MailWriteCode $code): void {
+    /** @var list<MailboxChange> $applied */
+    /** @var list<string> $external */
+    $gmail = new MutationGmailProvider;
+    $gmail->labels = ['gm-1' => ['INBOX', 'UNREAD']];
+    Http::fake($gmail->handler());
+    $account = mutationGmailAccount();
+    $service = app(MailWriteService::class);
+
+    foreach ($applied as $change) {
+        expect($service->apply(mutationTarget($account, 'gm-1'), $change)->outcome)->toBe(MailWriteOutcome::Applied);
+    }
+
+    // Someone outside this package moves the message into the retry's destination state.
+    $gmail->labels['gm-1'] = $external;
+    $failure = mutationFailure(mutationTarget($account, 'gm-1'), $retry);
+
+    expect($failure->safeCode)->toBe($code)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and($gmail->writes)->toHaveCount(count($applied));
+})->with([
+    'inverse change on the same state' => [
+        [MailboxChange::markRead(), MailboxChange::markUnread()], ['INBOX'], MailboxChange::markRead(), MailWriteCode::AlreadyInState,
+    ],
+    'other changes that touch the same label' => [
+        [MailboxChange::archive(), MailboxChange::spam(), MailboxChange::notSpam()], [], MailboxChange::archive(), MailWriteCode::AlreadyInState,
+    ],
+    'a trash after the legacy restore intent' => [
+        [MailboxChange::trash(), MailboxChange::untrash(), MailboxChange::trash()], ['INBOX'], MailboxChange::untrash(), MailWriteCode::NotInTrash,
+    ],
+]);

@@ -74,7 +74,7 @@ final readonly class MailWriteService
                 $account,
                 $target->providerMessageId,
                 $change,
-                $targetKey.':intent:'.$change->intentName(),
+                $targetKey,
                 $sendBy,
                 $sendSeconds,
             ),
@@ -132,14 +132,17 @@ final readonly class MailWriteService
         MailAccount $account,
         string $providerMessageId,
         MailboxChange $change,
-        string $intent,
+        string $targetKey,
         \DateTimeInterface $sendBy,
         int $sendSeconds,
     ): MailWriteResult {
+        $intent = $targetKey.':intent:'.$change->intentName();
         $observed = $this->messageState($driver, $account, $providerMessageId, $change);
 
         if ($observed->desiredStateHolds) {
-            if ($this->cache->get($intent) !== true) {
+            // Only the last change this package may have applied to the message counts:
+            // any later write, including the inverse change, replaced its intent.
+            if ($this->cache->get($intent) !== $change->intentValue()) {
                 throw new MailWriteFailure($change->action->unchangedCode());
             }
 
@@ -147,7 +150,7 @@ final readonly class MailWriteService
         }
 
         // The destination state does not hold, so any earlier intent belongs to a finished cycle.
-        $this->cache->forget($intent);
+        $this->forgetIntents($targetKey);
 
         try {
             $driver->prepareWrite($account, $sendSeconds);
@@ -165,13 +168,13 @@ final readonly class MailWriteService
             throw MailWriteFailure::fromProvider($failure, false);
         } catch (MailWriteFailure $failure) {
             if ($failure->writeSent) {
-                $this->cache->put($intent, true, $this->intentTtl());
+                $this->cache->put($intent, $change->intentValue(), $this->intentTtl());
             }
 
             throw $failure;
         }
 
-        $this->cache->put($intent, true, $this->intentTtl());
+        $this->cache->put($intent, $change->intentValue(), $this->intentTtl());
 
         try {
             $confirmed = $this->messageState($driver, $account, $providerMessageId, $change);
@@ -236,6 +239,14 @@ final readonly class MailWriteService
     private function targetKey(MailAccount $account, string $providerMessageId): string
     {
         return sprintf('mail-mirror:account:%d:message:%s', $account->id, hash('sha256', $providerMessageId));
+    }
+
+    /** Clear the message's single intent slot, including the legacy restore key. */
+    private function forgetIntents(string $targetKey): void
+    {
+        foreach (MailboxChange::intentNames() as $name) {
+            $this->cache->forget($targetKey.':intent:'.$name);
+        }
     }
 
     private function intentTtl(): int

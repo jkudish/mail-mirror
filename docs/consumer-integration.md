@@ -502,8 +502,10 @@ Every write follows the same sequence:
    immediately with `target_busy` and `writeSent` false, before any provider
    request. The lock is held for at most `mail-mirror.writes.lock_seconds`.
 4. Read the provider state. A message already in the change's destination
-   state returns `AlreadyApplied` without writing, but only when this package
-   recorded an intent for the same account, message, and change. Otherwise it
+   state returns `AlreadyApplied` without writing, but only when the last
+   write this package may have applied to that account's message was this
+   exact change. Each message has one intent slot, so any later write,
+   including the inverse change, replaces it. Otherwise it
    fails with `already_in_state` (`not_in_trash` for `untrash()`, as before).
 5. Send one write with transport retries off. The package records the intent
    only when the write may have applied, and clears it when the provider

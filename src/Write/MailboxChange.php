@@ -89,15 +89,31 @@ final readonly class MailboxChange
     }
 
     /**
-     * The intent-key suffix. Untrash keeps the key the Trash restore used, so an
-     * intent recorded before an upgrade still confirms a retry after it.
+     * Every change to one message shares one intent slot, which names the last
+     * change this package may have applied. Untrash keeps the key and value the
+     * Trash restore used, so an intent recorded before an upgrade still confirms
+     * a retry after it; every other change uses the shared "mailbox" key.
+     *
+     * @return list<string> every intent-key suffix in the slot
      */
+    public static function intentNames(): array
+    {
+        return ['restore-from-trash', 'mailbox'];
+    }
+
+    /** The intent-key suffix this change records under. */
     public function intentName(): string
     {
+        return $this->action === MailboxAction::Untrash ? 'restore-from-trash' : 'mailbox';
+    }
+
+    /** The recorded value that proves this exact change, not merely one on the same state. */
+    public function intentValue(): string|true
+    {
         return match (true) {
-            $this->action === MailboxAction::Untrash => 'restore-from-trash',
-            $this->containerId !== null => 'mailbox:'.$this->action->value.':'.hash('sha256', $this->containerId),
-            default => 'mailbox:'.$this->action->value,
+            $this->action === MailboxAction::Untrash => true,
+            $this->containerId !== null => $this->action->value.':'.hash('sha256', $this->containerId),
+            default => $this->action->value,
         };
     }
 }
