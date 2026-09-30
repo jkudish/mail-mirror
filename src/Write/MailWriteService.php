@@ -4,11 +4,12 @@ declare(strict_types=1);
 
 namespace Jkudish\MailMirror\Write;
 
+use Closure;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Support\Facades\Date;
-use Jkudish\MailMirror\Contracts\TrashRestoreDriver;
+use Jkudish\MailMirror\Contracts\MailboxMutationDriver;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailWriteCode;
 use Jkudish\MailMirror\Enums\MailWriteOutcome;
@@ -24,6 +25,8 @@ use Throwable;
  * Provider writes for one account-qualified message.
  *
  * Every write follows the same contract:
+ * 0. Refuse with WritesDisabled, before anything else, unless
+ *    mail-mirror.writes.enabled is true.
  * 1. Resolve the account through the full owner tuple before any provider request.
  * 2. Hold an account-namespaced cache lock for the target message; a busy lock
  *    fails with TargetBusy before any provider request.
@@ -46,6 +49,39 @@ final readonly class MailWriteService
     ) {}
 
     /**
+     * Apply one reversible mailbox change to exactly one provider message.
+     *
+     * @throws AccountResourceMismatch before any provider request
+     * @throws MailWriteFailure
+     */
+    public function apply(MailWriteTarget $target, MailboxChange $change): MailWriteResult
+    {
+        $this->assertWritesEnabled();
+        $account = $this->account($target);
+        $driver = $this->drivers->reader($account->driver);
+
+        if (! $driver instanceof MailboxMutationDriver) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedDriver);
+        }
+
+        $targetKey = $this->targetKey($account, $target->providerMessageId);
+
+        return $this->withLock(
+            $account,
+            $targetKey.':write-lock',
+            fn (\DateTimeInterface $sendBy, int $sendSeconds): MailWriteResult => $this->applyLocked(
+                $driver,
+                $account,
+                $target->providerMessageId,
+                $change,
+                $targetKey.':intent:'.$change->intentName(),
+                $sendBy,
+                $sendSeconds,
+            ),
+        );
+    }
+
+    /**
      * Move one message out of provider Trash. Gmail restores the message's
      * prior labels; JMAP moves it from the Trash-role to the Inbox-role mailbox.
      *
@@ -54,23 +90,29 @@ final readonly class MailWriteService
      */
     public function restoreFromTrash(MailWriteTarget $target): MailWriteResult
     {
-        $account = $this->account($target);
-        $driver = $this->drivers->reader($account->driver);
+        return $this->apply($target, MailboxChange::untrash());
+    }
 
-        if (! $driver instanceof TrashRestoreDriver) {
-            throw new MailWriteFailure(MailWriteCode::UnsupportedDriver);
-        }
-
+    /**
+     * Run $write under the account-namespaced lock $lockKey. $write receives
+     * the latest time it may send its single write and the send step length.
+     *
+     * @template TResult
+     *
+     * @param  Closure(\DateTimeInterface, int): TResult  $write
+     * @return TResult
+     */
+    private function withLock(MailAccount $account, string $lockKey, Closure $write): mixed
+    {
         $store = $this->cache->getStore();
 
         if (! $store instanceof LockProvider) {
             throw new LogicException('Provider writes require a cache store that supports atomic locks.');
         }
 
-        $targetKey = $this->targetKey($account, $target->providerMessageId);
         $sendSeconds = $this->sendStepSeconds($account->driver);
         $lockSeconds = $this->lockSeconds($sendSeconds);
-        $lock = $store->lock($targetKey.':write-lock', $lockSeconds);
+        $lock = $store->lock($lockKey, $lockSeconds);
 
         if (! $lock->get()) {
             throw new MailWriteFailure(MailWriteCode::TargetBusy);
@@ -79,31 +121,32 @@ final readonly class MailWriteService
         $sendBy = Date::now()->addSeconds($lockSeconds - $sendSeconds);
 
         try {
-            return $this->restoreLocked($driver, $account, $target->providerMessageId, $targetKey.':intent:restore-from-trash', $sendBy, $sendSeconds);
+            return $write($sendBy, $sendSeconds);
         } finally {
             $lock->release();
         }
     }
 
-    private function restoreLocked(
-        TrashRestoreDriver $driver,
+    private function applyLocked(
+        MailboxMutationDriver $driver,
         MailAccount $account,
         string $providerMessageId,
+        MailboxChange $change,
         string $intent,
         \DateTimeInterface $sendBy,
         int $sendSeconds,
     ): MailWriteResult {
-        $observed = $this->trashState($driver, $account, $providerMessageId);
+        $observed = $this->messageState($driver, $account, $providerMessageId, $change);
 
-        if (! $observed->inTrash) {
-            if (! $observed->restored || $this->cache->get($intent) !== true) {
-                throw new MailWriteFailure(MailWriteCode::NotInTrash);
+        if ($observed->desiredStateHolds) {
+            if ($this->cache->get($intent) !== true) {
+                throw new MailWriteFailure($change->action->unchangedCode());
             }
 
             return $this->result($account, $observed, MailWriteOutcome::AlreadyApplied);
         }
 
-        // The message is in Trash, so any earlier intent belongs to a finished cycle.
+        // The destination state does not hold, so any earlier intent belongs to a finished cycle.
         $this->cache->forget($intent);
 
         try {
@@ -117,7 +160,7 @@ final readonly class MailWriteService
         }
 
         try {
-            $driver->restoreFromTrash($account, $observed);
+            $driver->applyChange($account, $observed, $change);
         } catch (MailImportFailure $failure) {
             throw MailWriteFailure::fromProvider($failure, false);
         } catch (MailWriteFailure $failure) {
@@ -131,7 +174,7 @@ final readonly class MailWriteService
         $this->cache->put($intent, true, $this->intentTtl());
 
         try {
-            $confirmed = $this->trashState($driver, $account, $providerMessageId);
+            $confirmed = $this->messageState($driver, $account, $providerMessageId, $change);
         } catch (Throwable $failure) {
             throw new MailWriteFailure(
                 MailWriteCode::Unconfirmed,
@@ -141,17 +184,17 @@ final readonly class MailWriteService
             );
         }
 
-        if (! $confirmed->restored) {
+        if (! $confirmed->desiredStateHolds) {
             throw new MailWriteFailure(MailWriteCode::Unconfirmed, true);
         }
 
         return $this->result($account, $confirmed, MailWriteOutcome::Applied);
     }
 
-    private function trashState(TrashRestoreDriver $driver, MailAccount $account, string $providerMessageId): TrashState
+    private function messageState(MailboxMutationDriver $driver, MailAccount $account, string $providerMessageId, MailboxChange $change): MessageState
     {
         try {
-            $state = $driver->trashState($account, $providerMessageId);
+            $state = $driver->messageState($account, $providerMessageId, $change);
         } catch (MailImportFailure $failure) {
             throw MailWriteFailure::fromProvider($failure, false);
         }
@@ -164,9 +207,17 @@ final readonly class MailWriteService
         return $state;
     }
 
-    private function result(MailAccount $account, TrashState $state, MailWriteOutcome $outcome): MailWriteResult
+    private function result(MailAccount $account, MessageState $state, MailWriteOutcome $outcome): MailWriteResult
     {
         return new MailWriteResult($account->id, $account->driver, $state->providerMessageId, $outcome, $state->providerEvidence);
+    }
+
+    /** The one package write switch, checked before any database or provider access. */
+    private function assertWritesEnabled(): void
+    {
+        if (config('mail-mirror.writes.enabled') !== true) {
+            throw new MailWriteFailure(MailWriteCode::WritesDisabled);
+        }
     }
 
     private function account(MailWriteTarget $target): MailAccount

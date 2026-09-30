@@ -12,9 +12,10 @@ use Illuminate\Http\Client\Response;
 use Illuminate\Support\Sleep;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Contracts\BudgetedDeltaMailboxReader;
-use Jkudish\MailMirror\Contracts\TrashRestoreDriver;
+use Jkudish\MailMirror\Contracts\MailboxMutationDriver;
 use Jkudish\MailMirror\Credentials\ApiTokenCredential;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
+use Jkudish\MailMirror\Enums\MailboxAction;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
@@ -38,10 +39,11 @@ use Jkudish\MailMirror\Read\ProviderDeletionResolution;
 use Jkudish\MailMirror\Read\RawMessageSource;
 use Jkudish\MailMirror\Read\RetrievedMessage;
 use Jkudish\MailMirror\Read\SyncWorkBudget;
-use Jkudish\MailMirror\Write\TrashState;
+use Jkudish\MailMirror\Write\MailboxChange;
+use Jkudish\MailMirror\Write\MessageState;
 use Throwable;
 
-final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, TrashRestoreDriver
+final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, MailboxMutationDriver
 {
     private const CORE = 'urn:ietf:params:jmap:core';
 
@@ -684,36 +686,77 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Tra
         ];
     }
 
-    public function trashState(MailAccount $account, string $providerMessageId): TrashState
+    public function messageState(MailAccount $account, string $providerMessageId, MailboxChange $change): MessageState
     {
         $this->assertAccount($account);
         $session = $this->session($account);
         $mailboxes = $this->fetchMailboxes($account, $session)['mailboxes'];
-        $trashMailboxId = $this->mailboxWithRole($mailboxes, 'trash');
-        $inboxMailboxId = $this->mailboxWithRole($mailboxes, 'inbox');
+        $roles = [];
+
+        foreach ($this->rolesFor($change->action) as $role) {
+            $roles[$role] = $this->mailboxWithRole($mailboxes, $role);
+        }
+
+        $container = $change->containerId;
+
+        if ($container !== null && ! isset($mailboxes[$container])) {
+            throw new MailWriteFailure(MailWriteCode::ContainerNotFound);
+        }
+
+        if ($container !== null && $mailboxes[$container]['role'] !== null) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedContainer);
+        }
+
+        $keywordChange = in_array($change->action, [
+            MailboxAction::MarkRead, MailboxAction::MarkUnread, MailboxAction::Star, MailboxAction::Unstar,
+        ], true);
         $result = $this->call($account, $session, 'Email/get', [
             'accountId' => $account->provider_account_id,
             'ids' => [$providerMessageId],
-            'properties' => ['id', 'mailboxIds'],
+            'properties' => $keywordChange ? ['id', 'mailboxIds', 'keywords'] : ['id', 'mailboxIds'],
         ], 'email', MailImportStage::Retrieve);
         $emailState = $this->boundedString($result['state'] ?? null, 255, MailImportStage::Retrieve);
         $email = $this->singleObject($result, $providerMessageId, MailImportStage::Retrieve);
         $mailboxIds = array_keys($this->truthMap($email['mailboxIds'] ?? null, MailImportStage::Retrieve));
         sort($mailboxIds);
-        $inTrash = in_array($trashMailboxId, $mailboxIds, true);
+        $keywords = $keywordChange ? array_keys($this->truthMap($email['keywords'] ?? null, MailImportStage::Retrieve)) : [];
+        sort($keywords);
+        $in = fn (string $role): bool => in_array($roles[$role], $mailboxIds, true);
+        $evidence = ['mailbox_ids' => $mailboxIds];
 
-        return new TrashState(
+        foreach ($roles as $role => $mailboxId) {
+            $evidence[$role.'_mailbox_id'] = $mailboxId;
+        }
+
+        if ($keywordChange) {
+            $evidence['keywords'] = $keywords;
+        }
+
+        if ($container !== null) {
+            $evidence['container_id'] = $container;
+        }
+
+        $evidence['email_state'] = $emailState;
+
+        return new MessageState(
             $account->id,
             MailDriver::Jmap,
             $providerMessageId,
-            $inTrash,
-            ! $inTrash && in_array($inboxMailboxId, $mailboxIds, true),
-            [
-                'mailbox_ids' => $mailboxIds,
-                'trash_mailbox_id' => $trashMailboxId,
-                'inbox_mailbox_id' => $inboxMailboxId,
-                'email_state' => $emailState,
-            ],
+            match ($change->action) {
+                MailboxAction::MarkRead => in_array('$seen', $keywords, true),
+                MailboxAction::MarkUnread => ! in_array('$seen', $keywords, true),
+                MailboxAction::Star => in_array('$flagged', $keywords, true),
+                MailboxAction::Unstar => ! in_array('$flagged', $keywords, true),
+                MailboxAction::Archive => ! $in('inbox') && $in('archive'),
+                MailboxAction::Unarchive => $in('inbox') && ! $in('archive'),
+                MailboxAction::AddContainer => in_array($container, $mailboxIds, true),
+                MailboxAction::RemoveContainer => ! in_array($container, $mailboxIds, true),
+                MailboxAction::Trash => $in('trash'),
+                MailboxAction::Untrash => ! $in('trash') && $in('inbox'),
+                MailboxAction::Spam => $in('junk'),
+                MailboxAction::NotSpam => ! $in('junk') && $in('inbox'),
+            },
+            $evidence,
         );
     }
 
@@ -724,38 +767,154 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Tra
     }
 
     /**
-     * Patches only the observed Trash and Inbox memberships of one email, and
-     * only while the account's Email state still matches the observed read.
+     * Patches only the observed memberships or keyword of one email, and only
+     * while the account's Email state still matches the observed read.
      */
-    public function restoreFromTrash(MailAccount $account, TrashState $observed): void
+    public function applyChange(MailAccount $account, MessageState $observed, MailboxChange $change): void
     {
         $this->assertAccount($account);
         $evidence = $observed->providerEvidence;
-        $trash = $evidence['trash_mailbox_id'] ?? null;
-        $inbox = $evidence['inbox_mailbox_id'] ?? null;
         $state = $evidence['email_state'] ?? null;
+        $observedIds = $evidence['mailbox_ids'] ?? null;
 
-        if ($observed->mailAccountId !== $account->id || $observed->driver !== MailDriver::Jmap || ! $observed->inTrash
-            || ! is_string($trash) || ! is_string($inbox) || ! is_string($state) || $trash === $inbox
-            || ($evidence['mailbox_ids'] ?? null) !== [$trash]
-            || preg_match('/\A[A-Za-z0-9_-]{1,255}\z/', $trash) !== 1
-            || preg_match('/\A[A-Za-z0-9_-]{1,255}\z/', $inbox) !== 1) {
+        if ($observed->mailAccountId !== $account->id || $observed->driver !== MailDriver::Jmap
+            || $observed->desiredStateHolds || ! is_string($state) || ! is_array($observedIds)
+            || ! array_is_list($observedIds)) {
             throw new MailWriteFailure(MailWriteCode::UnsupportedState);
         }
+
+        $roles = [];
+        $mailboxIds = [];
+
+        foreach ($this->rolesFor($change->action) as $role) {
+            $roles[$role] = $this->writableMailboxId($evidence[$role.'_mailbox_id'] ?? null);
+        }
+
+        foreach ($observedIds as $mailboxId) {
+            $mailboxIds[] = $this->writableMailboxId($mailboxId);
+        }
+
+        if ($change->containerId !== null) {
+            $this->writableMailboxId($change->containerId);
+        }
+
+        if (count(array_unique($roles)) !== count($roles)) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedState);
+        }
+
+        $in = fn (string $mailboxId): bool => in_array($mailboxId, $mailboxIds, true);
+        $move = function (string $from, string $to) use ($mailboxIds): array {
+            // Leave a role mailbox only from exactly that mailbox, so nothing else is dropped.
+            if ($mailboxIds !== [$from]) {
+                throw new MailWriteFailure(MailWriteCode::UnsupportedState);
+            }
+
+            return ['mailboxIds/'.$from => null, 'mailboxIds/'.$to => true];
+        };
+        $replaceAll = function (string $to) use ($mailboxIds): array {
+            return array_fill_keys(array_map(fn (string $id): string => 'mailboxIds/'.$id, $mailboxIds), null)
+                + ['mailboxIds/'.$to => true];
+        };
+
+        if ($change->action === MailboxAction::Untrash && ! $in($roles['trash'])) {
+            throw new MailWriteFailure(MailWriteCode::NotInTrash);
+        }
+
+        $patch = match ($change->action) {
+            MailboxAction::MarkRead => ['keywords/$seen' => true],
+            MailboxAction::MarkUnread => ['keywords/$seen' => null],
+            MailboxAction::Star => ['keywords/$flagged' => true],
+            MailboxAction::Unstar => ['keywords/$flagged' => null],
+            MailboxAction::Archive => $in($roles['inbox'])
+                ? ['mailboxIds/'.$roles['inbox'] => null, 'mailboxIds/'.$roles['archive'] => true]
+                : throw new MailWriteFailure(MailWriteCode::UnsupportedState),
+            MailboxAction::Unarchive => $in($roles['archive'])
+                ? ['mailboxIds/'.$roles['archive'] => null, 'mailboxIds/'.$roles['inbox'] => true]
+                : throw new MailWriteFailure(MailWriteCode::UnsupportedState),
+            MailboxAction::AddContainer => ['mailboxIds/'.$change->containerId => true],
+            // An email must stay in at least one mailbox.
+            MailboxAction::RemoveContainer => $mailboxIds === [$change->containerId]
+                ? throw new MailWriteFailure(MailWriteCode::UnsupportedState)
+                : ['mailboxIds/'.$change->containerId => null],
+            MailboxAction::Trash => $replaceAll($roles['trash']),
+            MailboxAction::Untrash => $move($roles['trash'], $roles['inbox']),
+            MailboxAction::Spam => $replaceAll($roles['junk']),
+            MailboxAction::NotSpam => $move($roles['junk'], $roles['inbox']),
+        };
 
         $id = $observed->providerMessageId;
         // Session discovery and credential loading are pre-send; their failures propagate unwrapped.
         $session = $this->session($account);
         $this->credential($account, MailImportStage::Retrieve);
+        // "restore" is the call ID the Trash restore has always sent.
+        $callId = $change->action === MailboxAction::Untrash ? 'restore' : 'mutate';
+        $result = $this->sendSet($account, $session, 'Email/set', [
+            'accountId' => $account->provider_account_id,
+            'ifInState' => $state,
+            'update' => [$id => $patch],
+        ], $callId);
 
+        $updated = $result['updated'] ?? null;
+        $notUpdated = $result['notUpdated'] ?? null;
+
+        if (is_array($updated) && array_key_exists($id, $updated)) {
+            return;
+        }
+
+        $error = is_array($notUpdated) ? ($notUpdated[$id] ?? null) : null;
+
+        if (! is_array($error)) {
+            throw new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
+        }
+
+        throw $this->setItemFailure($error);
+    }
+
+    /** A mailbox ID safe to place in an Email/set patch path. */
+    private function writableMailboxId(mixed $id): string
+    {
+        if (! is_string($id) || preg_match('/\A[A-Za-z0-9_-]{1,255}\z/', $id) !== 1) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedState);
+        }
+
+        return $id;
+    }
+
+    /** @return list<string> the mailbox roles $action reads and writes, in evidence order */
+    private function rolesFor(MailboxAction $action): array
+    {
+        return match ($action) {
+            MailboxAction::Archive, MailboxAction::Unarchive => ['inbox', 'archive'],
+            MailboxAction::Trash => ['trash'],
+            MailboxAction::Untrash => ['trash', 'inbox'],
+            MailboxAction::Spam => ['junk'],
+            MailboxAction::NotSpam => ['junk', 'inbox'],
+            default => [],
+        };
+    }
+
+    /**
+     * Send one JMAP write method call without transport retries and return
+     * its verified result. Every failure is a MailWriteFailure classified by
+     * whether the provider may have applied the write.
+     *
+     * @param  array{api_url: string, download_url: string, session_state: string}  $session
+     * @param  array<string, mixed>  $arguments
+     * @param  list<string>  $capabilities
+     * @return array<string, mixed>
+     */
+    private function sendSet(
+        MailAccount $account,
+        array $session,
+        string $method,
+        array $arguments,
+        string $callId,
+        array $capabilities = [self::CORE, self::MAIL],
+    ): array {
         try {
             $payload = $this->jsonRequest($account, 'POST', $session['api_url'], [
-                'using' => [self::CORE, self::MAIL],
-                'methodCalls' => [['Email/set', [
-                    'accountId' => $account->provider_account_id,
-                    'ifInState' => $state,
-                    'update' => [$id => ['mailboxIds/'.$trash => null, 'mailboxIds/'.$inbox => true]],
-                ], 'restore']],
+                'using' => $capabilities,
+                'methodCalls' => [[$method, $arguments, $callId]],
             ], MailImportStage::Retrieve, retryTransport: false);
         } catch (MailImportFailure $failure) {
             throw MailWriteFailure::fromProvider($failure, true);
@@ -772,18 +931,17 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Tra
         $response = is_array($responses) && count($responses) === 1 ? ($responses[0] ?? null) : null;
 
         if (! is_array($response) || count($response) !== 3 || ! is_array($response[1] ?? null)
-            || ($response[2] ?? null) !== 'restore') {
+            || ($response[2] ?? null) !== $callId) {
             throw new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
         }
 
+        /** @var array<string, mixed> $result */
         $result = $response[1];
 
         if ($response[0] === 'error') {
             // RFC 8620 method errors reject the whole call. Server failures leave state
             // undefined, and an unrecognized type might too, so both count as possibly applied.
-            $type = $result['type'] ?? null;
-
-            throw match ($type) {
+            throw match ($result['type'] ?? null) {
                 'stateMismatch', 'accountNotFound' => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::StateMismatch),
                 'forbidden', 'accountNotSupportedByMethod', 'accountReadOnly' => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::PermissionDenied),
                 'unknownMethod', 'invalidArguments', 'invalidResultReference', 'requestTooLarge' => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::UnexpectedFailure),
@@ -792,24 +950,22 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Tra
             };
         }
 
-        if ($response[0] !== 'Email/set' || ($result['accountId'] ?? null) !== $account->provider_account_id) {
+        if ($response[0] !== $method || ($result['accountId'] ?? null) !== $account->provider_account_id) {
             throw new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
         }
 
-        $updated = $result['updated'] ?? null;
-        $notUpdated = $result['notUpdated'] ?? null;
+        return $result;
+    }
 
-        if (is_array($updated) && array_key_exists($id, $updated)) {
-            return;
-        }
-
-        $error = is_array($notUpdated) ? ($notUpdated[$id] ?? null) : null;
-
-        if (! is_array($error)) {
-            throw new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
-        }
-
-        throw match ($error['type'] ?? null) {
+    /**
+     * An RFC 8620 SetError for one object. The provider rejected that object,
+     * so the write did not apply to it.
+     *
+     * @param  array<mixed>  $error
+     */
+    private function setItemFailure(array $error): MailWriteFailure
+    {
+        return match ($error['type'] ?? null) {
             'notFound' => new MailWriteFailure(MailWriteCode::MessageNotFound, false, MailImportCode::MessageUnavailable),
             'forbidden' => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::PermissionDenied),
             default => new MailWriteFailure(MailWriteCode::ProviderFailed, false, MailImportCode::UnexpectedFailure),

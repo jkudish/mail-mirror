@@ -12,9 +12,10 @@ use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Date;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Contracts\BudgetedDeltaMailboxReader;
-use Jkudish\MailMirror\Contracts\TrashRestoreDriver;
+use Jkudish\MailMirror\Contracts\MailboxMutationDriver;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
+use Jkudish\MailMirror\Enums\MailboxAction;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
@@ -39,12 +40,13 @@ use Jkudish\MailMirror\Read\ProviderDeletionResolution;
 use Jkudish\MailMirror\Read\RawMessageSource;
 use Jkudish\MailMirror\Read\RetrievedMessage;
 use Jkudish\MailMirror\Read\SyncWorkBudget;
-use Jkudish\MailMirror\Write\TrashState;
+use Jkudish\MailMirror\Write\MailboxChange;
+use Jkudish\MailMirror\Write\MessageState;
 use Throwable;
 use ZBateson\MailMimeParser\Header\AddressHeader;
 use ZBateson\MailMimeParser\MailMimeParser;
 
-final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashRestoreDriver
+final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMutationDriver
 {
     private const API = 'https://gmail.googleapis.com/gmail/v1';
 
@@ -653,9 +655,15 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
         }, $nativeIdentities));
     }
 
-    public function trashState(MailAccount $account, string $providerMessageId): TrashState
+    public function messageState(MailAccount $account, string $providerMessageId, MailboxChange $change): MessageState
     {
         $this->assertAccount($account);
+
+        // Gmail system label IDs are upper case; user label IDs (Label_N) are not.
+        if ($change->containerId !== null && preg_match('/\A[A-Z0-9_]+\z/', $change->containerId) === 1) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedContainer);
+        }
+
         $native = $this->request(
             $account,
             'GET',
@@ -671,15 +679,28 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
             throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
         }
 
-        $inTrash = in_array('TRASH', $labelIds, true);
-
         /** @var list<string> $labelIds */
-        return new TrashState(
+        $has = fn (string $label): bool => in_array($label, $labelIds, true);
+
+        return new MessageState(
             $account->id,
             MailDriver::Gmail,
             $providerMessageId,
-            $inTrash,
-            ! $inTrash,
+            match ($change->action) {
+                MailboxAction::MarkRead => ! $has('UNREAD'),
+                MailboxAction::MarkUnread => $has('UNREAD'),
+                MailboxAction::Star => $has('STARRED'),
+                MailboxAction::Unstar => ! $has('STARRED'),
+                MailboxAction::Archive => ! $has('INBOX'),
+                MailboxAction::Unarchive => $has('INBOX'),
+                MailboxAction::AddContainer => $has((string) $change->containerId),
+                MailboxAction::RemoveContainer => ! $has((string) $change->containerId),
+                MailboxAction::Trash => $has('TRASH'),
+                // untrash restores the prior labels, so any state outside Trash is restored.
+                MailboxAction::Untrash => ! $has('TRASH'),
+                MailboxAction::Spam => $has('SPAM') && ! $has('INBOX'),
+                MailboxAction::NotSpam => ! $has('SPAM') && $has('INBOX'),
+            },
             ['label_ids' => $labelIds, 'history_id' => $historyId],
         );
     }
@@ -690,11 +711,40 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
         $this->credential($account, max(30, $validForSeconds));
     }
 
-    public function restoreFromTrash(MailAccount $account, TrashState $observed): void
+    /**
+     * Sends one users.messages.modify, trash, or untrash request for the
+     * observed message only; never a threads endpoint.
+     */
+    public function applyChange(MailAccount $account, MessageState $observed, MailboxChange $change): void
     {
         $this->assertAccount($account);
+        $labelIds = $observed->providerEvidence['label_ids'] ?? null;
 
-        if ($observed->mailAccountId !== $account->id || $observed->driver !== MailDriver::Gmail || ! $observed->inTrash) {
+        if ($observed->mailAccountId !== $account->id || $observed->driver !== MailDriver::Gmail
+            || $observed->desiredStateHolds || ! is_array($labelIds)) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedState);
+        }
+
+        $has = fn (string $label): bool => in_array($label, $labelIds, true);
+        [$endpoint, $modify] = match ($change->action) {
+            MailboxAction::MarkRead => ['modify', ['removeLabelIds' => ['UNREAD']]],
+            MailboxAction::MarkUnread => ['modify', ['addLabelIds' => ['UNREAD']]],
+            MailboxAction::Star => ['modify', ['addLabelIds' => ['STARRED']]],
+            MailboxAction::Unstar => ['modify', ['removeLabelIds' => ['STARRED']]],
+            MailboxAction::Archive => ['modify', ['removeLabelIds' => ['INBOX']]],
+            MailboxAction::Unarchive => ['modify', ['addLabelIds' => ['INBOX']]],
+            MailboxAction::AddContainer => ['modify', ['addLabelIds' => [(string) $change->containerId]]],
+            MailboxAction::RemoveContainer => ['modify', ['removeLabelIds' => [(string) $change->containerId]]],
+            MailboxAction::Trash => ['trash', null],
+            MailboxAction::Untrash => ['untrash', null],
+            MailboxAction::Spam => ['modify', ['addLabelIds' => ['SPAM'], 'removeLabelIds' => ['INBOX']]],
+            MailboxAction::NotSpam => ['modify', ['addLabelIds' => ['INBOX'], 'removeLabelIds' => ['SPAM']]],
+        };
+
+        // Trash and Spam leave only through untrash and not-spam, never by adding INBOX.
+        if (($change->action === MailboxAction::Unarchive && ($has('TRASH') || $has('SPAM')))
+            || ($change->action === MailboxAction::NotSpam && ! $has('SPAM'))
+            || ($change->action === MailboxAction::Spam && $has('TRASH'))) {
             throw new MailWriteFailure(MailWriteCode::UnsupportedState);
         }
 
@@ -706,9 +756,10 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
             $native = $this->request(
                 $account,
                 'POST',
-                self::API.'/users/me/messages/'.rawurlencode($observed->providerMessageId).'/untrash',
+                self::API.'/users/me/messages/'.rawurlencode($observed->providerMessageId).'/'.$endpoint,
                 resendAfterReauthorization: false,
                 refreshCredential: false,
+                json: $modify,
             );
         } catch (MailImportFailure $failure) {
             throw MailWriteFailure::fromProvider($failure, true);
@@ -724,6 +775,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
      * refreshed for the next call, but the write itself is never re-sent.
      *
      * @param  array<string, int|string|null>  $query
+     * @param  array<string, mixed>|null  $json
      * @return array<string, mixed>
      */
     private function request(
@@ -733,13 +785,14 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
         array $query = [],
         bool $resendAfterReauthorization = true,
         bool $refreshCredential = true,
+        ?array $json = null,
     ): array {
         if (config('mail-mirror.gmail.enabled') !== true) {
             throw new MailImportFailure(MailImportStage::Inventory, MailImportCode::ProviderUnavailable);
         }
 
         [$credential, $stored] = $this->credential($account, $refreshCredential ? 30 : null);
-        $response = $this->send($credential, $method, $url, $query);
+        $response = $this->send($credential, $method, $url, $query, $json);
 
         if ($response->status() === 401 && ! $resendAfterReauthorization) {
             try {
@@ -753,7 +806,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
 
         if ($response->status() === 401) {
             $credential = $this->refresh($account, $stored, $credential);
-            $response = $this->send($credential, $method, $url, $query);
+            $response = $this->send($credential, $method, $url, $query, $json);
 
             if ($response->status() === 401) {
                 $stored->refresh();
@@ -776,15 +829,18 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, TrashResto
         return $payload;
     }
 
-    /** @param array<string, int|string|null> $query */
-    private function send(OAuthTokenSetCredential $credential, string $method, string $url, array $query): Response
+    /**
+     * @param  array<string, int|string|null>  $query
+     * @param  array<string, mixed>|null  $json
+     */
+    private function send(OAuthTokenSetCredential $credential, string $method, string $url, array $query, ?array $json = null): Response
     {
         $this->budget?->claimHttpRequest();
 
         try {
             $response = $this->prepareRequest(
                 $this->http->withToken($credential->accessToken())->acceptJson(),
-            )->send($method, $url, ['query' => $query]);
+            )->send($method, $url, ['query' => $query] + ($json === null ? [] : ['json' => $json]));
             $this->budget?->recordDownloadedBytes(strlen($response->body()));
 
             return $response;

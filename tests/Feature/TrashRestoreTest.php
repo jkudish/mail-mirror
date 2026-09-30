@@ -5,8 +5,8 @@ declare(strict_types=1);
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\Http;
+use Jkudish\MailMirror\Contracts\MailboxMutationDriver;
 use Jkudish\MailMirror\Contracts\MailboxReader;
-use Jkudish\MailMirror\Contracts\TrashRestoreDriver;
 use Jkudish\MailMirror\Credentials\ApiTokenCredential;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
@@ -23,9 +23,10 @@ use Jkudish\MailMirror\Read\InventoryPage;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
 use Jkudish\MailMirror\Read\MessageReference;
 use Jkudish\MailMirror\Read\RetrievedMessage;
+use Jkudish\MailMirror\Write\MailboxChange;
 use Jkudish\MailMirror\Write\MailWriteService;
 use Jkudish\MailMirror\Write\MailWriteTarget;
-use Jkudish\MailMirror\Write\TrashState;
+use Jkudish\MailMirror\Write\MessageState;
 
 /**
  * Synthetic Gmail message state keyed by access token, so two accounts can
@@ -293,7 +294,7 @@ final class TrashRestoreJmapProvider
 }
 
 /** A Gmail-keyed driver whose confirming read throws or answers for another message. */
-final class TrashRestoreConfirmationDriver implements MailboxReader, TrashRestoreDriver
+final class TrashRestoreConfirmationDriver implements MailboxMutationDriver, MailboxReader
 {
     public int $reads = 0;
 
@@ -316,21 +317,21 @@ final class TrashRestoreConfirmationDriver implements MailboxReader, TrashRestor
         throw new LogicException('Not used by write tests.');
     }
 
-    public function trashState(MailAccount $account, string $providerMessageId): TrashState
+    public function messageState(MailAccount $account, string $providerMessageId, MailboxChange $change): MessageState
     {
         if (++$this->reads === 1) {
-            return new TrashState($account->id, MailDriver::Gmail, $providerMessageId, true, false, ['label_ids' => ['TRASH']]);
+            return new MessageState($account->id, MailDriver::Gmail, $providerMessageId, false, ['label_ids' => ['TRASH']]);
         }
 
         $state = ($this->confirmation)($account, $providerMessageId);
-        assert($state instanceof TrashState);
+        assert($state instanceof MessageState);
 
         return $state;
     }
 
     public function prepareWrite(MailAccount $account, int $validForSeconds): void {}
 
-    public function restoreFromTrash(MailAccount $account, TrashState $observed): void
+    public function applyChange(MailAccount $account, MessageState $observed, MailboxChange $change): void
     {
         $this->writes++;
     }
@@ -406,6 +407,7 @@ beforeEach(function (): void {
         'request_max_attempts' => 3,
         'max_raw_bytes' => 52428800,
     ]);
+    config()->set('mail-mirror.writes.enabled', true);
     Http::preventStrayRequests();
 });
 
@@ -413,8 +415,8 @@ afterEach(function (): void {
     putenv('MAIL_MIRROR_GMAIL_CLIENT_SECRET');
 });
 
-it('registers both production readers as Trash-restore drivers', function (MailDriver $driver): void {
-    expect(app(MailDriverRegistry::class)->reader($driver))->toBeInstanceOf(TrashRestoreDriver::class);
+it('registers both production readers as mailbox mutation drivers', function (MailDriver $driver): void {
+    expect(app(MailDriverRegistry::class)->reader($driver))->toBeInstanceOf(MailboxMutationDriver::class);
 })->with([MailDriver::Gmail, MailDriver::Jmap]);
 
 it('untrashes one Gmail message and reports success only from the confirming re-read', function (): void {
@@ -919,8 +921,8 @@ it('serializes writes to one target and fails a concurrent write as busy before 
 });
 
 it('reports any confirming-read exception after a sent write as unconfirmed', function (string $case): void {
-    $driver = new TrashRestoreConfirmationDriver(fn (MailAccount $account, string $providerMessageId): TrashState => match ($case) {
-        'mismatched state' => new TrashState($account->id, MailDriver::Gmail, 'another-message', false, true, []),
+    $driver = new TrashRestoreConfirmationDriver(fn (MailAccount $account, string $providerMessageId): MessageState => match ($case) {
+        'mismatched state' => new MessageState($account->id, MailDriver::Gmail, 'another-message', true, []),
         'invalid argument' => throw new InvalidArgumentException('synthetic invalid state'),
         'budget exhausted' => throw new SyncBudgetExhausted('http_requests', [
             'http_requests' => 1, 'max_http_requests' => 1, 'listed_ids' => 0, 'max_listed_ids' => 1,

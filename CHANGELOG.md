@@ -6,7 +6,32 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Breaking
+
+- Provider writes are off by default. Set `mail-mirror.writes.enabled`
+  (`MAIL_MIRROR_WRITES_ENABLED`) to true to allow them; otherwise every write,
+  including `restoreFromTrash()`, throws `writes_disabled` before any database
+  or provider access.
+- `TrashRestoreDriver` and `TrashState` are replaced by `MailboxMutationDriver`
+  and `MessageState`. Custom drivers implement `messageState()` and
+  `applyChange()` for a `MailboxChange` instead of `trashState()` and
+  `restoreFromTrash()`.
+
 ### Added
+
+- `MailWriteService::apply(MailWriteTarget, MailboxChange)`: exactly one
+  reversible change to exactly one provider message — mark read or unread,
+  star or unstar, archive or unarchive, add or remove one label or mailbox,
+  move to or out of Trash, and move to or out of Spam. Gmail calls only
+  `users.messages.modify`, `trash`, or `untrash`, never a threads endpoint.
+  Fastmail JMAP sends one `Email/set` patch with `ifInState`; archive and spam
+  resolve exactly one Archive- or Junk-role mailbox. `restoreFromTrash()` is
+  now `apply()` with `MailboxChange::untrash()` and keeps its behavior,
+  evidence, and intent key.
+- Write codes `writes_disabled`, `already_in_state` (the destination state
+  already held and this package recorded no intent for it),
+  `unsupported_container` (a Gmail system label or JMAP role mailbox passed as
+  a container), and `container_not_found` (an unknown JMAP mailbox).
 
 - `MailWriteService::restoreFromTrash()`, the first provider write. Gmail
   untrashes one message; Fastmail JMAP moves one email from the Trash-role to

@@ -429,63 +429,98 @@ config()->set('mail-mirror.storage_disk', 'mail-mirror-test');
 It does not return content or object keys. Missing attachments can be rebuilt
 from an unchanged, verified raw message.
 
-## Restore a message from provider Trash
+## Change mailbox state
 
-Provider Trash is normal mailbox state, so restoring from it is a provider
-write. Authorize the owner and approve the action in your application first,
-then call the write service with the full owner tuple:
+Mailbox state such as read, starred, archived, labels, Trash, and Spam is
+provider state, so changing it is a provider write. Writes are off by default:
+set `mail-mirror.writes.enabled` (`MAIL_MIRROR_WRITES_ENABLED`) to true in each
+environment that may write. While it is off, every write throws
+`MailWriteFailure` with `writes_disabled` and `writeSent` false before any
+database or provider access.
+
+Authorize the owner and approve the action in your application first, then
+apply exactly one change to exactly one message with the full owner tuple:
 
 ```php
 use Jkudish\MailMirror\Enums\MailWriteOutcome;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
+use Jkudish\MailMirror\Write\MailboxChange;
 use Jkudish\MailMirror\Write\MailWriteService;
 use Jkudish\MailMirror\Write\MailWriteTarget;
 
-$result = app(MailWriteService::class)->restoreFromTrash(new MailWriteTarget(
+$result = app(MailWriteService::class)->apply(new MailWriteTarget(
     mailAccountId: $account->id,
     ownerType: $account->owner_type,
     ownerId: $account->owner_id,
     providerMessageId: $providerMessageId,
-));
+), MailboxChange::archive());
 
 $result->outcome;          // Applied or AlreadyApplied
 $result->providerEvidence; // provider-native state from the confirming re-read
 ```
 
-Gmail calls `users.messages.untrash`, which restores the message's prior
-labels. The evidence contains `label_ids` and `history_id`. Fastmail JMAP moves
-the email from the Trash-role mailbox to the Inbox-role mailbox, because JMAP
-keeps no record of the original mailbox. The evidence contains `mailbox_ids`,
-`trash_mailbox_id`, `inbox_mailbox_id`, and `email_state`.
+A change never widens to a thread or conversation. To act on a conversation,
+call `apply()` once per message and report each result.
+
+| Change | Gmail request | Fastmail JMAP `Email/set` patch |
+| --- | --- | --- |
+| `markRead()` / `markUnread()` | `modify` removes / adds `UNREAD` | `keywords/$seen` true / null |
+| `star()` / `unstar()` | `modify` adds / removes `STARRED` | `keywords/$flagged` true / null |
+| `archive()` | `modify` removes `INBOX` | Inbox-role → Archive-role mailbox; requires Inbox |
+| `unarchive()` | `modify` adds `INBOX`; refused in Trash or Spam | Archive-role → Inbox-role mailbox; requires Archive |
+| `addContainer($id)` | `modify` adds a user label | adds a mailbox without a role |
+| `removeContainer($id)` | `modify` removes a user label | removes a mailbox without a role; never the last one |
+| `trash()` | `trash` | every current mailbox → Trash-role mailbox |
+| `untrash()` | `untrash` (restores prior labels) | Trash-role → Inbox-role mailbox; requires only Trash |
+| `spam()` | `modify` adds `SPAM`, removes `INBOX` | every current mailbox → Junk-role mailbox |
+| `notSpam()` | `modify` adds `INBOX`, removes `SPAM` | Junk-role → Inbox-role mailbox; requires only Junk |
+
+Gmail requests go to `users.messages.{modify,trash,untrash}` for the target
+message only. Gmail evidence contains `label_ids` and `history_id`. JMAP
+sends one `Email/set` update with `ifInState` from the pre-write read, and
+resolves each role through exactly one mailbox with that role, or fails with
+`ambiguous_mailbox_role`. JMAP evidence contains `mailbox_ids`, the
+`<role>_mailbox_id` of each role used, `keywords` for keyword changes,
+`container_id` for container changes, and `email_state`.
+
+Containers are user labels or role-less mailboxes. Gmail system labels
+(upper-case IDs such as `INBOX` or `CATEGORY_UPDATES`) and JMAP role mailboxes
+fail with `unsupported_container`; use their dedicated change instead. An
+unknown JMAP mailbox fails with `container_not_found`. A JMAP change that would
+leave an email in no mailbox, or move it out of a role mailbox it is not only
+in, fails with `unsupported_state` before any write.
+
+`restoreFromTrash($target)` is `apply($target, MailboxChange::untrash())`.
 
 Every write follows the same sequence:
 
-1. Resolve the account through the full owner tuple. A mismatch throws
+1. Refuse with `writes_disabled` unless writes are enabled.
+2. Resolve the account through the full owner tuple. A mismatch throws
    `AccountResourceMismatch` before any provider request.
-2. Acquire a cache lock for the target message. The lock covers every write to
+3. Acquire a cache lock for the target message. The lock covers every write to
    that message in that account. If another write holds it, the call fails
    immediately with `target_busy` and `writeSent` false, before any provider
    request. The lock is held for at most `mail-mirror.writes.lock_seconds`.
-3. Read the provider state. A message already at the restore destination
-   returns `AlreadyApplied` without writing, but only when this package
-   recorded a restore intent for the same account and message. Otherwise a
-   message outside Trash fails with `not_in_trash`. For Gmail the destination is
-   any state without the `TRASH` label. For JMAP it is Inbox and not Trash.
-4. Send one write with transport retries off. JMAP sends the update with
-   `ifInState`. The package records the intent only when the write may have
-   applied, and clears it when the provider definitively did not apply it.
-5. Re-read the provider state. Only a re-read at the restore destination
+4. Read the provider state. A message already in the change's destination
+   state returns `AlreadyApplied` without writing, but only when this package
+   recorded an intent for the same account, message, and change. Otherwise it
+   fails with `already_in_state` (`not_in_trash` for `untrash()`, as before).
+5. Send one write with transport retries off. The package records the intent
+   only when the write may have applied, and clears it when the provider
+   definitively did not apply it.
+6. Re-read the provider state. Only a re-read in the destination state
    returns `Applied`. A re-read that fails for any reason throws `unconfirmed`.
 
 Any other outcome throws `MailWriteFailure`. Its `safeCode` is one of
-`message_not_found`, `not_in_trash`, `ambiguous_mailbox_role`,
+`writes_disabled`, `message_not_found`, `already_in_state`, `not_in_trash`,
+`ambiguous_mailbox_role`, `unsupported_container`, `container_not_found`,
 `unsupported_state`, `provider_failed`, `target_busy`, `lock_expired`,
-`unconfirmed`, or `unsupported_driver`. `providerCode` carries the underlying provider
-classification when one exists.
+`unconfirmed`, or `unsupported_driver`. `providerCode` carries the underlying
+provider classification when one exists.
 
 `writeSent` is true when the provider may have applied the write: the request
 was sent and the provider did not answer with a 4xx status or a JMAP
-method-level rejection. Call the same restore again to confirm it without a
+method-level rejection. Call the same change again to confirm it without a
 second write. `writeSent` is false when nothing was sent or the provider
 definitively rejected the write. A Gmail 401 on the write refreshes the token
 but does not re-send the write, and reports `writeSent` false.
@@ -493,7 +528,7 @@ but does not re-send the write, and reports `writeSent` false.
 ### Concurrency and cache dependencies
 
 Writes use your application's default cache store for both the per-message lock
-and the restore intent. The store must support atomic locks, as the `redis`,
+and the write intent. The store must support atomic locks, as the `redis`,
 `database`, `file`, `array`, and `dynamodb` stores do. Otherwise the call throws
 `LogicException` before any provider request. Use a store shared by every
 process that can write, or the lock cannot serialize them.
@@ -511,8 +546,9 @@ so a writer that later takes the lock always reads state after this write
 finished. The effective lock is `lock_seconds`, raised to twice the send step
 when configured shorter; retry `lock_expired` like `target_busy`.
 
-If the intent is lost, a retry of an already restored message fails closed
-with `not_in_trash` instead of reporting success. This happens when the cache
+If the intent is lost, a retry of an already applied change fails closed
+with `already_in_state` (`not_in_trash` for a restore) instead of reporting
+success. This happens when the cache
 evicts the intent, when it expires under `mail-mirror.writes.intent_ttl_seconds`,
 or when a process stops between the provider write and recording the intent.
 If a lock outlives a stopped process, the target stays busy until the lock
