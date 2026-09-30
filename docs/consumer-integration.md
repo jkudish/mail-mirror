@@ -527,6 +527,61 @@ second write. `writeSent` is false when nothing was sent or the provider
 definitively rejected the write. A Gmail 401 on the write refreshes the token
 but does not re-send the write, and reports `writeSent` false.
 
+## Manage provider drafts
+
+MailMirror stores drafts at the provider from RFC 5322 bytes your application
+builds; it does not build MIME. Draft writes use the same write switch,
+owner-tuple check, lock, single write, and confirming re-read as mailbox
+changes. Draft reads (`draft()`, `resolveDraft()`) need no write switch.
+
+```php
+use Jkudish\MailMirror\Write\DraftContent;
+use Jkudish\MailMirror\Write\DraftTarget;
+use Jkudish\MailMirror\Write\MailAccountTarget;
+
+$content = new DraftContent($rfc5322Bytes); // throws invalid_draft
+$created = $writes->createDraft(new MailAccountTarget($account->id, $account->owner_type, $account->owner_id), $content, $providerThreadId);
+$draft = $created->draft; // DraftRevision: draftId, providerMessageId, messageId, threadId, rawSha256, revision
+
+$replaced = $writes->replaceDraft(new DraftTarget($account->id, $account->owner_type, $account->owner_id, $draft->draftId), $draft->revision, $newContent);
+$writes->deleteDraft(new DraftTarget(/* ... */ $replaced->draft->draftId), $replaced->draft->revision);
+```
+
+`DraftContent` requires a CRLF-delimited header section with well-formed
+fields, at most one of each RFC 5322 single-instance field, and exactly one
+`Message-ID: <local@domain>`. Bytes larger than
+`mail-mirror.writes.max_draft_bytes` fail `draft_too_large`. Both failures
+happen before any provider request.
+
+The Message-ID is your idempotency key; generate it once before the first
+write. `createDraft()` first looks for drafts with that Message-ID: the same
+bytes return `AlreadyApplied` without a write, and different bytes fail
+`message_id_conflict`. A replace fails the same way when another draft uses
+the new Message-ID with different bytes.
+
+Pass back the `revision` you read. A replace or delete of a draft whose
+current revision differs fails `stale_revision` without writing. A
+`DraftRevision` from a JMAP replace has a new `draftId`, because JMAP emails
+are immutable; Gmail keeps the draft ID and changes `providerMessageId`.
+
+| Operation | Gmail | Fastmail JMAP |
+| --- | --- | --- |
+| create | `drafts.create` with `raw` and optional `threadId` | blob upload, then `Email/import` into the Drafts role with `$draft` and `$seen` |
+| read | `drafts.get` with `format=raw` | `Email/get` plus blob download; must be in Drafts with `$draft` |
+| resolve by provider message ID | `drafts.list` pages, then `drafts.get` | the email ID is the draft ID |
+| replace | `drafts.update`, unconditional | `Email/import` with `ifInState`; after it is created, `Email/set destroy` of the old email with `ifInState` set to the import's `newState` |
+| delete | `drafts.delete` | `Email/set destroy` with `ifInState` |
+
+Gmail has no update precondition. MailMirror compares the revision under its
+lock and sends one update; an edit made elsewhere between that read and the
+update is detected by the confirming re-read and fails `revision_conflict`
+with `writeSent` true. Such an edit can be lost; re-read the draft before
+retrying.
+
+A JMAP replace interrupted after the import and before the destroy leaves both
+drafts. Retrying the same replace with the same revision and bytes finishes it:
+it destroys the old draft without importing again.
+
 ### Concurrency and cache dependencies
 
 Writes use your application's default cache store for both the per-message lock

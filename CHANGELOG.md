@@ -30,6 +30,22 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   evidence, and intent key. Each message has one intent slot naming the last
   change this package may have applied, so a retry returns `AlreadyApplied`
   only when no later write replaced it.
+- Provider drafts from caller-built RFC 5322 bytes (`DraftContent`):
+  `MailWriteService::createDraft()`, `draft()`, `resolveDraft()` (by provider
+  message ID, including drafts started outside the consumer),
+  `replaceDraft()`, and `deleteDraft()`. Each returns or takes a
+  `DraftRevision` whose opaque `revision` must still match before a replace or
+  delete writes anything; a mismatch fails `stale_revision`. The Message-ID is
+  the create idempotency key: a retry finds the existing draft and never
+  creates a second one. Gmail uses `users.drafts` create, get (`format=raw`),
+  update, and delete; a confirming read with other bytes than those written
+  fails `revision_conflict`. JMAP uploads a blob and uses `Email/import` into
+  the Drafts role with `$draft` and `$seen`; a replace imports the new email
+  and, only after it is created, destroys the old one, each guarded by
+  `ifInState`, and a retry finishes an interrupted replace.
+- `mail-mirror.writes.max_draft_bytes` (25 MiB) and draft codes
+  `invalid_draft`, `draft_too_large`, `draft_not_found`, `stale_revision`,
+  `revision_conflict`, and `message_id_conflict`.
 - Write codes `writes_disabled`, `already_in_state` (the destination state
   already held and this package recorded no intent for it),
   `unsupported_container` (a Gmail system label or JMAP role mailbox passed as

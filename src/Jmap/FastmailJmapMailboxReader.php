@@ -12,6 +12,7 @@ use Illuminate\Http\Client\Response;
 use Illuminate\Support\Sleep;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Contracts\BudgetedDeltaMailboxReader;
+use Jkudish\MailMirror\Contracts\DraftDriver;
 use Jkudish\MailMirror\Contracts\MailboxMutationDriver;
 use Jkudish\MailMirror\Credentials\ApiTokenCredential;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
@@ -39,11 +40,13 @@ use Jkudish\MailMirror\Read\ProviderDeletionResolution;
 use Jkudish\MailMirror\Read\RawMessageSource;
 use Jkudish\MailMirror\Read\RetrievedMessage;
 use Jkudish\MailMirror\Read\SyncWorkBudget;
+use Jkudish\MailMirror\Write\DraftContent;
+use Jkudish\MailMirror\Write\DraftRevision;
 use Jkudish\MailMirror\Write\MailboxChange;
 use Jkudish\MailMirror\Write\MessageState;
 use Throwable;
 
-final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, MailboxMutationDriver
+final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, DraftDriver, MailboxMutationDriver
 {
     private const CORE = 'urn:ietf:params:jmap:core';
 
@@ -61,6 +64,9 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
 
     /** @var array<int, array<string, string>> */
     private array $profileMetadata = [];
+
+    /** @var array<int, string|null> session upload URL templates keyed by account */
+    private array $uploadUrls = [];
 
     private ?SyncWorkBudget $budget = null;
 
@@ -870,6 +876,268 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
         throw $this->setItemFailure($error);
     }
 
+    /** A draft is an email in the single Drafts-role mailbox with the $draft keyword. */
+    public function draft(MailAccount $account, string $draftId): ?DraftRevision
+    {
+        $this->assertAccount($account);
+        $session = $this->session($account);
+        $draftsMailboxId = $this->mailboxWithRole($this->fetchMailboxes($account, $session)['mailboxes'], 'drafts');
+        $result = $this->call($account, $session, 'Email/get', [
+            'accountId' => $account->provider_account_id,
+            'ids' => [$draftId],
+            'properties' => ['id', 'blobId', 'threadId', 'mailboxIds', 'keywords'],
+        ], 'draft', MailImportStage::Retrieve);
+        $emailState = $this->boundedString($result['state'] ?? null, 255, MailImportStage::Retrieve);
+
+        if (in_array($draftId, $this->stringList($result['notFound'] ?? [], 255, MailImportStage::Retrieve), true)) {
+            return null;
+        }
+
+        $email = $this->singleObject($result, $draftId, MailImportStage::Retrieve);
+        $mailboxIds = array_keys($this->truthMap($email['mailboxIds'] ?? null, MailImportStage::Retrieve));
+        $keywords = $this->truthMap($email['keywords'] ?? null, MailImportStage::Retrieve);
+
+        if (! in_array($draftsMailboxId, $mailboxIds, true) || ! isset($keywords['$draft'])) {
+            return null;
+        }
+
+        sort($mailboxIds);
+        $blobId = $this->boundedString($email['blobId'] ?? null, 255, MailImportStage::Retrieve);
+        $bytes = $this->download($account, $session, $blobId);
+
+        try {
+            return new DraftRevision(
+                $account->id,
+                MailDriver::Jmap,
+                $draftId,
+                $draftId,
+                DraftContent::messageIdOf($bytes),
+                $this->boundedString($email['threadId'] ?? null, 255, MailImportStage::Retrieve),
+                hash('sha256', $bytes),
+                [
+                    'blob_id' => $blobId,
+                    'mailbox_ids' => $mailboxIds,
+                    'drafts_mailbox_id' => $draftsMailboxId,
+                    'email_state' => $emailState,
+                ],
+            );
+        } catch (InvalidArgumentException) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+        }
+    }
+
+    /** A JMAP draft's ID is its email ID. */
+    public function draftForMessage(MailAccount $account, string $providerMessageId): ?DraftRevision
+    {
+        return $this->draft($account, $providerMessageId);
+    }
+
+    public function draftsWithMessageId(MailAccount $account, string $messageId): array
+    {
+        $this->assertAccount($account);
+        $session = $this->session($account);
+        $draftsMailboxId = $this->mailboxWithRole($this->fetchMailboxes($account, $session)['mailboxes'], 'drafts');
+        $result = $this->call($account, $session, 'Email/query', [
+            'accountId' => $account->provider_account_id,
+            'filter' => ['operator' => 'AND', 'conditions' => [
+                ['inMailbox' => $draftsMailboxId],
+                ['header' => ['Message-ID', '<'.$messageId.'>']],
+            ]],
+            'limit' => 10,
+        ], 'drafts', MailImportStage::Retrieve);
+        $drafts = [];
+
+        foreach ($this->stringList($result['ids'] ?? null, 255, MailImportStage::Retrieve) as $id) {
+            $draft = $this->draft($account, $id);
+
+            if ($draft !== null && $draft->messageId === $messageId) {
+                $drafts[] = $draft;
+            }
+        }
+
+        return $drafts;
+    }
+
+    /** Upload the bytes as a blob. An unreferenced blob is not visible mailbox state. */
+    public function stageDraft(MailAccount $account, DraftContent $content): string
+    {
+        $this->assertAccount($account);
+        $this->session($account);
+        $template = $this->uploadUrls[$account->id] ?? null;
+
+        if (! is_string($template) || ! str_contains($template, '{accountId}')) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::StateMismatch);
+        }
+
+        $url = str_replace('{accountId}', rawurlencode($account->provider_account_id), $template);
+        $this->assertFastmailApiUrl($url);
+
+        if (config('mail-mirror.jmap.enabled') !== true) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::ProviderUnavailable);
+        }
+
+        [$credential, $stored] = $this->credential($account, MailImportStage::Retrieve);
+
+        try {
+            $response = $this->prepareRequest($this->http->withToken($credential->token())->acceptJson())
+                ->withBody($content->bytes, 'message/rfc822')
+                ->post($url);
+        } catch (Throwable) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::ProviderUnavailable, true);
+        }
+
+        if ($response->status() === 401) {
+            $this->revoke($account, $stored, MailImportStage::Retrieve);
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::AuthenticationFailed, httpStatus: 401);
+        }
+
+        if (! $response->successful()) {
+            throw $this->httpFailure($response, MailImportStage::Retrieve);
+        }
+
+        $payload = $response->json();
+
+        if (! is_array($payload) || ($payload['accountId'] ?? null) !== $account->provider_account_id
+            || ($payload['size'] ?? null) !== $content->size()) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+        }
+
+        return $this->boundedString($payload['blobId'] ?? null, 255, MailImportStage::Retrieve);
+    }
+
+    public function createDraft(MailAccount $account, DraftContent $content, ?string $stagedBlobId, ?string $providerThreadId): string
+    {
+        $this->assertAccount($account);
+        // The pre-write Message-ID lookup resolved the Drafts role and cached the mailboxes.
+        $draftsMailboxId = $this->mailboxWithRole($this->mailboxes[$account->id] ?? [], 'drafts');
+
+        return $this->importDraft($account, $this->writableBlobId($stagedBlobId), $draftsMailboxId, null);
+    }
+
+    /**
+     * Import the new email, then destroy the observed one in a second request
+     * sent only after the import created the email. Each request carries
+     * ifInState, so neither applies over an unseen change. A single request
+     * cannot make the destroy depend on the import succeeding.
+     */
+    public function replaceDraft(MailAccount $account, DraftRevision $observed, DraftContent $content, ?string $stagedBlobId, ?DraftRevision $imported): string
+    {
+        $this->assertAccount($account);
+        $state = $observed->providerEvidence['email_state'] ?? null;
+        $draftsMailboxId = $observed->providerEvidence['drafts_mailbox_id'] ?? null;
+
+        if ($observed->mailAccountId !== $account->id || $observed->driver !== MailDriver::Jmap
+            || ! is_string($state) || ! is_string($draftsMailboxId)
+            || ($imported !== null && ($imported->mailAccountId !== $account->id || $imported->rawSha256 !== $content->sha256))) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedState);
+        }
+
+        if ($imported !== null) {
+            // An earlier replace imported the new email and stopped before destroying the old one.
+            $this->destroyEmail($account, $observed->draftId, $state, false);
+
+            return $imported->draftId;
+        }
+
+        $newState = null;
+        $draftId = $this->importDraft($account, $this->writableBlobId($stagedBlobId), $this->writableMailboxId($draftsMailboxId), $state, $newState);
+        $this->destroyEmail($account, $observed->draftId, (string) $newState, true);
+
+        return $draftId;
+    }
+
+    public function deleteDraft(MailAccount $account, DraftRevision $observed): void
+    {
+        $this->assertAccount($account);
+        $state = $observed->providerEvidence['email_state'] ?? null;
+
+        if ($observed->mailAccountId !== $account->id || $observed->driver !== MailDriver::Jmap || ! is_string($state)) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedState);
+        }
+
+        $this->destroyEmail($account, $observed->draftId, $state, false);
+    }
+
+    /** Import one staged blob into Drafts as a seen draft, and return its email ID. */
+    private function importDraft(MailAccount $account, string $blobId, string $draftsMailboxId, ?string $ifInState, ?string &$newState = null): string
+    {
+        $this->credential($account, MailImportStage::Retrieve);
+        $result = $this->sendSet($account, $this->session($account), 'Email/import', array_filter([
+            'accountId' => $account->provider_account_id,
+            'ifInState' => $ifInState,
+            'emails' => ['draft' => [
+                'blobId' => $blobId,
+                'mailboxIds' => [$draftsMailboxId => true],
+                'keywords' => ['$draft' => true, '$seen' => true],
+            ]],
+        ], fn (mixed $value): bool => $value !== null), 'import');
+        $created = $result['created'] ?? null;
+        $email = is_array($created) ? ($created['draft'] ?? null) : null;
+        $id = is_array($email) ? ($email['id'] ?? null) : null;
+        $state = $result['newState'] ?? null;
+
+        if (is_string($id) && $id !== '' && mb_strlen($id) <= 255 && is_string($state) && $state !== '') {
+            $newState = $state;
+
+            return $id;
+        }
+
+        $notCreated = $result['notCreated'] ?? null;
+        $error = is_array($notCreated) ? ($notCreated['draft'] ?? null) : null;
+
+        throw is_array($error)
+            ? $this->setItemFailure($error)
+            : new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
+    }
+
+    /**
+     * Destroy one email while the account's Email state is $ifInState. After an
+     * import in the same replace, every failure is writeSent: the import applied.
+     */
+    private function destroyEmail(MailAccount $account, string $emailId, string $ifInState, bool $afterImport): void
+    {
+        try {
+            $this->credential($account, MailImportStage::Retrieve);
+            $result = $this->sendSet($account, $this->session($account), 'Email/set', [
+                'accountId' => $account->provider_account_id,
+                'ifInState' => $ifInState,
+                'destroy' => [$emailId],
+            ], 'destroy');
+            $destroyed = $result['destroyed'] ?? null;
+
+            if (is_array($destroyed) && in_array($emailId, $destroyed, true)) {
+                return;
+            }
+
+            $notDestroyed = $result['notDestroyed'] ?? null;
+            $error = is_array($notDestroyed) ? ($notDestroyed[$emailId] ?? null) : null;
+
+            throw is_array($error)
+                ? $this->setItemFailure($error)
+                : new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
+        } catch (MailImportFailure|MailWriteFailure $failure) {
+            if (! $afterImport) {
+                throw $failure instanceof MailImportFailure ? MailWriteFailure::fromProvider($failure, false) : $failure;
+            }
+
+            throw new MailWriteFailure(
+                MailWriteCode::ProviderFailed,
+                true,
+                $failure instanceof MailImportFailure ? $failure->safeCode : $failure->providerCode,
+                $failure,
+            );
+        }
+    }
+
+    private function writableBlobId(?string $blobId): string
+    {
+        if (! is_string($blobId) || preg_match('/\A[A-Za-z0-9_-]{1,255}\z/', $blobId) !== 1) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedState);
+        }
+
+        return $blobId;
+    }
+
     /** A mailbox ID safe to place in an Email/set patch path. */
     private function writableMailboxId(mixed $id): string
     {
@@ -996,6 +1264,7 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
         $accounts = $payload['accounts'] ?? null;
         $apiUrl = $payload['apiUrl'] ?? null;
         $downloadUrl = $payload['downloadUrl'] ?? null;
+        $uploadUrl = $payload['uploadUrl'] ?? null;
         $state = $payload['state'] ?? null;
 
         $nativeAccount = is_array($accounts) ? ($accounts[$account->provider_account_id] ?? null) : null;
@@ -1014,6 +1283,7 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
 
         $this->assertFastmailApiUrl($apiUrl);
         $this->assertFastmailDownloadUrl($downloadUrl);
+        $this->uploadUrls[$account->id] = is_string($uploadUrl) ? $uploadUrl : null;
 
         $session = [
             'api_url' => $apiUrl,
