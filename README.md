@@ -99,9 +99,10 @@ Your application must:
 - treat package events as notification references, not authorization.
 
 MailMirror never sends mail, changes mailbox state, or purges local mail on its
-own. It changes provider state only when your application calls a write such as
-`MailWriteService::restoreFromTrash()`; approving that call is your
-application's responsibility.
+own. It changes provider state only when your application enables
+`mail-mirror.writes.enabled` and calls a write such as
+`MailWriteService::apply()`; approving that call is your application's
+responsibility.
 
 ## Documentation
 

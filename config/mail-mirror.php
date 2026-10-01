@@ -29,9 +29,15 @@ return [
 
     'writes' => [
         /*
-         * A restore records its intent under an account-namespaced cache key
+         * Every provider write is refused with writes_disabled, before any
+         * provider request, unless a consumer explicitly enables writes.
+         */
+        'enabled' => filter_var(env('MAIL_MIRROR_WRITES_ENABLED', false), FILTER_VALIDATE_BOOL),
+
+        /*
+         * A write records its intent under an account-namespaced cache key
          * before the provider write. A retry within this window that finds the
-         * message already restored returns success without writing again.
+         * message already in the written state returns success without writing again.
          */
         'intent_ttl_seconds' => 86400,
 
