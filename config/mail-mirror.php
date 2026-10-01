@@ -49,6 +49,9 @@ return [
          * shorter than twice that step is raised automatically.
          */
         'lock_seconds' => 300,
+
+        /* Draft bytes larger than this are refused with draft_too_large before any request. */
+        'max_draft_bytes' => 26214400,
     ],
 
     'gmail' => [

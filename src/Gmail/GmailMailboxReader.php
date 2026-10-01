@@ -12,6 +12,7 @@ use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Date;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Contracts\BudgetedDeltaMailboxReader;
+use Jkudish\MailMirror\Contracts\DraftDriver;
 use Jkudish\MailMirror\Contracts\MailboxMutationDriver;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
@@ -40,13 +41,15 @@ use Jkudish\MailMirror\Read\ProviderDeletionResolution;
 use Jkudish\MailMirror\Read\RawMessageSource;
 use Jkudish\MailMirror\Read\RetrievedMessage;
 use Jkudish\MailMirror\Read\SyncWorkBudget;
+use Jkudish\MailMirror\Write\DraftContent;
+use Jkudish\MailMirror\Write\DraftRevision;
 use Jkudish\MailMirror\Write\MailboxChange;
 use Jkudish\MailMirror\Write\MessageState;
 use Throwable;
 use ZBateson\MailMimeParser\Header\AddressHeader;
 use ZBateson\MailMimeParser\MailMimeParser;
 
-final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMutationDriver
+final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDriver, MailboxMutationDriver
 {
     private const API = 'https://gmail.googleapis.com/gmail/v1';
 
@@ -770,6 +773,233 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
         }
     }
 
+    public function draft(MailAccount $account, string $draftId): ?DraftRevision
+    {
+        $this->assertAccount($account);
+
+        try {
+            $native = $this->request($account, 'GET', self::API.'/users/me/drafts/'.rawurlencode($draftId), ['format' => 'raw']);
+        } catch (MailImportFailure $failure) {
+            if ($failure->httpStatus === 404) {
+                return null;
+            }
+
+            throw $failure;
+        }
+
+        $message = $native['message'] ?? null;
+        $raw = is_array($message) ? ($message['raw'] ?? null) : null;
+        $messageId = is_array($message) ? ($message['id'] ?? null) : null;
+        $threadId = is_array($message) ? ($message['threadId'] ?? null) : null;
+        $labelIds = is_array($message) ? ($message['labelIds'] ?? []) : null;
+
+        if (($native['id'] ?? null) !== $draftId || ! is_string($raw) || ! is_string($messageId) || $messageId === ''
+            || ! is_string($threadId) || $threadId === '' || ! is_array($labelIds) || ! array_is_list($labelIds)
+            || array_filter($labelIds, fn (mixed $labelId): bool => ! is_string($labelId)) !== []) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+        }
+
+        $bytes = $this->base64UrlDecode($raw, MailImportStage::Retrieve, $this->maxRawBytes());
+
+        try {
+            return new DraftRevision(
+                $account->id,
+                MailDriver::Gmail,
+                $draftId,
+                $messageId,
+                DraftContent::messageIdOf($bytes),
+                $threadId,
+                hash('sha256', $bytes),
+                ['label_ids' => $labelIds],
+            );
+        } catch (InvalidArgumentException) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+        }
+    }
+
+    /** Pages through drafts.list, which reports each draft's current message ID. */
+    public function draftForMessage(MailAccount $account, string $providerMessageId): ?DraftRevision
+    {
+        $this->assertAccount($account);
+        $pageToken = null;
+
+        for ($page = 0; $page < 20; $page++) {
+            $native = $this->request($account, 'GET', self::API.'/users/me/drafts', array_filter([
+                'maxResults' => 500,
+                'pageToken' => $pageToken,
+            ], fn (mixed $value): bool => $value !== null));
+
+            foreach ($this->draftIds($native) as $draftId => $messageId) {
+                if ($messageId === $providerMessageId) {
+                    return $this->draft($account, $draftId);
+                }
+            }
+
+            $pageToken = $native['nextPageToken'] ?? null;
+
+            if (! is_string($pageToken) || $pageToken === '') {
+                return null;
+            }
+        }
+
+        throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::StateMismatch);
+    }
+
+    public function draftsWithMessageId(MailAccount $account, string $messageId): array
+    {
+        $this->assertAccount($account);
+        $native = $this->request($account, 'GET', self::API.'/users/me/drafts', [
+            'q' => 'rfc822msgid:'.$messageId,
+            'maxResults' => 10,
+        ]);
+        $drafts = [];
+
+        foreach (array_keys($this->draftIds($native)) as $draftId) {
+            $draft = $this->draft($account, $draftId);
+
+            if ($draft !== null && $this->sameContentIdentity($draft, $messageId, null)) {
+                $drafts[] = $draft;
+            }
+        }
+
+        return $drafts;
+    }
+
+    public function holdsContent(DraftRevision $draft, DraftContent $content): bool
+    {
+        return $this->sameContentIdentity($draft, $content->messageId, $content->sha256);
+    }
+
+    /**
+     * Gmail content identity, in one place. ASSUMPTION, unverified against live
+     * Gmail (#3131): drafts.get format=raw returns exactly the bytes written,
+     * including the client Message-ID. If Gmail rewrites either, every Gmail
+     * create and replace reports unconfirmed or revision_conflict, and draft
+     * lookups by Message-ID find nothing; change only this method.
+     */
+    private function sameContentIdentity(DraftRevision $draft, string $messageId, ?string $sha256): bool
+    {
+        return $draft->messageId === $messageId && ($sha256 === null || $draft->rawSha256 === $sha256);
+    }
+
+    public function stageDraft(MailAccount $account, DraftContent $content): ?string
+    {
+        return null;
+    }
+
+    public function createDraft(MailAccount $account, DraftContent $content, ?string $stagedBlobId, ?string $providerThreadId): string
+    {
+        $this->assertAccount($account);
+        $this->credential($account, null);
+        $native = $this->sendDraftWrite($account, 'POST', self::API.'/users/me/drafts', [
+            'message' => array_filter([
+                'raw' => $this->base64UrlEncode($content->bytes),
+                'threadId' => $providerThreadId,
+            ], fn (mixed $value): bool => $value !== null),
+        ]);
+        $draftId = $native['id'] ?? null;
+
+        return is_string($draftId) && $draftId !== ''
+            ? $draftId
+            : throw new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
+    }
+
+    /**
+     * Gmail has no update precondition, so this update is unconditional. The
+     * service compared the revision under its lock, and its confirming read
+     * reports a racing external edit as revision_conflict.
+     */
+    public function replaceDraft(MailAccount $account, DraftRevision $observed, DraftContent $content, ?string $stagedBlobId, ?DraftRevision $imported): string
+    {
+        $this->assertAccount($account);
+
+        // drafts.update replaces in place, so no interrupted replace leaves a second draft.
+        if ($imported !== null) {
+            throw new MailWriteFailure(MailWriteCode::MessageIdConflict);
+        }
+
+        $this->assertDraft($account, $observed);
+        $this->credential($account, null);
+        $url = self::API.'/users/me/drafts/'.rawurlencode($observed->draftId);
+        $native = $this->sendDraftWrite($account, 'PUT', $url, [
+            'id' => $observed->draftId,
+            'message' => ['raw' => $this->base64UrlEncode($content->bytes), 'threadId' => $observed->threadId],
+        ]);
+
+        return ($native['id'] ?? null) === $observed->draftId
+            ? $observed->draftId
+            : throw new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
+    }
+
+    public function deleteDraft(MailAccount $account, DraftRevision $observed): void
+    {
+        $this->assertAccount($account);
+        $this->assertDraft($account, $observed);
+        $this->credential($account, null);
+        $this->sendDraftWrite($account, 'DELETE', self::API.'/users/me/drafts/'.rawurlencode($observed->draftId), null);
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $json
+     * @return array<string, mixed>
+     */
+    private function sendDraftWrite(MailAccount $account, string $method, string $url, ?array $json): array
+    {
+        try {
+            return $this->request(
+                $account,
+                $method,
+                $url,
+                resendAfterReauthorization: false,
+                refreshCredential: false,
+                json: $json,
+            );
+        } catch (MailImportFailure $failure) {
+            throw MailWriteFailure::fromProvider($failure, true);
+        }
+    }
+
+    private function assertDraft(MailAccount $account, DraftRevision $observed): void
+    {
+        if ($observed->mailAccountId !== $account->id || $observed->driver !== MailDriver::Gmail) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedState);
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $native  a drafts.list page
+     * @return array<string, string> message IDs keyed by draft ID
+     */
+    private function draftIds(array $native): array
+    {
+        $drafts = $native['drafts'] ?? [];
+
+        if (! is_array($drafts) || ! array_is_list($drafts) || count($drafts) > 500) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+        }
+
+        $ids = [];
+
+        foreach ($drafts as $draft) {
+            $draftId = is_array($draft) ? ($draft['id'] ?? null) : null;
+            $message = is_array($draft) ? ($draft['message'] ?? null) : null;
+            $messageId = is_array($message) ? ($message['id'] ?? null) : null;
+
+            if (! is_string($draftId) || $draftId === '' || mb_strlen($draftId) > 255 || ! is_string($messageId)) {
+                throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+            }
+
+            $ids[$draftId] = $messageId;
+        }
+
+        return $ids;
+    }
+
+    private function base64UrlEncode(string $bytes): string
+    {
+        return rtrim(strtr(base64_encode($bytes), '+/', '-_'), '=');
+    }
+
     /**
      * Writes pass $resendAfterReauthorization false: a rejected token is
      * refreshed for the next call, but the write itself is never re-sent.
@@ -817,6 +1047,11 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
 
         if (! $response->successful()) {
             throw $this->failureFor($response, $url);
+        }
+
+        // drafts.delete answers 204 with no body.
+        if ($method === 'DELETE' && $response->body() === '') {
+            return [];
         }
 
         $payload = $response->json();
