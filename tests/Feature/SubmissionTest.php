@@ -43,6 +43,12 @@ final class SubmitGmailProvider
     /** @var list<string> */
     public array $paths = [];
 
+    /** @var array<string, string> the bytes Gmail actually sent, keyed by sent message ID */
+    public array $sentRaw = [];
+
+    /** @var (Closure(): void)|null Runs during each SENT search, for example an edit in Gmail's UI. */
+    public ?Closure $onSentSearch = null;
+
     /** @return Closure(Request): mixed */
     public function handler(): Closure
     {
@@ -53,7 +59,7 @@ final class SubmitGmailProvider
 
             if ($path === '/gmail/v1/users/me/drafts/send') {
                 expect($request->method())->toBe('POST');
-                /** @var array{id: string} $body */
+                /** @var array{id: string, message?: array{raw: string}} $body */
                 $body = $request->data();
                 $this->sends[] = $body;
 
@@ -71,7 +77,10 @@ final class SubmitGmailProvider
                 }
 
                 $id = 'sent-'.$draft['message'];
-                $header = $this->sentMessageIdHeader ?? '<'.DraftContent::messageIdOf($draft['raw']).'>';
+                // drafts.send with a message sends those bytes; with only an ID, the stored draft.
+                $raw = isset($body['message']) ? (string) base64_decode(strtr($body['message']['raw'], '-_', '+/'), true) : $draft['raw'];
+                $this->sentRaw[$id] = $raw;
+                $header = $this->sentMessageIdHeader ?? '<'.DraftContent::messageIdOf($raw).'>';
                 $this->messages[$id] = ['thread' => $draft['thread'], 'labels' => ['SENT'], 'messageIdHeader' => $header];
                 unset($this->drafts[$body['id']]);
 
@@ -96,6 +105,11 @@ final class SubmitGmailProvider
 
             if ($path === '/gmail/v1/users/me/messages') {
                 expect($query['labelIds'] ?? null)->toBe('SENT');
+
+                if ($this->onSentSearch !== null) {
+                    ($this->onSentSearch)();
+                }
+
                 $q = $query['q'] ?? null;
                 $wanted = '<'.substr(is_string($q) ? $q : '', strlen('rfc822msgid:')).'>';
 
@@ -215,10 +229,17 @@ final class SubmitJmapProvider
                     /** @var array{emailIds: list<string>} $filter */
                     $filter = $arguments['filter'];
 
-                    return $reply('EmailSubmission/query', ['queryState' => 'q', 'position' => 0, 'ids' => array_keys(array_filter(
+                    $all = array_keys(array_filter(
                         $this->submissions,
                         fn (array $submission): bool => in_array($submission['emailId'], $filter['emailIds'], true),
-                    ))]);
+                    ));
+                    $position = is_int($arguments['position'] ?? null) ? $arguments['position'] : 0;
+                    $limit = min(10, is_int($arguments['limit'] ?? null) ? $arguments['limit'] : 10);
+
+                    return $reply('EmailSubmission/query', [
+                        'queryState' => 'q', 'position' => $position, 'limit' => $limit, 'total' => count($all),
+                        'ids' => array_slice($all, $position, $limit),
+                    ]);
                 })(),
                 'EmailSubmission/get' => (function () use ($arguments, $reply): mixed {
                     /** @var list<string> $ids */
@@ -350,7 +371,7 @@ it('sends a Gmail draft with exactly one drafts.send and returns the confirmed s
         ->and($result->providerMessageId)->toBe('sent-m-1')
         ->and($result->threadId)->toBe('t-1')
         ->and($result->matchedBy)->toBe('provider_id')
-        ->and($gmail->sends)->toBe([['id' => 'd-1']])
+        ->and($gmail->sends)->toBe([['id' => 'd-1', 'message' => ['raw' => rtrim(strtr(base64_encode(submitBytes('send-1@invented.test')), '+/', '-_'), '='), 'threadId' => 't-1']]])
         ->and($gmail->drafts)->toBe([])
         ->and(array_slice($gmail->paths, -2))->toBe(['POST /gmail/v1/users/me/drafts/send', 'GET /gmail/v1/users/me/messages/sent-m-1']);
 });
@@ -447,25 +468,30 @@ it('never sends again after a possibly sent submit and reconciles it from provid
         ->and($driver === MailDriver::Gmail ? $gmail->sends : $jmap->sends)->toHaveCount(1);
 })->with([MailDriver::Gmail, MailDriver::Jmap]);
 
-it('reports not_submitted only while the draft still exists at the expected revision, then allows a new submit', function (MailDriver $driver): void {
+it('reports unknown, never not_submitted, when nothing matched and the draft is unchanged, and keeps blocking', function (MailDriver $driver): void {
     [$gmail, $jmap, $account] = submitSetup($driver);
     $gmail->sendStatusBeforeApply = 503;
     $service = app(MailWriteService::class);
     $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
 
     if ($driver === MailDriver::Gmail) {
-        expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->writeSent)->toBeTrue()
-            // The draft still exists, but the uncertain send blocks another until reconciled.
-            ->and(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->safeCode)->toBe(MailWriteCode::SubmissionUnknown)
-            ->and($gmail->sends)->toHaveCount(1);
+        expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->writeSent)->toBeTrue();
     }
 
     $reconciled = $service->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test');
 
-    expect($reconciled->outcome)->toBe(SubmissionOutcome::NotSubmitted)
-        ->and($reconciled->providerEvidence)->toBe(['draft_exists' => true, 'draft_at_expected_revision' => true])
-        ->and($service->submit(submitTarget($account, 'd-1'), $revision)->outcome)->toBe(SubmissionOutcome::Submitted)
-        ->and($driver === MailDriver::Gmail ? $gmail->sends : $jmap->sends)->toHaveCount($driver === MailDriver::Gmail ? 2 : 1);
+    expect($reconciled->outcome)->toBe(SubmissionOutcome::Unknown)
+        ->and($reconciled->providerEvidence)->toBe(['draft_exists' => true, 'draft_at_expected_revision' => true]);
+
+    if ($driver === MailDriver::Gmail) {
+        // Unknown never clears the recorded attempt.
+        expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->safeCode)->toBe(MailWriteCode::SubmissionUnknown)
+            ->and($gmail->sends)->toHaveCount(1);
+    } else {
+        // Without any recorded attempt, reconciliation itself blocks nothing.
+        expect($service->submit(submitTarget($account, 'd-1'), $revision)->outcome)->toBe(SubmissionOutcome::Submitted)
+            ->and($jmap->sends)->toHaveCount(1);
+    }
 })->with([MailDriver::Gmail, MailDriver::Jmap]);
 
 it('reports unknown, never not_submitted, when the Gmail draft is gone and the sent copy has another Message-ID', function (): void {
@@ -521,7 +547,7 @@ it('reconciles JMAP by EmailSubmission on the email ID, ignoring canceled submis
 })->with([
     'pending, while the email is still a draft' => ['pending', SubmissionOutcome::Submitted],
     'final' => ['final', SubmissionOutcome::Submitted],
-    'canceled' => ['canceled', SubmissionOutcome::NotSubmitted],
+    'canceled' => ['canceled', SubmissionOutcome::Unknown],
 ]);
 
 it('refuses submit with writes_disabled before any request while the switch is off', function (): void {
@@ -566,5 +592,100 @@ it('never sends a second JMAP submission after the submit intent is evicted', fu
         ->and($jmap->sends)->toHaveCount(1)
         ->and($service->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test')->outcome)
         ->toBe(SubmissionOutcome::Submitted)
+        ->and($jmap->sends)->toHaveCount(1);
+});
+
+it('sends the approved Gmail bytes and From even when the draft changes during the pre-send search', function (): void {
+    [$gmail, , $account] = submitSetup(MailDriver::Gmail);
+    $service = app(MailWriteService::class);
+    $approved = $service->draft(submitTarget($account, 'd-1'));
+    // Someone edits the draft in Gmail's UI after the revision and identity checks.
+    $gmail->onSentSearch = function () use ($gmail): void {
+        $gmail->drafts['d-1']['raw'] = submitBytes('send-1@invented.test', 'Attacker <attacker@invented.test>');
+        $gmail->onSentSearch = null;
+    };
+
+    $result = $service->submit(submitTarget($account, 'd-1'), $approved->revision);
+
+    expect($result->outcome)->toBe(SubmissionOutcome::Submitted)
+        ->and($gmail->sentRaw['sent-m-1'])->toBe(submitBytes('send-1@invented.test'))
+        ->and(DraftContent::fromAddressOf($gmail->sentRaw['sent-m-1']))->toBe('owner@invented.test');
+});
+
+it('reports unknown for a changed but existing draft with only a Message-ID match, and the attempt still blocks', function (): void {
+    [$gmail, , $account] = submitSetup(MailDriver::Gmail);
+    $gmail->sendStatusBeforeApply = 503;
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
+
+    expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->writeSent)->toBeTrue();
+
+    $gmail->drafts['d-1']['raw'] = submitBytes('send-1@invented.test', 'alias@invented.test');
+    $gmail->messages['sent-elsewhere'] = ['thread' => 't-9', 'labels' => ['SENT'], 'messageIdHeader' => '<send-1@invented.test>'];
+    $result = $service->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test');
+
+    expect($result->outcome)->toBe(SubmissionOutcome::Unknown)
+        ->and($result->matchedBy)->toBe('message_id')
+        ->and(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->safeCode)->toBe(MailWriteCode::SubmissionUnknown)
+        ->and($gmail->sends)->toHaveCount(1);
+});
+
+it('finds a final JMAP submission behind ten canceled ones after the attempt is evicted', function (): void {
+    [, $jmap, $account] = submitSetup(MailDriver::Jmap);
+
+    for ($i = 1; $i <= 10; $i++) {
+        $jmap->submissions['canceled-'.$i] = ['emailId' => 'd-1', 'undoStatus' => 'canceled'];
+    }
+
+    $jmap->skipOnSuccess = true;
+    $jmap->sendStatusAfterApply = 503;
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
+
+    expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->writeSent)->toBeTrue();
+    cache()->flush();
+
+    expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->safeCode)->toBe(MailWriteCode::SubmissionUnknown)
+        ->and($jmap->sends)->toHaveCount(1)
+        ->and($service->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test')->outcome)->toBe(SubmissionOutcome::Submitted)
+        ->and($jmap->sends)->toHaveCount(1);
+});
+
+it('treats a JMAP submission search that reaches its bound as unknown, never as absence', function (): void {
+    [, $jmap, $account] = submitSetup(MailDriver::Jmap);
+
+    for ($i = 1; $i <= 250; $i++) {
+        $jmap->submissions['canceled-'.$i] = ['emailId' => 'd-1', 'undoStatus' => 'canceled'];
+    }
+
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
+
+    expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->safeCode)->toBe(MailWriteCode::SubmissionUnknown)
+        ->and($jmap->sends)->toBe([])
+        ->and($service->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test')->outcome)->toBe(SubmissionOutcome::Unknown);
+});
+
+it('reports unknown after an accepted JMAP submission whose record was destroyed, and keeps refusing', function (): void {
+    [, $jmap, $account] = submitSetup(MailDriver::Jmap);
+    $jmap->skipOnSuccess = true;
+    $jmap->sendStatusAfterApply = 503;
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
+
+    expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->writeSent)->toBeTrue();
+    // RFC 8621 lets the server destroy the submission record after sending.
+    $jmap->submissions = [];
+    $requests = count(Http::recorded());
+    $result = $service->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test');
+
+    expect($result->outcome)->toBe(SubmissionOutcome::Unknown)
+        ->and($result->providerEvidence)->toBe(['draft_exists' => true, 'draft_at_expected_revision' => true])
+        ->and(count(Http::recorded()))->toBeGreaterThan($requests);
+
+    $requests = count(Http::recorded());
+
+    expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->safeCode)->toBe(MailWriteCode::SubmissionUnknown)
+        ->and(count(Http::recorded()))->toBe($requests)
         ->and($jmap->sends)->toHaveCount(1);
 });

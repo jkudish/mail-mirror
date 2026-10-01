@@ -59,6 +59,9 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
 
     private const SESSION_URL = 'https://api.fastmail.com/jmap/session';
 
+    /** EmailSubmission/query pages read before submission evidence counts as unknown. */
+    private const SUBMISSION_QUERY_PAGES = 20;
+
     /** @var array<int, array{api_url: string, download_url: string, session_state: string}> */
     private array $sessions = [];
 
@@ -924,6 +927,7 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
                     'email_state' => $emailState,
                 ],
                 DraftContent::fromAddressOf($bytes),
+                $bytes,
             );
         } catch (InvalidArgumentException) {
             throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
@@ -1166,14 +1170,25 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
     {
         $this->assertAccount($account);
         $session = $this->session($account);
-        $query = $this->call($account, $session, 'EmailSubmission/query', [
-            'accountId' => $account->provider_account_id,
-            'filter' => ['emailIds' => [$draftId]],
-            'limit' => 10,
-        ], 'submissions', MailImportStage::Retrieve);
-        $submissionIds = $this->stringList($query['ids'] ?? null, 255, MailImportStage::Retrieve);
+        $position = 0;
 
-        if ($submissionIds !== []) {
+        // Canceled submissions do not count, so page until linked pending or final
+        // evidence appears or the query is exhausted. Reaching the bound is never
+        // treated as absence.
+        for ($page = 0; $page < self::SUBMISSION_QUERY_PAGES; $page++) {
+            $query = $this->call($account, $session, 'EmailSubmission/query', [
+                'accountId' => $account->provider_account_id,
+                'filter' => ['emailIds' => [$draftId]],
+                'position' => $position,
+                'limit' => 50,
+                'calculateTotal' => true,
+            ], 'submissions', MailImportStage::Retrieve);
+            $submissionIds = $this->stringList($query['ids'] ?? null, 255, MailImportStage::Retrieve);
+
+            if ($submissionIds === []) {
+                break;
+            }
+
             $submissions = $this->objectList($this->call($account, $session, 'EmailSubmission/get', [
                 'accountId' => $account->provider_account_id,
                 'ids' => $submissionIds,
@@ -1195,6 +1210,17 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
                         ],
                     );
                 }
+            }
+
+            $position += count($submissionIds);
+            $total = $query['total'] ?? null;
+
+            if (is_int($total) && $position >= $total) {
+                break;
+            }
+
+            if ($page === self::SUBMISSION_QUERY_PAGES - 1) {
+                throw new MailWriteFailure(MailWriteCode::SubmissionUnknown);
             }
         }
 

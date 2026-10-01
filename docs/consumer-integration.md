@@ -612,35 +612,41 @@ Before sending, MailMirror re-reads the draft under the draft lock. A changed
 revision fails `stale_revision`. The draft's single From address must match,
 case-insensitively, exactly one identity mirrored for the account by the last
 import; otherwise the call fails `identity_mismatch` before any submission
-request. Gmail sends one `drafts.send`, which deletes the draft. JMAP sends one
-`EmailSubmission/set` with that identity's `identityId` and
-`onSuccessUpdateEmail`, which moves the email from Drafts to Sent and removes
-`$draft`. Neither request is retried. `Submitted` is returned only after a
-re-read shows the message sent.
+request. Gmail sends one `drafts.send` carrying the exact bytes read at the
+approved revision, so the approved content and From go out even if the draft
+is edited in Gmail during the submit; that concurrent edit is lost. Gmail
+deletes the draft on success. JMAP sends one `EmailSubmission/set` with that
+identity's `identityId` and `onSuccessUpdateEmail`, which moves the email from
+Drafts to Sent and removes `$draft`; JMAP emails are immutable, so the email
+ID pins the approved bytes. Neither request is retried. `Submitted` is returned
+only after a re-read shows the message sent.
 
 When a submit fails with `writeSent` true, the provider may have sent it.
 MailMirror records that and refuses every later `submit()` of the draft with
-`submission_unknown`, without any provider request. Call
-`reconcileSubmission($target, $revision, $messageId)`; it only reads.
-The record lives in the cache; if it is evicted, `submit()` still refuses with
-`submission_unknown` when the provider links a submission to the draft's ID
-(a JMAP `EmailSubmission`), so a draft left in Drafts after an accepted
-submission is never sent twice. Every submit makes that one read first.
-Reconciliation uses this evidence:
+`submission_unknown`, without any provider request. The record lives in the
+cache; if it is evicted, `submit()` still refuses when the provider links a
+submission to the draft's ID (a JMAP `EmailSubmission` that is `pending` or
+`final`, searched page by page). A search that reaches its page bound before
+it is exhausted also refuses. Every submit makes that read first.
+
+`reconcileSubmission($target, $revision, $messageId)` only reads, and answers
+`submitted` or `unknown`:
 
 | Evidence | Outcome |
 | --- | --- |
 | JMAP `EmailSubmission` for the email ID, `pending` or `final` | `submitted` (`matchedBy` `provider_id`) |
-| Sent message with the Message-ID, draft gone or changed | `submitted` (`matchedBy` `message_id`) |
-| Sent message with the Message-ID, draft still at the revision | `unknown` |
-| No match, draft still at the revision | `not_submitted` |
-| No match, draft gone or changed | `unknown` |
+| Sent message with the Message-ID, draft gone | `submitted` (`matchedBy` `message_id`) |
+| Sent message with the Message-ID, draft still exists (any revision) | `unknown` |
+| No match, or a submission search that reached its bound | `unknown` |
 
-`not_submitted` is never inferred from a missing Message-ID match alone, so a
-provider that rewrites Message-IDs yields `unknown`, not a second send.
-`submitted` and `not_submitted` clear the recorded attempt, after which a new
-`submit()` is allowed; `unknown` keeps it. Treat `unknown` as needing a human
-decision, and never re-send on it.
+Absence is never proof that nothing was sent: a provider may destroy
+submission records after sending (RFC 8621), may rewrite Message-IDs, and a
+timed-out request may still be in flight. `submitted` clears the recorded
+attempt; `unknown` never does. Durable at-most-once and any decision to send
+again after `unknown` belong to your application's approval process, with a
+human decision; MailMirror never re-sends. While the record exists, a resend
+needs a new draft (new draft ID and Message-ID) or the record's expiry under
+`mail-mirror.writes.intent_ttl_seconds`.
 
 ### Concurrency and cache dependencies
 

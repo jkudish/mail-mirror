@@ -815,6 +815,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
                 hash('sha256', $bytes),
                 ['label_ids' => $labelIds],
                 DraftContent::fromAddressOf($bytes),
+                $bytes,
             );
         } catch (InvalidArgumentException) {
             throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
@@ -880,8 +881,8 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
      * including the client Message-ID. If Gmail rewrites either, every Gmail
      * create and replace reports unconfirmed or revision_conflict, and draft
      * lookups by Message-ID find nothing; change only this method. Submission
-     * reconciliation reports not_submitted only from the draft itself, never
-     * from a missing Message-ID match, so a rewrite there yields unknown.
+     * reconciliation never infers anything from a missing Message-ID match, so
+     * a rewrite there yields unknown.
      */
     private function sameContentIdentity(?string $observedMessageId, ?string $observedSha256, string $messageId, ?string $sha256): bool
     {
@@ -945,7 +946,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
         $this->sendDraftWrite($account, 'DELETE', self::API.'/users/me/drafts/'.rawurlencode($observed->draftId), null);
     }
 
-    /** drafts.send sends the draft's stored bytes and deletes the draft on success. */
+    /** drafts.send sends the approved bytes and deletes the draft on success. */
     public function submitDraft(MailAccount $account, DraftRevision $observed, MailIdentity $identity): string
     {
         $this->assertAccount($account);
@@ -955,8 +956,18 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
             throw new MailWriteFailure(MailWriteCode::IdentityMismatch);
         }
 
+        if ($observed->rawBytes === null) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedState);
+        }
+
+        // Send the approved snapshot, not whatever the draft holds now: drafts.send with
+        // only an ID would send an edit made in Gmail after the revision and identity
+        // checks. A concurrent Gmail edit to the draft is lost (accepted Gmail draft race).
         $this->credential($account, null);
-        $native = $this->sendDraftWrite($account, 'POST', self::API.'/users/me/drafts/send', ['id' => $observed->draftId]);
+        $native = $this->sendDraftWrite($account, 'POST', self::API.'/users/me/drafts/send', [
+            'id' => $observed->draftId,
+            'message' => ['raw' => $this->base64UrlEncode($observed->rawBytes), 'threadId' => $observed->threadId],
+        ]);
         $messageId = $native['id'] ?? null;
 
         return is_string($messageId) && $messageId !== '' && mb_strlen($messageId) <= 255

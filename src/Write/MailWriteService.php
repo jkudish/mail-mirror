@@ -442,12 +442,13 @@ final readonly class MailWriteService
      * Send one draft exactly once, only while it still has $expectedRevision
      * and its From address matches exactly one mirrored provider identity.
      *
-     * A submit that may have been sent records an intent; until
-     * reconcileSubmission() answers submitted or not_submitted, every later
-     * submit of that draft fails submission_unknown without any provider
-     * request. If that cache intent is lost, a provider submission linked to
-     * the draft's ID still refuses the send with submission_unknown. MailMirror never re-sends on its own. Durable approval and
-     * at-most-once across processes belong to the consumer.
+     * Gmail sends the bytes approved at $expectedRevision, not the draft's
+     * current content. A submit that may have been sent records an intent;
+     * until reconcileSubmission() answers submitted, every later submit of
+     * that draft fails submission_unknown without any provider request. If that
+     * cache intent is lost, a provider submission linked to the draft's ID still
+     * refuses the send. MailMirror never re-sends on its own. Durable
+     * at-most-once and any human-authorized resend belong to the consumer.
      *
      * @throws AccountResourceMismatch before any provider request
      * @throws MailWriteFailure
@@ -525,14 +526,12 @@ final readonly class MailWriteService
      * $expectedRevision with Message-ID $messageId, was submitted.
      *
      * - Evidence linked to the draft's own provider ID means submitted.
-     * - A Message-ID match alone means submitted only when the draft is gone,
-     *   and unknown while the draft still exists at the expected revision.
-     * - No match means not_submitted only while the draft still exists at the
-     *   expected revision, because a successful send removes the draft;
-     *   otherwise unknown. Absence of a Message-ID match alone never means
-     *   not_submitted.
+     * - A Message-ID match alone means submitted only when the draft is gone.
+     * - Everything else is unknown. Absence is never proof of not sending:
+     *   providers may destroy submission records, and a timed-out request may
+     *   still be in flight. A human-authorized resend belongs to the consumer.
      *
-     * Submitted and not_submitted clear a pending submit intent; unknown keeps it.
+     * Submitted clears a pending submit intent; unknown never does.
      *
      * @throws AccountResourceMismatch before any provider request
      * @throws MailWriteFailure
@@ -554,6 +553,13 @@ final readonly class MailWriteService
                     $found = $driver->findSubmission($account, $target->draftId, $messageId);
                 } catch (MailImportFailure $failure) {
                     throw MailWriteFailure::fromProvider($failure, false);
+                } catch (MailWriteFailure $failure) {
+                    // A search that stopped at its bound proves nothing either way.
+                    if ($failure->safeCode !== MailWriteCode::SubmissionUnknown) {
+                        throw $failure;
+                    }
+
+                    $found = null;
                 }
 
                 if ($found !== null && ($found->mailAccountId !== $account->id || $found->driver !== $account->driver
@@ -561,17 +567,15 @@ final readonly class MailWriteService
                     throw new AccountResourceMismatch('The provider submission does not belong to the supplied account.');
                 }
 
-                if ($found !== null && ($found->matchedBy === 'provider_id' || ! $draftUnsent)) {
+                // A Message-ID match alone proves a send only once the draft is gone:
+                // a changed draft that still exists may never have been sent.
+                if ($found !== null && ($found->matchedBy === 'provider_id' || $draft === null)) {
                     $this->cache->forget($draftKey.':intent:submit');
 
                     return $found;
                 }
 
-                $outcome = $found === null && $draftUnsent ? SubmissionOutcome::NotSubmitted : SubmissionOutcome::Unknown;
-
-                if ($outcome === SubmissionOutcome::NotSubmitted) {
-                    $this->cache->forget($draftKey.':intent:submit');
-                }
+                $outcome = SubmissionOutcome::Unknown;
 
                 return new SubmissionResult($account->id, $account->driver, $outcome, null, null, $found?->matchedBy, [
                     'draft_exists' => $draft !== null,

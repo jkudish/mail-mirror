@@ -46,15 +46,20 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `MailWriteService::submit()` sends one draft exactly once, only at the
   expected revision and only when its single From address matches exactly one
   mirrored identity (`identity_mismatch` otherwise). Gmail sends one
-  `drafts.send`; JMAP sends one `EmailSubmission/set` with `identityId` and
-  `onSuccessUpdateEmail` (Drafts to Sent, `$draft` removed). Neither retries
-  transport, and success is confirmed by re-reading the sent message.
-- `MailWriteService::reconcileSubmission()` answers `submitted`,
-  `not_submitted`, or `unknown` (`SubmissionOutcome`) from provider reads only.
-  A possibly sent submit blocks further submits of that draft with
-  `submission_unknown` until reconciliation gives a definite answer, and a
-  provider submission linked to the draft's ID blocks it even if that cached
-  record is lost.
+  `drafts.send` carrying the bytes approved at that revision, so a concurrent
+  edit in Gmail cannot change what goes out; JMAP sends one
+  `EmailSubmission/set` with `identityId` and `onSuccessUpdateEmail` (Drafts
+  to Sent, `$draft` removed). Neither retries transport, and success is
+  confirmed by re-reading the sent message.
+- `MailWriteService::reconcileSubmission()` answers `submitted` or `unknown`
+  (`SubmissionOutcome`) from provider reads only; absence of evidence is never
+  reported as not sent. A possibly sent submit blocks further submits of that
+  draft with `submission_unknown` until reconciliation answers `submitted`,
+  and a provider submission linked to the draft's ID (JMAP, paginated, with a
+  bound that also refuses) blocks it even if that cached record is lost.
+  Durable at-most-once and any human-authorized resend belong to the
+  consumer's approval engine.
+- `DraftRevision::$rawBytes`: the exact bytes the read found.
 - `mail-mirror.writes.max_draft_bytes` (25 MiB) and draft codes
   `invalid_draft`, `draft_too_large`, `draft_not_found`, `stale_revision`,
   `revision_conflict`, `message_id_conflict`, `identity_mismatch`, and
