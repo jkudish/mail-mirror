@@ -46,15 +46,24 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   caller Message-ID create idempotency key. Gmail uses resumable draft upload
   preparation, status and one remaining MIME transfer, plus get (`format=raw`),
   update, and delete. Gmail confirms meaningful content while permitting only
-  generated top-level Message-ID/added Received and equivalent Date instants;
+  generated top-level Message-ID/added Received, equivalent supplied Date
+  instants, and Date delegation when omitted;
   exact provider bytes and revisions remain unchanged. Changed recipients
   (including Bcc), From, threading, MIME headers, body/attachment bytes or Date
-  instant fail `revision_conflict`. JMAP uploads a blob and uses `Email/import` into
-  the Drafts role with `$draft` and `$seen`; a replace imports the new email
+  instant when supplied fail `revision_conflict`. JMAP uploads a blob and uses
+  `Email/import` into the Drafts role with `$draft` and `$seen`; a replace imports the new email
   and, only after it is created, destroys the old one, each guarded by
   `ifInState`, and a retry finishes an interrupted replace.
+- An omitted top-level Date delegates selection to Gmail, including during
+  same-session recovery, known-ID/exact-intent replacement retry and later valid
+  Date-only edits. Both header maps are validated first; malformed, empty,
+  unsupported or duplicate Dates still refuse. Supplied Dates keep exact-instant
+  protection, without tolerance or automatic stripping. Omission on replacement
+  does not preserve the old Date and cannot distinguish generated Dates from
+  later edits. Nested Dates and raw revisions remain exact; consumers must bind
+  send approvals to the returned revision, not the delegated comparison.
 - Gmail replace recovery confirms the known draft ID under its recorded exact
-  attempt intent, not a client Message-ID search. Meaningful external edits or
+  attempt intent, not a client Message-ID search. Nondelegated external edits or
   lost intent still fail stale revision; a missing known ID fails draft-not-found
   without adopting another matching draft. JMAP's Message-ID recovery remains.
   The unconditional Gmail update race remains.

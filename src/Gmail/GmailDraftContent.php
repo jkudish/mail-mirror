@@ -29,7 +29,17 @@ final class GmailDraftContent
         $left = self::headers($actual);
         $right = self::headers($requested);
 
-        return $left !== null && $right !== null && $left === $right
+        if ($left === null || $right === null) {
+            return false;
+        }
+
+        // Omission delegates Date selection, including later Date-only edits.
+        // Validate both maps first; never ignore a malformed provider Date.
+        if (! array_key_exists('date', $right)) {
+            unset($left['date']);
+        }
+
+        return $left === $right
             && substr($observed, (int) strpos($observed, "\r\n\r\n") + 4)
                 === substr($requested->bytes, (int) strpos($requested->bytes, "\r\n\r\n") + 4);
     }

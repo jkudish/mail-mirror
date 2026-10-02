@@ -16,6 +16,7 @@ use Jkudish\MailMirror\Enums\MailWriteOutcome;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
+use Jkudish\MailMirror\Gmail\GmailDraftContent;
 use Jkudish\MailMirror\Gmail\GmailMailboxReader;
 use Jkudish\MailMirror\Gmail\GmailOAuth;
 use Jkudish\MailMirror\Jmap\FastmailJmapMailboxReader;
@@ -789,6 +790,7 @@ it('refuses draft bytes without exactly one valid Message-ID or with malformed h
     'leading continuation' => [" folded\r\nMessage-ID: <a@invented.test>\r\n\r\nBody\r\n"],
     'NUL in a header' => ["Message-ID: <a@invented.test>\r\nSubject: a\0b\r\n\r\nBody\r\n"],
     'duplicate Subject' => ["Message-ID: <a@invented.test>\r\nSubject: a\r\nSubject: b\r\n\r\nBody\r\n"],
+    'duplicate supplied Dates' => ["Message-ID: <a@invented.test>\r\nDate: 2 Oct 2026 11:55:52 +0000\r\nDate: 2 Oct 2026 11:55:52 +0000\r\n\r\nBody\r\n"],
     'oversized header line' => ["Message-ID: <a@invented.test>\r\nSubject: ".str_repeat('a', 1000)."\r\n\r\nBody\r\n"],
 ]);
 
@@ -1023,8 +1025,80 @@ function meaningfulDraftBytes(): string
         ."MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=synthetic\r\n\r\n"
         ."--synthetic\r\nContent-Type: text/plain\r\n\r\nBody unchanged.\r\n"
         ."--synthetic\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAAECAw==\r\n"
-        ."--synthetic\r\nContent-Type: message/rfc822\r\n\r\nReceived: nested-significant\r\nMessage-ID: <nested@invented.test>\r\n\r\nNested body.\r\n--synthetic--\r\n";
+        ."--synthetic\r\nContent-Type: message/rfc822\r\n\r\nReceived: nested-significant\r\nDate: Thu, 1 Oct 2026 16:00:00 -0700\r\nMessage-ID: <nested@invented.test>\r\n\r\nNested body.\r\n--synthetic--\r\n";
 }
+
+it('delegates only an omitted top-level Date after validating both header maps', function (?string $requestedDate, ?string $observedDate, bool $matches): void {
+    $withoutDate = str_replace("Date: Thu, 1 Oct 2026 17:04:05 -0700\r\n", '', meaningfulDraftBytes());
+    $requested = new DraftContent(($requestedDate === null ? '' : 'Date: '.$requestedDate."\r\n").$withoutDate);
+    $observed = ($observedDate === null ? '' : 'Date: '.$observedDate."\r\n").$withoutDate;
+
+    expect(GmailDraftContent::matches($observed, $requested))->toBe($matches);
+})->with([
+    'both omitted' => [null, null, true],
+    'valid generated Date' => [null, 'Fri, 2 Oct 2026 11:55:53 +0000', true],
+    'later valid Date-only edit' => [null, 'Fri, 2 Oct 2026 12:58:07 +0000', true],
+    'empty generated Date' => [null, '', false],
+    'invalid generated calendar' => [null, '31 Feb 2026 11:55:53 +0000', false],
+    'unsupported generated Date' => [null, '2 Oct 2026 04:55:53 PDT', false],
+    'duplicate generated Dates' => [null, "2 Oct 2026 11:55:53 +0000\r\nDate: 2 Oct 2026 11:55:53 +0000", false],
+    'malformed generated Date' => [null, "2 Oct 2026 11:55:53 +0000\nX-Injected: x", false],
+    'empty supplied Date' => ['', '2 Oct 2026 11:55:53 +0000', false],
+    'invalid supplied calendar' => ['31 Feb 2026 11:55:53 +0000', null, false],
+    'unsupported supplied Date' => ['2 Oct 2026 04:55:53 PDT', null, false],
+    'equivalent supplied instant' => ['2 Oct 2026 11:55:52 +0000', 'Fri, 2 Oct 2026 04:55:52 -0700', true],
+    'supplied plus one second' => ['2 Oct 2026 11:55:52 +0000', 'Fri, 2 Oct 2026 04:55:53 -0700', false],
+    'supplied Date removed' => ['2 Oct 2026 11:55:52 +0000', null, false],
+]);
+
+it('keeps nested Dates byte-significant when top-level Date is delegated', function (): void {
+    $requested = new DraftContent(str_replace("Date: Thu, 1 Oct 2026 17:04:05 -0700\r\n", '', meaningfulDraftBytes()));
+    $observed = "Date: Fri, 2 Oct 2026 11:55:53 +0000\r\n".$requested->bytes;
+
+    expect(GmailDraftContent::matches($observed, $requested))->toBeTrue()
+        ->and(GmailDraftContent::matches(str_replace('Thu, 1 Oct 2026 16:00:00 -0700', 'Thu, 1 Oct 2026 23:00:00 GMT', $observed), $requested))->toBeFalse()
+        ->and(GmailDraftContent::matches(str_replace("Date: Thu, 1 Oct 2026 16:00:00 -0700\r\n", '', $observed), $requested))->toBeFalse();
+});
+
+it('recovers delegated Dates through the same checkpoint with one MIME upload and exact observed revisions', function (): void {
+    $gmail = new DraftGmailProvider;
+    $gmail->rewrite = fn (string $raw): string => "Date: Fri, 2 Oct 2026 11:55:53 +0000\r\n".str_replace('<meaning@invented.test>', '<assigned@gmail.invented.test>', $raw);
+    draftFake($gmail, new DraftJmapProvider);
+    $target = draftAccountTarget(draftGmailAccount());
+    $content = new DraftContent(str_replace("Date: Thu, 1 Oct 2026 17:04:05 -0700\r\n", '', meaningfulDraftBytes()));
+    $service = app(MailWriteService::class);
+    $session = $service->prepareDraftUpload($target, 'delegated-date', $content);
+    $checkpoint = $session->checkpoint();
+    $gmail->statusAfterApply = 503;
+
+    expect(draftFailure(fn (MailWriteService $s) => $s->createDraft($target, $content, upload: $session))->safeCode)->toBe(MailWriteCode::DraftUploadUnknown);
+    $restored = DraftUploadSession::fromCheckpoint($checkpoint);
+    $recovered = $service->createDraft($target, $content, upload: $restored)->draft;
+    $changedBytes = str_replace('11:55:53 +0000', '12:58:07 +0000', $gmail->drafts['d-1']['raw']);
+    $gmail->drafts['d-1']['raw'] = $changedBytes;
+    $again = $service->createDraft($target, $content, upload: $restored)->draft;
+
+    expect($recovered?->draftId)->toBe('d-1')->and($again?->draftId)->toBe('d-1')
+        ->and($again?->rawBytes)->toBe($changedBytes)->and($again?->rawSha256)->toBe(hash('sha256', $changedBytes))
+        ->and($again?->revision)->not->toBe($recovered?->revision)
+        ->and($gmail->sessions)->toHaveCount(1)->and($gmail->uploadBodies)->toBe([$content->bytes])
+        ->and($gmail->writes)->toBe(['create']);
+});
+
+it('rejects a checkpoint input mismatch when a supplied Date is removed before recovery', function (): void {
+    $gmail = new DraftGmailProvider;
+    draftFake($gmail, new DraftJmapProvider);
+    $target = draftAccountTarget(draftGmailAccount());
+    $content = new DraftContent(meaningfulDraftBytes());
+    $session = app(MailWriteService::class)->prepareDraftUpload($target, 'supplied-date', $content);
+    $withoutDate = new DraftContent(str_replace("Date: Thu, 1 Oct 2026 17:04:05 -0700\r\n", '', $content->bytes));
+    $requests = Http::recorded()->count();
+
+    $failure = draftFailure(fn (MailWriteService $s) => $s->createDraft($target, $withoutDate, upload: DraftUploadSession::fromCheckpoint($session->checkpoint())));
+
+    expect($failure->safeCode)->toBe(MailWriteCode::InvalidDraftUpload)->and($failure->writeSent)->toBeFalse()
+        ->and(Http::recorded())->toHaveCount($requests)->and($gmail->uploadBodies)->toBe([])->and($gmail->writes)->toBe([]);
+});
 
 it('allows only supported Gmail header differences while keeping exact provider revisions', function (): void {
     $gmail = new DraftGmailProvider;
@@ -1068,6 +1142,7 @@ it('rejects Gmail transformations of meaningful MIME and retains the known draft
     'Cc' => ['cc@invented.test', 'else@invented.test'], 'Bcc' => ['hidden@invented.test', 'leaked@invented.test'],
     'Reply-To' => ['reply@invented.test', 'redirect@invented.test'], 'Subject' => ['Subject: Meaningful', 'Subject: Altered'],
     'Date instant' => ['17:04:05 -0700', '17:04:06 -0700'], 'invalid Date' => ['1 Oct 2026', '32 Oct 2026'],
+    'removed supplied Date' => ["Date: Thu, 1 Oct 2026 17:04:05 -0700\r\n", ''],
     'unsupported Date' => ['-0700', 'PST'], 'caller trace' => ['caller-trace', 'discarded'],
     'threading' => ['<parent@invented.test>', '<unrelated@invented.test>'], 'X header' => ['X-Private: preserved', 'X-Private: removed'],
     'MIME boundary' => ['boundary=synthetic', 'boundary=other'], 'body' => ['Body unchanged.', 'Body changed.'],
@@ -1096,6 +1171,36 @@ it('recovers a Gmail replace at its known draft ID after Gmail rewrites the clie
         ->and($gmail->writes)->toBe(['update:d-1']);
 });
 
+it('recovers a delegated-Date replacement only by known ID and exact intent without preserving the old Date', function (): void {
+    $gmail = new DraftGmailProvider;
+    $gmail->drafts['d-1'] = ['message' => 'm-old', 'thread' => 't-1', 'raw' => meaningfulDraftBytes()];
+    $gmail->rewrite = fn (string $raw): string => "Date: Fri, 2 Oct 2026 11:55:53 +0000\r\n".str_replace('<meaning@invented.test>', '<assigned@gmail.invented.test>', $raw);
+    $gmail->statusAfterApply = 503;
+    draftFake($gmail, new DraftJmapProvider);
+    $account = draftGmailAccount();
+    $target = draftTarget($account, 'd-1');
+    $service = app(MailWriteService::class);
+    $old = $service->draft($target);
+    $content = new DraftContent(str_replace("Date: Thu, 1 Oct 2026 17:04:05 -0700\r\n", '', meaningfulDraftBytes()));
+
+    expect(draftFailure(fn (MailWriteService $s) => $s->replaceDraft($target, $old->revision, $content))->writeSent)->toBeTrue();
+    $recovered = $service->replaceDraft($target, $old->revision, $content);
+    assert($recovered->draft !== null);
+    $gmail->drafts['d-1']['raw'] = str_replace('11:55:53 +0000', '12:58:07 +0000', $gmail->drafts['d-1']['raw']);
+    $again = $service->replaceDraft($target, $old->revision, $content);
+    assert($again->draft !== null);
+
+    expect($recovered->outcome)->toBe(MailWriteOutcome::AlreadyApplied)
+        ->and($recovered->draft->rawBytes)->toContain('Date: Fri, 2 Oct 2026 11:55:53 +0000')
+        ->and($recovered->draft->rawBytes)->not->toContain('Date: Thu, 1 Oct 2026 17:04:05 -0700')
+        ->and($again->outcome)->toBe(MailWriteOutcome::AlreadyApplied)->and($again->draft->draftId)->toBe('d-1')
+        ->and($again->draft->rawSha256)->toBe(hash('sha256', $gmail->drafts['d-1']['raw']))
+        ->and($again->draft->revision)->not->toBe($recovered->draft->revision)
+        ->and(draftFailure(fn (MailWriteService $s) => $s->replaceDraft($target, str_repeat('0', 64), $content))->safeCode)->toBe(MailWriteCode::StaleRevision)
+        ->and(draftFailure(fn (MailWriteService $s) => $s->replaceDraft($target, $old->revision, new DraftContent("Date: Fri, 2 Oct 2026 12:58:07 +0000\r\n".$content->bytes)))->safeCode)->toBe(MailWriteCode::StaleRevision)
+        ->and($gmail->writes)->toBe(['update:d-1']);
+});
+
 it('never recovers a deleted Gmail replacement through an unrelated Message-ID match', function (): void {
     $gmail = new DraftGmailProvider;
     $gmail->drafts['d-original'] = ['message' => 'm-old', 'thread' => 't-1', 'raw' => draftBytes('before@invented.test')];
@@ -1110,7 +1215,7 @@ it('never recovers a deleted Gmail replacement through an unrelated Message-ID m
 
     unset($gmail->drafts['d-original']);
     $gmail->drafts['d-unrelated'] = ['message' => 'm-unrelated', 'thread' => 't-1',
-        'raw' => "Received: unrelated synthetic trace\r\n".$content->bytes];
+        'raw' => "Received: unrelated synthetic trace\r\nDate: Fri, 2 Oct 2026 11:55:53 +0000\r\n".$content->bytes];
     $requestsBeforeRetry = Http::recorded()->count();
     $failure = draftFailure(fn (MailWriteService $s) => $s->replaceDraft($target, $revision, $content));
 

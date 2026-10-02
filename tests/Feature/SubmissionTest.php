@@ -12,6 +12,7 @@ use Jkudish\MailMirror\Enums\MailWriteCode;
 use Jkudish\MailMirror\Enums\SubmissionOutcome;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
+use Jkudish\MailMirror\Gmail\GmailDraftContent;
 use Jkudish\MailMirror\Gmail\GmailOAuth;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailIdentity;
@@ -417,6 +418,29 @@ it('sends nothing when the draft revision is stale', function (MailDriver $drive
         ->and($gmail->sends)->toBe([])
         ->and($jmap->sends)->toBe([]);
 })->with([MailDriver::Gmail, MailDriver::Jmap]);
+
+it('rejects an earlier send approval after a delegated Date-only edit changes exact raw revision', function (): void {
+    [$gmail, , $account] = submitSetup(MailDriver::Gmail);
+    $input = new DraftContent(submitBytes('send-1@invented.test'));
+    $gmail->drafts['d-1'] = ['message' => 'm-1', 'thread' => 't-1', 'raw' => "Date: Fri, 2 Oct 2026 11:55:53 +0000\r\n".$input->bytes];
+    $service = app(MailWriteService::class);
+    $target = submitTarget($account, 'd-1');
+    $approved = $service->draft($target);
+    // Keep provider IDs and all other bytes fixed, isolating exact Date hashing.
+    $changedBytes = "Date: Fri, 2 Oct 2026 12:58:07 +0000\r\n".$input->bytes;
+    $gmail->drafts['d-1'] = ['message' => 'm-1', 'thread' => 't-1', 'raw' => $changedBytes];
+    $observed = $service->draft($target);
+
+    expect(GmailDraftContent::matches($changedBytes, $input))->toBeTrue()
+        ->and($observed->providerMessageId)->toBe($approved->providerMessageId)
+        ->and($observed->rawBytes)->toBe($changedBytes)->and($observed->rawSha256)->toBe(hash('sha256', $changedBytes))
+        ->and($observed->rawSha256)->not->toBe($approved->rawSha256)->and($observed->revision)->not->toBe($approved->revision);
+    $failure = submitFailure(fn (MailWriteService $s) => $s->submit($target, $approved->revision));
+
+    expect($failure->safeCode)->toBe(MailWriteCode::StaleRevision)->and($failure->writeSent)->toBeFalse()
+        ->and($gmail->sends)->toBe([])->and($gmail->sentRaw)->toBe([])
+        ->and(array_filter($gmail->paths, fn (string $path): bool => str_starts_with($path, 'POST')))->toBe([]);
+});
 
 it('refuses a From address that does not match exactly one identity before any submission request', function (MailDriver $driver, string $from): void {
     [$gmail, $jmap, $account] = submitSetup($driver, 'identity@invented.test', $from);

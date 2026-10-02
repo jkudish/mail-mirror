@@ -660,8 +660,8 @@ content and keep them within your application's authorized content boundary.
 | delete | `drafts.delete` | `Email/set destroy` with `ifInState` |
 
 Gmail has no update precondition. MailMirror compares the revision under its
-lock and sends one update; an edit made elsewhere between that read and the
-update is detected by the confirming re-read and fails `revision_conflict`
+lock and sends one update; an edit to nondelegated content made elsewhere between
+that read and the update is detected by the confirming re-read and fails `revision_conflict`
 with `writeSent` true. Such an edit can be lost; re-read the draft before
 retrying.
 
@@ -675,19 +675,31 @@ Gmail confirmation permits a generated top-level Message-ID, added top-level
 Received fields, field-name case/order and outer field whitespace, and equivalent
 Date formatting. Date supports an optional weekday, day/month/four-digit year,
 time with seconds, and numeric timezone offset or GMT/UT; it validates the date
-and compares the instant. Unsupported or invalid Dates fail confirmation, never
-get dropped. From, recipients (including Bcc), Reply-To, Subject, threading,
+and compares a caller-supplied instant exactly. Changing or removing a supplied
+Date fails confirmation; there is no time tolerance or automatic Date stripping.
+Unsupported, empty, invalid or duplicate Dates fail confirmation before any
+delegation. From, recipients (including Bcc), Reply-To, Subject, threading,
 arbitrary X-* and MIME headers remain significant. Ambiguous duplicate fields
 fail; body bytes (including every attachment and nested message header) must
 match exactly. Transfer-encoding transformations are unsupported, not decoded
 or normalized to make them pass.
 
+Omitting **top-level** Date delegates its instant to Gmail: confirmation,
+same-session recovery and known-ID/exact-intent replacement retry accept absence
+or one valid Date in the supported grammar. This also accepts a later valid
+Date-only edit; confirmation cannot distinguish it from a generated Date.
+Omission during replacement does not preserve the old draft's Date. Nested Dates
+remain byte-significant. Removing a supplied Date changes the caller input and
+cannot reuse its checkpoint or exact replacement intent.
+
 These comparison allowances never change exact provider revisions: returned
 Message-ID, raw bytes, raw SHA-256 and revision are the actual readback. A retry
 of a possibly applied Gmail replace confirms the known draft ID's meaningful
 content only with the recorded exact attempt intent, without Message-ID search
-or another update. Changed content or lost intent fails stale revision. Gmail's
-accepted unconditional update race is unchanged.
+or another update. Changed nondelegated content or lost intent fails stale revision.
+Consumers must bind send approval to the returned **exact revision**: even a
+delegated Date-only edit changes it, so an earlier revision fails `stale_revision`
+before submission. Gmail's accepted unconditional update race is unchanged.
 
 A JMAP replace interrupted after the import and before the destroy leaves both
 drafts. Retrying the same replace with the same revision and bytes finishes it:
