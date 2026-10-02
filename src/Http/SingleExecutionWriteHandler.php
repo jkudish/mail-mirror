@@ -52,6 +52,11 @@ final class SingleExecutionWriteHandler
             }
             $deadline = $started + (int) floor($timeout * 1_000_000_000);
             $body = $request->getBody();
+            // Body-inspecting Laravel/PSR middleware may consume a seekable
+            // stream. Rewind once before execution, never inside cURL or a retry.
+            if ($body->isSeekable()) {
+                $body->rewind();
+            }
             $size = $body->getSize();
             if ($size === null || $size < 0 || $body->tell() !== 0) {
                 throw new RuntimeException;
@@ -92,6 +97,7 @@ final class SingleExecutionWriteHandler
                 CURLOPT_HTTPAUTH => CURLAUTH_NONE, CURLOPT_PROXYAUTH => CURLAUTH_NONE,
                 CURLOPT_PROXY => '', CURLOPT_NOPROXY => '*', CURLOPT_NOSIGNAL => true,
                 CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_SSLVERSION => CURL_SSLVERSION_TLSv1_2,
                 CURLOPT_SSL_SESSIONID_CACHE => false, CURLOPT_SSL_OPTIONS => 0,
                 CURLOPT_TCP_FASTOPEN => false,
                 CURLOPT_HTTPHEADER => $headers,
@@ -201,13 +207,18 @@ final class SingleExecutionWriteHandler
                 ? new Response($status, $responseHeaders, $received, '1.1', $reason) : null;
             unset($handle);
             if (is_callable($options['on_stats'] ?? null)) {
-                $options['on_stats'](new TransferStats($request, $response, (hrtime(true) - $started) / 1_000_000_000,
-                    $errno, ['informational_headers' => $informational]));
+                try {
+                    $options['on_stats'](new TransferStats($request, $response, (hrtime(true) - $started) / 1_000_000_000,
+                        $errno, ['informational_headers' => $informational]));
+                } catch (Throwable $failure) {
+                    // A later stats failure cannot mask the first budget abort.
+                    $aborted ??= $failure;
+                }
             }
             if ($aborted instanceof SyncBudgetExhausted) {
                 throw new SyncBudgetExhausted($aborted->dimension, $aborted->snapshot);
             }
-            if ($response === null) {
+            if ($response === null || $aborted !== null) {
                 throw new RuntimeException;
             }
 

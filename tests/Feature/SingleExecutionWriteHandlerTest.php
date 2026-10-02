@@ -2,7 +2,9 @@
 
 declare(strict_types=1);
 
+use GuzzleHttp\Psr7\NoSeekStream;
 use GuzzleHttp\Psr7\Request as NativeRequest;
+use GuzzleHttp\Psr7\Utils;
 use GuzzleHttp\TransferStats;
 use Illuminate\Http\Client\Factory;
 use Illuminate\Http\Client\Request;
@@ -11,6 +13,7 @@ use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
 use Jkudish\MailMirror\Http\SingleExecutionWriteHandler;
 use Jkudish\MailMirror\Read\SyncWorkBudget;
 use Jkudish\MailMirror\Tests\Support\LocalWriteServer;
+use PHPUnit\Framework\SkippedWithMessageException;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
 use Symfony\Component\Process\Process;
@@ -73,6 +76,7 @@ it('refuses a second base handler invocation before a second connection', functi
         expect($response->getStatusCode())->toBe(200);
         expect(fn () => $handler($request, $options)->wait())->toThrow(RuntimeException::class, 'already used')
             ->and($server->records(true))->toHaveCount(1)
+            ->and($request->getBody()->tell())->toBe(12)
             ->and(array_column($server->records(), 'length'))->toBe([12]);
     } finally {
         $server->close();
@@ -105,6 +109,7 @@ it('preserves informational and final headers stats and budget progress callback
         expect($stats->getHandlerStats()['informational_headers'])->toBe([['X-Interim' => ['synthetic']], ['Link' => ['</synthetic>']]]);
 
         $budget = new SyncWorkBudget(maxDownloadedBytes: 4);
+        $failedStatsCalled = false;
         try {
             SingleExecutionWriteHandler::prepare($http->timeout(2)->withBody('Body.', 'message/rfc822')->withOptions([
                 'progress' => function (int $total, int $downloaded) use ($budget): void {
@@ -112,12 +117,16 @@ it('preserves informational and final headers stats and budget progress callback
                         $budget->recordDownloadedBytes($downloaded);
                     }
                 },
+                'on_stats' => function () use (&$failedStatsCalled): void {
+                    $failedStatsCalled = true;
+                    throw new RuntimeException('Synthetic stats failure after budget failure.');
+                },
             ]))->post($server->origin.'/write');
             throw new LogicException('The byte budget was ignored.');
         } catch (SyncBudgetExhausted $failure) {
             expect($failure->dimension)->toBe('downloaded_bytes')->and($failure->getPrevious())->toBeNull();
         }
-        expect($server->records(true))->toHaveCount(2);
+        expect($server->records(true))->toHaveCount(2)->and($failedStatsCalled)->toBeTrue();
     } finally {
         $server->close();
     }
@@ -131,6 +140,100 @@ it('keeps fakes recording and request middleware around the selected base handle
     $response = SingleExecutionWriteHandler::prepare($http->timeout(1))->post('https://synthetic.invalid/write', ['key' => 'value']);
     expect($response->json('id'))->toBe('recorded')->and($http->recorded())->toHaveCount(1);
     $http->assertSent(fn (Request $request): bool => $request->data() === ['key' => 'value']);
+});
+
+it('sends the complete body once after body-inspecting middleware on real TLS', function (string $inspection): void {
+    $server = new LocalWriteServer('echo');
+    $body = 'Synthetic middleware-read payload.';
+    $inspected = null;
+    $http = new Factory;
+    $http->globalOptions(['verify' => $server->certificate]);
+
+    try {
+        $pending = $http->timeout(2)->withBody($body, 'message/rfc822');
+        if ($inspection === 'beforeSending') {
+            $pending->beforeSending(function (Request $request) use (&$inspected): void {
+                $inspected = $request->body();
+            });
+        } else {
+            $pending->withRequestMiddleware(function (RequestInterface $request) use (&$inspected): RequestInterface {
+                $inspected = (string) $request->getBody();
+
+                return $request;
+            });
+        }
+        $response = SingleExecutionWriteHandler::prepare($pending)->post($server->origin.'/write');
+        expect($response->status())->toBe(200)->and($inspected)->toBe($body)
+            ->and($server->records(true))->toHaveCount(1)
+            ->and(array_column($server->records(), 'length'))->toBe([34])
+            ->and(array_column($server->records(), 'sha256'))->toBe([hash('sha256', $body)]);
+    } finally {
+        $server->close();
+    }
+})->with(['beforeSending', 'PSR string inspection']);
+
+it('refuses an advanced nonseekable body before connection', function (): void {
+    $server = new LocalWriteServer('echo');
+    $body = new NoSeekStream(Utils::streamFor('Nonseekable bytes.'));
+    $body->read(4);
+    $request = new NativeRequest('POST', $server->origin.'/write', [], $body);
+
+    try {
+        expect(fn () => (new SingleExecutionWriteHandler)($request, ['timeout' => 2, 'verify' => $server->certificate])->wait())
+            ->toThrow(RuntimeException::class, 'single-execution')
+            ->and($server->records(true))->toBe([]);
+    } finally {
+        $server->close();
+    }
+});
+
+it('accepts TLS 1.2 and 1.3 while preserving the fixed minimum', function (string $version): void {
+    $server = new LocalWriteServer('tls-'.$version);
+    $http = new Factory;
+    $http->globalOptions(['verify' => $server->certificate]);
+
+    try {
+        $response = SingleExecutionWriteHandler::prepare($http->timeout(2)->withBody('TLS body.', 'message/rfc822'))
+            ->post($server->origin.'/write');
+        expect($response->status())->toBe(200)->and($server->records(true))->toHaveCount(1)
+            ->and(array_column($server->records(true), 'tls'))->toBe(['TLSv'.$version])
+            ->and(array_column($server->records(), 'sha256'))->toBe([hash('sha256', 'TLS body.')]);
+    } finally {
+        $server->close();
+    }
+})->with(['1.2', '1.3']);
+
+it('refuses a TLS 1.1-only peer that a synthetic legacy qualification can reach', function (): void {
+    $server = new LocalWriteServer('tls-1.1');
+
+    try {
+        // Qualify the peer explicitly; this legacy override is never accepted by
+        // the package. Some runtimes compile out TLS 1.1 entirely.
+        $legacy = curl_init($server->origin.'/qualification');
+        if (! $legacy instanceof CurlHandle) {
+            throw new RuntimeException('Could not start the local TLS qualification.');
+        }
+        assert($server->certificate !== '');
+        curl_setopt_array($legacy, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT_MS => 2000,
+            CURLOPT_PROXY => '', CURLOPT_NOPROXY => '*', CURLOPT_CAINFO => $server->certificate,
+            CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_SSLVERSION => CURL_SSLVERSION_TLSv1_1 | CURL_SSLVERSION_MAX_TLSv1_1,
+            CURLOPT_SSL_CIPHER_LIST => 'DEFAULT:@SECLEVEL=0']);
+        $supported = curl_exec($legacy) !== false;
+        unset($legacy);
+        if (! $supported) {
+            throw new SkippedWithMessageException('This runtime cannot qualify the local legacy TLS 1.1 peer.');
+        }
+        expect(array_column($server->records(true), 'tls'))->toBe(['TLSv1.1']);
+
+        $http = new Factory;
+        $http->globalOptions(['verify' => $server->certificate]);
+        expect(fn () => SingleExecutionWriteHandler::prepare($http->timeout(2)->withBody('Must not send.', 'message/rfc822'))
+            ->post($server->origin.'/write'))->toThrow(RuntimeException::class, 'single-execution')
+            ->and($server->records(true))->toHaveCount(1);
+    } finally {
+        $server->close();
+    }
 });
 
 it('rejects unsupported overrides and unsafe destinations before connecting', function (array $overrides, string $url): void {
@@ -156,6 +259,7 @@ it('rejects unsupported overrides and unsafe destinations before connecting', fu
     'proxy' => [['proxy' => 'https://synthetic.invalid'], 'safe'],
     'unverified TLS' => [['verify' => false], 'safe'],
     'redirect' => [['allow_redirects' => true], 'safe'],
+    'alternate crypto method' => [['crypto_method' => STREAM_CRYPTO_METHOD_TLSv1_1_CLIENT], 'safe'],
     'zero deadline' => [['timeout' => 0], 'safe'],
     'debug' => [['debug' => true], 'safe'],
     'sink' => [['sink' => '/tmp/must-not-write'], 'safe'],

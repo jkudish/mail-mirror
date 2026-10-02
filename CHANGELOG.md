@@ -65,8 +65,12 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Provider writes use a fresh single-execution ext-cURL base handler, one native
   execution and one Laravel attempt, retaining HTTP middleware/fakes. Gmail
   resumable/mailbox/draft/send writes and JMAP upload/import/set/submission writes
-  use the fixed verified-TLS HTTP/1.1 profile with a monotonic total timeout,
-  forward-only bodies, no redirects/reuse/auth negotiation/proxies/early data.
+  use the fixed verified-TLS (1.2 minimum, 1.3 permitted) HTTP/1.1 profile with a
+  monotonic total timeout, forward-only bodies, no redirects/reuse/auth
+  negotiation/proxies/early data.
+  A seekable body gets one initial rewind after inspection middleware, never
+  during native execution/retry; advanced nonseekable bodies refuse. A stats
+  callback failure cannot mask an earlier budget abort.
   Writes require ext-cURL with asynchronous DNS; unsupported transport options
   refuse without fallback or replay. Reads retain their existing transport.
 - Draft upload codes `draft_upload_required`, `invalid_draft_upload`, and

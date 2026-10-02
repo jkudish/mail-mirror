@@ -598,14 +598,18 @@ Writes require ext-cURL with asynchronous DNS and refuse instead of falling
 back to a replay-capable or per-I/O-timeout transport.
 
 The fixed profile performs one `curl_exec` on a fresh unshared HTTP/1.1 handle,
-with a positive remaining monotonic total timeout, verified TLS, no reuse,
+with a positive remaining monotonic total timeout, verified TLS 1.2 minimum
+(TLS 1.3 permitted), no reuse,
 redirects, authentication negotiation, proxies, early data or Expect handshake.
-The body is forward-only with an exact length; it cannot rewind or reset for a
-retry. A second base-handler invocation refuses before connecting. Explicit
+After body-inspecting middleware, a seekable body gets one initial rewind before
+native execution; an advanced nonseekable body refuses. During execution the
+body is forward-only with an exact length; it cannot rewind or reset for a retry.
+A second base-handler invocation refuses before connecting or rewinding. Explicit
 proxies, arbitrary cURL overrides, unverified TLS, debug/sink options and other
 unsupported behavior-changing options refuse. Status/Location/Range/body,
 informational headers in transfer stats, and stats/budget callbacks remain
-available. Transport errors are safe classifications, never raw cURL errors or
+available; a later stats failure cannot mask an earlier budget abort.
+Transport errors are safe classifications, never raw cURL errors or
 underlying exception chains. A lost response remains ambiguous: consumers
 recover the same upload session or reconcile submission; they never re-send
 merely because the transport returned no response.
