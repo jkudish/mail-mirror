@@ -164,7 +164,14 @@ it('rejects unsupported overrides and unsafe destinations before connecting', fu
 ]);
 
 it('refuses before network when ext-cURL is unavailable', function (): void {
-    $code = 'require '.var_export(dirname(__DIR__, 2).'/vendor/autoload.php', true).';
+    // This extension-refusal proof needs class loading only, not framework
+    // bootstrap functions whose legacy lowest versions require other extensions.
+    $code = '$vendor = '.var_export(dirname(__DIR__, 2).'/vendor', true).';
+        require $vendor."/composer/ClassLoader.php";
+        $loader = new Composer\\Autoload\\ClassLoader();
+        foreach (require $vendor."/composer/autoload_psr4.php" as $prefix => $paths) { $loader->addPsr4($prefix, $paths); }
+        $loader->addClassMap(require $vendor."/composer/autoload_classmap.php");
+        $loader->register();
         try { (new Jkudish\\MailMirror\\Http\\SingleExecutionWriteHandler)(new GuzzleHttp\\Psr7\\Request("POST", "https://localhost/write"), ["timeout" => 1])->wait(); exit(1); }
         catch (RuntimeException $failure) { echo $failure->getMessage(); }';
     $process = new Process([PHP_BINARY, '-n', '-r', $code]);

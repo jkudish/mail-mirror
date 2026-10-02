@@ -8,7 +8,6 @@ use CurlHandle;
 use GuzzleHttp\HandlerStack;
 use GuzzleHttp\Promise\Create;
 use GuzzleHttp\Promise\PromiseInterface;
-use GuzzleHttp\Psr7\HttpFactory;
 use GuzzleHttp\Psr7\Response;
 use GuzzleHttp\TransferStats;
 use Illuminate\Http\Client\PendingRequest;
@@ -244,7 +243,11 @@ final class SingleExecutionWriteHandler
             throw new RuntimeException;
         }
         foreach (['request_factory', 'uri_factory', 'stream_factory', 'response_factory'] as $factory) {
-            if (isset($options[$factory]) && ! $options[$factory] instanceof HttpFactory) {
+            // Guzzle 8 supplies these final factory objects; Guzzle 7 does not.
+            // Compare the loaded object's type without loading an unused factory
+            // and its unrelated UploadedFile interface on lowest dependencies.
+            if (isset($options[$factory]) && (! is_object($options[$factory])
+                || $options[$factory]::class !== 'GuzzleHttp\\Psr7\\HttpFactory')) {
                 throw new RuntimeException;
             }
         }
