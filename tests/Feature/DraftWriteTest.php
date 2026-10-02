@@ -2,7 +2,10 @@
 
 declare(strict_types=1);
 
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\Factory;
 use Illuminate\Http\Client\Request;
+use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\Http;
 use Jkudish\MailMirror\Credentials\ApiTokenCredential;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
@@ -11,14 +14,24 @@ use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailWriteCode;
 use Jkudish\MailMirror\Enums\MailWriteOutcome;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
+use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
+use Jkudish\MailMirror\Gmail\GmailDraftContent;
+use Jkudish\MailMirror\Gmail\GmailMailboxReader;
 use Jkudish\MailMirror\Gmail\GmailOAuth;
+use Jkudish\MailMirror\Jmap\FastmailJmapMailboxReader;
 use Jkudish\MailMirror\Models\MailAccount;
+use Jkudish\MailMirror\Tests\Support\LocalWriteServer;
 use Jkudish\MailMirror\Write\DraftContent;
 use Jkudish\MailMirror\Write\DraftTarget;
+use Jkudish\MailMirror\Write\DraftUploadSession;
 use Jkudish\MailMirror\Write\MailAccountTarget;
 use Jkudish\MailMirror\Write\MailWriteService;
 use Jkudish\MailMirror\Write\MailWriteTarget;
+use Psr\Http\Message\RequestInterface;
+use Symfony\Component\VarDumper\Cloner\VarCloner;
+use Symfony\Component\VarDumper\Dumper\CliDumper;
+use ZBateson\MailMimeParser\MailMimeParser;
 
 /** Synthetic Gmail drafts; every create or update issues a new message ID, as Gmail does. */
 final class DraftGmailProvider
@@ -33,6 +46,19 @@ final class DraftGmailProvider
     public array $bodies = [];
 
     public int $next = 1;
+
+    /** @var array<string, array{bytes: string, size: int, thread: string, draft: string|null}> */
+    public array $sessions = [];
+
+    /** @var list<string> */
+    public array $uploadBodies = [];
+
+    public ?int $sessionStatus = null;
+
+    public ?string $rangeOverride = null;
+
+    /** @var Closure(string): string|null */
+    public ?Closure $rewrite = null;
 
     /** Apply the next write, then answer with this status, like a timeout after the provider applied it. */
     public ?int $statusAfterApply = null;
@@ -49,6 +75,57 @@ final class DraftGmailProvider
         return function (Request $request) {
             $path = (string) parse_url($request->url(), PHP_URL_PATH);
             parse_str((string) parse_url($request->url(), PHP_URL_QUERY), $query);
+
+            if ($path === '/upload/gmail/v1/users/me/drafts') {
+                if ($request->method() === 'POST') {
+                    $id = 'upload-'.(count($this->sessions) + 1);
+                    /** @var array{message: array{threadId?: string}} $metadata */
+                    $metadata = json_decode($request->body(), true, flags: JSON_THROW_ON_ERROR);
+                    $this->bodies[] = $metadata;
+                    expect($request->header('X-Upload-Content-Type'))->toBe(['message/rfc822']);
+                    $size = $request->header('X-Upload-Content-Length')[0] ?? null;
+                    assert(is_string($size));
+                    $this->sessions[$id] = ['bytes' => '', 'size' => (int) $size,
+                        'thread' => $metadata['message']['threadId'] ?? 't-new', 'draft' => null];
+
+                    return Http::response('', 200, ['Location' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id='.$id.'&session_crd='.str_repeat('s', 586)]);
+                }
+
+                $uploadId = $query['upload_id'] ?? '';
+                assert(is_string($uploadId));
+                $session = $this->sessions[$uploadId] ?? null;
+
+                if ($session === null || $this->sessionStatus !== null) {
+                    return Http::response([], $this->sessionStatus ?? 404);
+                }
+
+                if ($request->body() === '') {
+                    expect($request->header('Content-Range'))->toBe(['bytes */'.$session['size']]);
+
+                    return $session['draft'] !== null ? Http::response(['id' => $session['draft']])
+                        : Http::response('', 308, $this->rangeOverride !== null ? ['Range' => $this->rangeOverride]
+                            : ($session['bytes'] === '' ? [] : ['Range' => 'bytes=0-'.(strlen($session['bytes']) - 1)]));
+                }
+
+                $offset = strlen($session['bytes']);
+                expect($request->header('Content-Range'))->toBe(['bytes '.$offset.'-'.($session['size'] - 1).'/'.$session['size']]);
+                $this->uploadBodies[] = $request->body();
+                $this->sessions[$uploadId]['bytes'] .= $request->body();
+                $raw = $this->sessions[$uploadId]['bytes'];
+                expect(strlen($raw))->toBe($session['size']);
+                $this->writes[] = 'create';
+
+                if ($this->onCreate !== null) {
+                    ($this->onCreate)();
+                }
+
+                $draftId = 'd-'.$this->next;
+                $this->drafts[$draftId] = ['message' => 'm-'.$this->next++, 'thread' => $session['thread'],
+                    'raw' => $this->rewrite === null ? $raw : ($this->rewrite)($raw)];
+                $this->sessions[$uploadId]['draft'] = $draftId;
+
+                return $this->afterWrite(['id' => $draftId]);
+            }
 
             if ($path === '/gmail/v1/users/me/drafts' && $request->method() === 'GET') {
                 $q = $query['q'] ?? null;
@@ -102,8 +179,10 @@ final class DraftGmailProvider
                 /** @var array{id: string, message: array{raw: string, threadId: string}} $body */
                 $body = $request->data();
                 $this->bodies[] = $body;
-                $this->drafts[$id]['raw'] = draftDecode($body['message']['raw']);
-                $this->drafts[$id]['message'] = 'm-'.$this->next++;
+                $raw = draftDecode($body['message']['raw']);
+                $thread = $this->drafts[$id]['thread'];
+                $this->drafts[$id] = ['raw' => $this->rewrite === null ? $raw : ($this->rewrite)($raw),
+                    'message' => 'm-'.$this->next++, 'thread' => $thread];
 
                 if ($this->afterUpdate !== null) {
                     ($this->afterUpdate)();
@@ -384,7 +463,11 @@ it('creates a Gmail draft from the exact bytes and confirms its revision by re-r
     draftFake($gmail, new DraftJmapProvider);
     $bytes = draftBytes('create-1@invented.test');
 
-    $result = app(MailWriteService::class)->createDraft(draftAccountTarget(draftGmailAccount()), new DraftContent($bytes), 'thread-7');
+    $service = app(MailWriteService::class);
+    $target = draftAccountTarget(draftGmailAccount());
+    $content = new DraftContent($bytes);
+    $session = $service->prepareDraftUpload($target, 'create-1', $content, 'thread-7');
+    $result = $service->createDraft($target, $content, 'thread-7', DraftUploadSession::fromCheckpoint($session->checkpoint()));
 
     expect($result->outcome)->toBe(MailWriteOutcome::Applied)
         ->and($result->draft?->draftId)->toBe('d-1')
@@ -393,7 +476,8 @@ it('creates a Gmail draft from the exact bytes and confirms its revision by re-r
         ->and($result->draft?->threadId)->toBe('thread-7')
         ->and($result->draft?->rawSha256)->toBe(hash('sha256', $bytes))
         ->and($gmail->writes)->toBe(['create'])
-        ->and($gmail->bodies[0])->toBe(['message' => ['raw' => rtrim(strtr(base64_encode($bytes), '+/', '-_'), '='), 'threadId' => 'thread-7']])
+        ->and($gmail->bodies[0])->toBe(['message' => ['threadId' => 'thread-7']])
+        ->and($gmail->uploadBodies)->toBe([$bytes])
         ->and($gmail->drafts['d-1']['raw'])->toBe($bytes);
 });
 
@@ -426,31 +510,32 @@ it('finds a draft created by a possibly applied request by Message-ID and never 
     draftFake($gmail, $jmap);
     $account = $driver === MailDriver::Gmail ? draftGmailAccount() : draftJmapAccount();
     $content = new DraftContent(draftBytes('retry-1@invented.test'));
+    $session = $driver === MailDriver::Gmail ? app(MailWriteService::class)->prepareDraftUpload(draftAccountTarget($account), 'retry-1', $content) : null;
 
-    $failure = draftFailure(fn (MailWriteService $service) => $service->createDraft(draftAccountTarget($account), $content));
-    $retry = app(MailWriteService::class)->createDraft(draftAccountTarget($account), $content);
+    $failure = draftFailure(fn (MailWriteService $service) => $service->createDraft(draftAccountTarget($account), $content, upload: $session));
+    $retry = app(MailWriteService::class)->createDraft(draftAccountTarget($account), $content, upload: $session);
 
-    expect($failure->safeCode)->toBe(MailWriteCode::ProviderFailed)
+    expect($failure->safeCode)->toBe($driver === MailDriver::Gmail ? MailWriteCode::DraftUploadUnknown : MailWriteCode::ProviderFailed)
         ->and($failure->writeSent)->toBeTrue()
-        ->and($retry->outcome)->toBe(MailWriteOutcome::AlreadyApplied)
+        ->and($retry->outcome)->toBe($driver === MailDriver::Gmail ? MailWriteOutcome::Applied : MailWriteOutcome::AlreadyApplied)
         ->and($retry->draft?->rawSha256)->toBe($content->sha256)
         ->and($driver === MailDriver::Gmail ? count($gmail->drafts) : count($jmap->emails))->toBe(1)
         ->and($driver === MailDriver::Gmail ? $gmail->writes : $jmap->writeMethods())->toHaveCount(1);
 })->with([MailDriver::Gmail, MailDriver::Jmap]);
 
 it('refuses to create a draft whose Message-ID another draft already uses with different bytes', function (): void {
-    $gmail = new DraftGmailProvider;
-    $gmail->drafts['d-9'] = ['message' => 'm-9', 'thread' => 't-9', 'raw' => draftBytes('taken@invented.test', 'Other body.')];
-    draftFake($gmail, new DraftJmapProvider);
+    $jmap = new DraftJmapProvider;
+    $jmap->put('e-9', draftBytes('taken@invented.test', 'Other body.'));
+    draftFake(new DraftGmailProvider, $jmap);
 
     $failure = draftFailure(fn (MailWriteService $service) => $service->createDraft(
-        draftAccountTarget(draftGmailAccount()),
+        draftAccountTarget(draftJmapAccount()),
         new DraftContent(draftBytes('taken@invented.test')),
     ));
 
     expect($failure->safeCode)->toBe(MailWriteCode::MessageIdConflict)
         ->and($failure->writeSent)->toBeFalse()
-        ->and($gmail->writes)->toBe([]);
+        ->and($jmap->writes)->toBe([]);
 });
 
 it('refuses a stale revision for replace and delete with zero provider writes', function (MailDriver $driver): void {
@@ -705,6 +790,7 @@ it('refuses draft bytes without exactly one valid Message-ID or with malformed h
     'leading continuation' => [" folded\r\nMessage-ID: <a@invented.test>\r\n\r\nBody\r\n"],
     'NUL in a header' => ["Message-ID: <a@invented.test>\r\nSubject: a\0b\r\n\r\nBody\r\n"],
     'duplicate Subject' => ["Message-ID: <a@invented.test>\r\nSubject: a\r\nSubject: b\r\n\r\nBody\r\n"],
+    'duplicate supplied Dates' => ["Message-ID: <a@invented.test>\r\nDate: 2 Oct 2026 11:55:52 +0000\r\nDate: 2 Oct 2026 11:55:52 +0000\r\n\r\nBody\r\n"],
     'oversized header line' => ["Message-ID: <a@invented.test>\r\nSubject: ".str_repeat('a', 1000)."\r\n\r\nBody\r\n"],
 ]);
 
@@ -724,6 +810,7 @@ it('refuses draft bytes over the configured size limit before any request', func
     $content = new DraftContent(draftBytes('big@invented.test', str_repeat('x', 2048)));
 
     expect(draftFailure(fn (MailWriteService $s) => $s->createDraft(draftAccountTarget($account), $content))->safeCode)->toBe(MailWriteCode::DraftTooLarge)
+        ->and(draftFailure(fn (MailWriteService $s) => $s->prepareDraftUpload(draftAccountTarget($account), 'oversize', $content))->safeCode)->toBe(MailWriteCode::DraftTooLarge)
         ->and(draftFailure(fn (MailWriteService $s) => $s->replaceDraft(draftTarget($account, 'd-1'), str_repeat('0', 64), $content))->safeCode)->toBe(MailWriteCode::DraftTooLarge);
     Http::assertNothingSent();
 });
@@ -734,13 +821,14 @@ it('refuses every draft write with writes_disabled before any request while the 
     $account = draftGmailAccount();
     $content = new DraftContent(draftBytes('off@invented.test'));
     $failures = [
+        draftFailure(fn (MailWriteService $s) => $s->prepareDraftUpload(draftAccountTarget($account), 'disabled', $content)),
         draftFailure(fn (MailWriteService $s) => $s->createDraft(draftAccountTarget($account), $content)),
         draftFailure(fn (MailWriteService $s) => $s->replaceDraft(draftTarget($account, 'd-1'), str_repeat('0', 64), $content)),
         draftFailure(fn (MailWriteService $s) => $s->deleteDraft(draftTarget($account, 'd-1'), str_repeat('0', 64))),
     ];
 
     expect(array_map(fn (MailWriteFailure $failure): MailWriteCode => $failure->safeCode, $failures))
-        ->toBe([MailWriteCode::WritesDisabled, MailWriteCode::WritesDisabled, MailWriteCode::WritesDisabled]);
+        ->toBe([MailWriteCode::WritesDisabled, MailWriteCode::WritesDisabled, MailWriteCode::WritesDisabled, MailWriteCode::WritesDisabled]);
     Http::assertNothingSent();
 });
 
@@ -749,6 +837,7 @@ it('rejects an owner or account mismatch with zero provider requests for every d
     $account = draftGmailAccount();
     $content = new DraftContent(draftBytes('owner@invented.test'));
     $operations = [
+        fn (MailWriteService $s): mixed => $s->prepareDraftUpload(new MailAccountTarget($account->id, 'synthetic-workspace', 'owner-b'), 'wrong-owner', $content),
         fn (MailWriteService $s): mixed => $s->createDraft(new MailAccountTarget($account->id, 'synthetic-workspace', 'owner-b'), $content),
         fn (MailWriteService $s): mixed => $s->replaceDraft(new DraftTarget($account->id, 'synthetic-workspace', 'owner-b', 'd-1'), str_repeat('0', 64), $content),
         fn (MailWriteService $s): mixed => $s->deleteDraft(new DraftTarget($account->id, null, null, 'd-1'), str_repeat('0', 64)),
@@ -772,7 +861,8 @@ it('serializes a create and a replace that use the same Message-ID, in either or
     $revision = $service->draft(draftTarget($account, 'd-old'))->revision;
     $created = new DraftContent(draftBytes('contended@invented.test', 'Created.'));
     $replacement = new DraftContent(draftBytes('contended@invented.test', 'Replaced.'));
-    $create = fn (): mixed => $service->createDraft(draftAccountTarget($account), $created);
+    $session = $service->prepareDraftUpload(draftAccountTarget($account), 'contended', $created);
+    $create = fn (): mixed => $service->createDraft(draftAccountTarget($account), $created, upload: $session);
     $replace = fn (): mixed => $service->replaceDraft(draftTarget($account, 'd-old'), $revision, $replacement);
     $blocked = null;
     $requests = [0, 0];
@@ -805,3 +895,534 @@ it('serializes a create and a replace that use the same Message-ID, in either or
         ->and($gmail->writes)->toBe([$first === 'create' ? 'create' : 'update:d-old'])
         ->and($withMessageId)->toHaveCount(1);
 })->with(['create', 'replace']);
+
+it('prepares without MIME and recovers a completed Gmail session twice despite a rewritten Message-ID', function (): void {
+    $gmail = new DraftGmailProvider;
+    $gmail->rewrite = fn (string $raw): string => "Received: by synthetic.gmail.test\r\n".str_replace('<retry@invented.test>', '<provider@gmail.invented.test>', $raw);
+    draftFake($gmail, new DraftJmapProvider);
+    $target = draftAccountTarget(draftGmailAccount());
+    $content = new DraftContent(draftBytes('retry@invented.test'));
+    $service = app(MailWriteService::class);
+    $session = $service->prepareDraftUpload($target, 'durable-op-7', $content, 'thread-reply');
+    $checkpoint = $session->checkpoint();
+
+    expect($gmail->drafts)->toBe([])->and($gmail->uploadBodies)->toBe([])
+        ->and($checkpoint)->not->toContain('googleapis.com')
+        ->and(json_encode($session, JSON_THROW_ON_ERROR))->not->toContain('upload_id')
+        ->and(fn () => serialize($session))->toThrow(LogicException::class);
+    expect(strlen($session->uri()))->toBe(699);
+    $gmail->statusAfterApply = 503;
+    expect(draftFailure(fn (MailWriteService $s) => $s->createDraft($target, $content, 'thread-reply', $session))->writeSent)->toBeTrue();
+
+    $restored = DraftUploadSession::fromCheckpoint($checkpoint);
+    expect($restored->uri())->toBe($session->uri());
+    $result = $service->createDraft($target, $content, 'thread-reply', $restored);
+    $again = $service->createDraft($target, $content, 'thread-reply', $restored);
+
+    expect($result->draft?->draftId)->toBe('d-1')
+        ->and($again->draft?->revision)->toBe($result->draft?->revision)
+        ->and($result->draft?->messageId)->toBe('provider@gmail.invented.test')
+        ->and($result->draft?->rawSha256)->toBe(hash('sha256', $gmail->drafts['d-1']['raw']))
+        ->and($result->draft?->rawSha256)->not->toBe($content->sha256)
+        ->and($gmail->sessions)->toHaveCount(1)->and($gmail->uploadBodies)->toBe([$content->bytes])
+        ->and($gmail->writes)->toBe(['create']);
+    Http::assertSent(fn (Request $request): bool => $request->method() === 'PUT'
+        && $request->url() === $session->uri() && $request->body() === $content->bytes);
+});
+
+it('resumes only the missing Gmail upload suffix established by provider Range', function (): void {
+    $gmail = new DraftGmailProvider;
+    draftFake($gmail, new DraftJmapProvider);
+    $target = draftAccountTarget(draftGmailAccount());
+    $content = new DraftContent(draftBytes('partial@invented.test'));
+    $service = app(MailWriteService::class);
+    $session = $service->prepareDraftUpload($target, 'partial', $content);
+    $gmail->sessions['upload-1']['bytes'] = substr($content->bytes, 0, 43);
+
+    expect($service->createDraft($target, $content, upload: $session)->draft?->rawSha256)->toBe($content->sha256)
+        ->and($gmail->uploadBodies)->toBe([substr($content->bytes, 43)])
+        ->and($gmail->writes)->toBe(['create']);
+});
+
+it('never recreates from an expired or ambiguous Gmail session', function (int $status, ?string $range): void {
+    $gmail = new DraftGmailProvider;
+    draftFake($gmail, new DraftJmapProvider);
+    $target = draftAccountTarget(draftGmailAccount());
+    $content = new DraftContent(draftBytes('expired@invented.test'));
+    $service = app(MailWriteService::class);
+    $session = $service->prepareDraftUpload($target, 'expired', $content);
+    $gmail->sessionStatus = $status === 308 ? null : $status;
+    $gmail->rangeOverride = $range;
+
+    $failure = draftFailure(fn (MailWriteService $s) => $s->createDraft($target, $content, upload: $session));
+
+    expect($failure->safeCode)->toBe(MailWriteCode::DraftUploadUnknown)
+        ->and($failure->writeSent)->toBeTrue()->and($gmail->sessions)->toHaveCount(1)
+        ->and($gmail->uploadBodies)->toBe([])->and($gmail->writes)->toBe([]);
+})->with([
+    'expired' => [404, null], 'gone' => [410, null], 'server failure' => [503, null],
+    'redirect' => [307, null], 'ambiguous range' => [308, 'bytes=5-42'],
+    'all bytes but no draft ID' => [308, 'bytes=0-999999'],
+]);
+
+it('refuses absent or mismatched Gmail recovery state before any provider request', function (): void {
+    Http::fake();
+    $account = draftGmailAccount();
+    $otherAccount = draftGmailAccount('owner-b');
+    $target = draftAccountTarget($account);
+    $content = new DraftContent(draftBytes('bound@invented.test'));
+    $uri = 'https://www.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=synthetic';
+    $session = DraftUploadSession::issued($target, 'bound', $content, 'thread-bound', $uri);
+    $wrongOwner = DraftUploadSession::issued(new MailAccountTarget($account->id, 'synthetic-workspace', 'owner-b'), 'bound', $content, 'thread-bound', $uri);
+
+    expect(draftFailure(fn (MailWriteService $s) => $s->createDraft($target, $content))->safeCode)->toBe(MailWriteCode::DraftUploadRequired);
+
+    foreach ([
+        fn (MailWriteService $s): mixed => $s->createDraft(draftAccountTarget($otherAccount), $content, 'thread-bound', $session),
+        fn (MailWriteService $s): mixed => $s->createDraft($target, $content, 'thread-bound', $wrongOwner),
+        fn (MailWriteService $s): mixed => $s->createDraft($target, new DraftContent(draftBytes('bound@invented.test', 'Changed.')), 'thread-bound', $session),
+        fn (MailWriteService $s): mixed => $s->createDraft($target, $content, 'thread-other', $session),
+    ] as $call) {
+        expect(draftFailure($call)->safeCode)->toBe(MailWriteCode::InvalidDraftUpload);
+    }
+
+    expect(fn () => DraftUploadSession::fromCheckpoint('missing-or-corrupt'))->toThrow(MailWriteFailure::class);
+    Http::assertNothingSent();
+});
+
+it('rejects unsafe Gmail session destinations before transport', function (string $uri): void {
+    Http::fake();
+
+    expect(fn () => DraftUploadSession::issued(draftAccountTarget(draftGmailAccount()), 'unsafe', new DraftContent(draftBytes('safe@invented.test')), null, $uri))
+        ->toThrow(MailWriteFailure::class);
+    Http::assertNothingSent();
+})->with([
+    'http://www.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x',
+    'https://www.googleapis.com.evil.test/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x',
+    'https://evil@www.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x',
+    'https://www.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=resumable&upload_id=x',
+    'https://www.googleapis.com/upload/gmail/v1/users/another/drafts?uploadType=resumable&upload_id=x',
+    'unknown key' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&other=y',
+    'unknown fourth key' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd=y&other=z',
+    'duplicate required key' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&upload_id=y',
+    'duplicate optional key' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd=y&session_crd=z',
+    'encoded duplicate optional key' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd=y&session%5Fcrd=z',
+    'empty optional value' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd=',
+    'array optional value' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd[]=y',
+    'normalized unknown key' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session.crd=y',
+    'missing required key' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&session_crd=y',
+    'explicit port' => 'https://gmail.googleapis.com:443/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd=y',
+    'fragment' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd=y#fragment',
+    'control character' => "https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd=y\n",
+    'oversized capability' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd='.str_repeat('s', 8192),
+]);
+
+function meaningfulDraftBytes(): string
+{
+    return "Received: caller-trace\r\nFrom: Owner <owner@invented.test>\r\nTo: friend@invented.test\r\nCc: cc@invented.test\r\nBcc: hidden@invented.test\r\nReply-To: reply@invented.test\r\n"
+        ."Subject: Meaningful\r\nDate: Thu, 1 Oct 2026 17:04:05 -0700\r\nMessage-ID: <meaning@invented.test>\r\n"
+        ."In-Reply-To: <parent@invented.test>\r\nReferences: <older@invented.test> <parent@invented.test>\r\nX-Private: preserved\r\n"
+        ."MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=synthetic\r\n\r\n"
+        ."--synthetic\r\nContent-Type: text/plain\r\n\r\nBody unchanged.\r\n"
+        ."--synthetic\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAAECAw==\r\n"
+        ."--synthetic\r\nContent-Type: message/rfc822\r\n\r\nReceived: nested-significant\r\nDate: Thu, 1 Oct 2026 16:00:00 -0700\r\nMessage-ID: <nested@invented.test>\r\n\r\nNested body.\r\n--synthetic--\r\n";
+}
+
+it('delegates only an omitted top-level Date after validating both header maps', function (?string $requestedDate, ?string $observedDate, bool $matches): void {
+    $withoutDate = str_replace("Date: Thu, 1 Oct 2026 17:04:05 -0700\r\n", '', meaningfulDraftBytes());
+    $requested = new DraftContent(($requestedDate === null ? '' : 'Date: '.$requestedDate."\r\n").$withoutDate);
+    $observed = ($observedDate === null ? '' : 'Date: '.$observedDate."\r\n").$withoutDate;
+
+    expect(GmailDraftContent::matches($observed, $requested))->toBe($matches);
+})->with([
+    'both omitted' => [null, null, true],
+    'valid generated Date' => [null, 'Fri, 2 Oct 2026 11:55:53 +0000', true],
+    'later valid Date-only edit' => [null, 'Fri, 2 Oct 2026 12:58:07 +0000', true],
+    'empty generated Date' => [null, '', false],
+    'invalid generated calendar' => [null, '31 Feb 2026 11:55:53 +0000', false],
+    'unsupported generated Date' => [null, '2 Oct 2026 04:55:53 PDT', false],
+    'duplicate generated Dates' => [null, "2 Oct 2026 11:55:53 +0000\r\nDate: 2 Oct 2026 11:55:53 +0000", false],
+    'malformed generated Date' => [null, "2 Oct 2026 11:55:53 +0000\nX-Injected: x", false],
+    'empty supplied Date' => ['', '2 Oct 2026 11:55:53 +0000', false],
+    'invalid supplied calendar' => ['31 Feb 2026 11:55:53 +0000', null, false],
+    'unsupported supplied Date' => ['2 Oct 2026 04:55:53 PDT', null, false],
+    'equivalent supplied instant' => ['2 Oct 2026 11:55:52 +0000', 'Fri, 2 Oct 2026 04:55:52 -0700', true],
+    'supplied plus one second' => ['2 Oct 2026 11:55:52 +0000', 'Fri, 2 Oct 2026 04:55:53 -0700', false],
+    'supplied Date removed' => ['2 Oct 2026 11:55:52 +0000', null, false],
+]);
+
+it('keeps nested Dates byte-significant when top-level Date is delegated', function (): void {
+    $requested = new DraftContent(str_replace("Date: Thu, 1 Oct 2026 17:04:05 -0700\r\n", '', meaningfulDraftBytes()));
+    $observed = "Date: Fri, 2 Oct 2026 11:55:53 +0000\r\n".$requested->bytes;
+
+    expect(GmailDraftContent::matches($observed, $requested))->toBeTrue()
+        ->and(GmailDraftContent::matches(str_replace('Thu, 1 Oct 2026 16:00:00 -0700', 'Thu, 1 Oct 2026 23:00:00 GMT', $observed), $requested))->toBeFalse()
+        ->and(GmailDraftContent::matches(str_replace("Date: Thu, 1 Oct 2026 16:00:00 -0700\r\n", '', $observed), $requested))->toBeFalse();
+});
+
+it('recovers delegated Dates through the same checkpoint with one MIME upload and exact observed revisions', function (): void {
+    $gmail = new DraftGmailProvider;
+    $gmail->rewrite = fn (string $raw): string => "Date: Fri, 2 Oct 2026 11:55:53 +0000\r\n".str_replace('<meaning@invented.test>', '<assigned@gmail.invented.test>', $raw);
+    draftFake($gmail, new DraftJmapProvider);
+    $target = draftAccountTarget(draftGmailAccount());
+    $content = new DraftContent(str_replace("Date: Thu, 1 Oct 2026 17:04:05 -0700\r\n", '', meaningfulDraftBytes()));
+    $service = app(MailWriteService::class);
+    $session = $service->prepareDraftUpload($target, 'delegated-date', $content);
+    $checkpoint = $session->checkpoint();
+    $gmail->statusAfterApply = 503;
+
+    expect(draftFailure(fn (MailWriteService $s) => $s->createDraft($target, $content, upload: $session))->safeCode)->toBe(MailWriteCode::DraftUploadUnknown);
+    $restored = DraftUploadSession::fromCheckpoint($checkpoint);
+    $recovered = $service->createDraft($target, $content, upload: $restored)->draft;
+    $changedBytes = str_replace('11:55:53 +0000', '12:58:07 +0000', $gmail->drafts['d-1']['raw']);
+    $gmail->drafts['d-1']['raw'] = $changedBytes;
+    $again = $service->createDraft($target, $content, upload: $restored)->draft;
+
+    expect($recovered?->draftId)->toBe('d-1')->and($again?->draftId)->toBe('d-1')
+        ->and($again?->rawBytes)->toBe($changedBytes)->and($again?->rawSha256)->toBe(hash('sha256', $changedBytes))
+        ->and($again?->revision)->not->toBe($recovered?->revision)
+        ->and($gmail->sessions)->toHaveCount(1)->and($gmail->uploadBodies)->toBe([$content->bytes])
+        ->and($gmail->writes)->toBe(['create']);
+});
+
+it('rejects a checkpoint input mismatch when a supplied Date is removed before recovery', function (): void {
+    $gmail = new DraftGmailProvider;
+    draftFake($gmail, new DraftJmapProvider);
+    $target = draftAccountTarget(draftGmailAccount());
+    $content = new DraftContent(meaningfulDraftBytes());
+    $session = app(MailWriteService::class)->prepareDraftUpload($target, 'supplied-date', $content);
+    $withoutDate = new DraftContent(str_replace("Date: Thu, 1 Oct 2026 17:04:05 -0700\r\n", '', $content->bytes));
+    $requests = Http::recorded()->count();
+
+    $failure = draftFailure(fn (MailWriteService $s) => $s->createDraft($target, $withoutDate, upload: DraftUploadSession::fromCheckpoint($session->checkpoint())));
+
+    expect($failure->safeCode)->toBe(MailWriteCode::InvalidDraftUpload)->and($failure->writeSent)->toBeFalse()
+        ->and(Http::recorded())->toHaveCount($requests)->and($gmail->uploadBodies)->toBe([])->and($gmail->writes)->toBe([]);
+});
+
+it('allows only supported Gmail header differences while keeping exact provider revisions', function (): void {
+    $gmail = new DraftGmailProvider;
+    $gmail->rewrite = fn (string $raw): string => "Received: added by synthetic.gmail.test\r\n".str_replace(
+        ['<meaning@invented.test>', 'Thu, 1 Oct 2026 17:04:05 -0700'],
+        ['<assigned@gmail.invented.test>', 'Fri, 02 Oct 2026 00:04:05 GMT'], $raw);
+    draftFake($gmail, new DraftJmapProvider);
+    $target = draftAccountTarget(draftGmailAccount());
+    $content = new DraftContent(meaningfulDraftBytes());
+    $service = app(MailWriteService::class);
+    $session = $service->prepareDraftUpload($target, 'meaning', $content);
+    $draft = $service->createDraft($target, $content, upload: $session)->draft;
+    assert($draft !== null);
+
+    expect($draft->messageId)->toBe('assigned@gmail.invented.test')->and($draft->rawBytes)->toBe($gmail->drafts['d-1']['raw'])
+        ->and($draft->rawSha256)->toBe(hash('sha256', $gmail->drafts['d-1']['raw']))->and($draft->rawSha256)->not->toBe($content->sha256);
+    // A provider-byte-only difference still changes the exact revision and blocks stale writes.
+    $gmail->drafts['d-1']['raw'] = "Received: another provider hop\r\n".$gmail->drafts['d-1']['raw'];
+    $draftTarget = new DraftTarget($target->mailAccountId, $target->ownerType, $target->ownerId, 'd-1');
+    expect($service->draft($draftTarget)->revision)->not->toBe($draft->revision)
+        ->and(draftFailure(fn (MailWriteService $s) => $s->replaceDraft($draftTarget, $draft->revision, $content))->safeCode)->toBe(MailWriteCode::StaleRevision)
+        ->and($gmail->writes)->toBe(['create']);
+});
+
+it('rejects Gmail transformations of meaningful MIME and retains the known draft ID', function (string $before, string $after): void {
+    $gmail = new DraftGmailProvider;
+    $gmail->rewrite = fn (string $raw): string => str_replace($before, $after, $raw);
+    draftFake($gmail, new DraftJmapProvider);
+    $target = draftAccountTarget(draftGmailAccount());
+    $content = new DraftContent(meaningfulDraftBytes());
+    $service = app(MailWriteService::class);
+    $session = $service->prepareDraftUpload($target, 'mutated', $content);
+    $failure = draftFailure(fn (MailWriteService $s) => $s->createDraft($target, $content, upload: $session));
+
+    expect($failure->safeCode)->toBe(MailWriteCode::RevisionConflict)->and($failure->writeSent)->toBeTrue()
+        ->and($failure->draftId)->toBe('d-1')
+        ->and(draftFailure(fn (MailWriteService $s) => $s->createDraft($target, $content, upload: $session))->draftId)->toBe('d-1')
+        ->and($gmail->writes)->toBe(['create']);
+})->with([
+    'From' => ['owner@invented.test', 'intruder@invented.test'], 'To' => ['friend@invented.test', 'different@invented.test'],
+    'Cc' => ['cc@invented.test', 'else@invented.test'], 'Bcc' => ['hidden@invented.test', 'leaked@invented.test'],
+    'Reply-To' => ['reply@invented.test', 'redirect@invented.test'], 'Subject' => ['Subject: Meaningful', 'Subject: Altered'],
+    'Date instant' => ['17:04:05 -0700', '17:04:06 -0700'], 'invalid Date' => ['1 Oct 2026', '32 Oct 2026'],
+    'removed supplied Date' => ["Date: Thu, 1 Oct 2026 17:04:05 -0700\r\n", ''],
+    'unsupported Date' => ['-0700', 'PST'], 'caller trace' => ['caller-trace', 'discarded'],
+    'threading' => ['<parent@invented.test>', '<unrelated@invented.test>'], 'X header' => ['X-Private: preserved', 'X-Private: removed'],
+    'MIME boundary' => ['boundary=synthetic', 'boundary=other'], 'body' => ['Body unchanged.', 'Body changed.'],
+    'attachment' => ['AAECAw==', 'AAECAA=='], 'nested Message-ID' => ['<nested@invented.test>', '<other@invented.test>'],
+    'nested Received' => ['nested-significant', 'nested-changed'], 'encoding' => ['Content-Transfer-Encoding: base64', 'Content-Transfer-Encoding: x-unknown'],
+    'duplicate field' => ['Subject: Meaningful', "Subject: Meaningful\r\nSubject: Ambiguous"],
+]);
+
+it('recovers a Gmail replace at its known draft ID after Gmail rewrites the client Message-ID', function (): void {
+    $gmail = new DraftGmailProvider;
+    $gmail->drafts['d-1'] = ['message' => 'm-old', 'thread' => 't-1', 'raw' => draftBytes('before@invented.test')];
+    $gmail->rewrite = fn (string $raw): string => "Received: synthetic\r\n".str_replace('<replace@invented.test>', '<gmail-assigned@invented.test>', $raw);
+    $gmail->statusAfterApply = 503;
+    draftFake($gmail, new DraftJmapProvider);
+    $account = draftGmailAccount();
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(draftTarget($account, 'd-1'))->revision;
+    $content = new DraftContent(draftBytes('replace@invented.test', 'Replaced bytes.'));
+
+    expect(draftFailure(fn (MailWriteService $s) => $s->replaceDraft(draftTarget($account, 'd-1'), $revision, $content))->writeSent)->toBeTrue();
+    $result = $service->replaceDraft(draftTarget($account, 'd-1'), $revision, $content);
+    expect($result->outcome)->toBe(MailWriteOutcome::AlreadyApplied)->and($result->draft?->messageId)->toBe('gmail-assigned@invented.test')
+        ->and($gmail->writes)->toBe(['update:d-1']);
+    $gmail->drafts['d-1']['raw'] = str_replace('Replaced bytes.', 'Edited externally.', $gmail->drafts['d-1']['raw']);
+    expect(draftFailure(fn (MailWriteService $s) => $s->replaceDraft(draftTarget($account, 'd-1'), $revision, $content))->safeCode)->toBe(MailWriteCode::StaleRevision)
+        ->and($gmail->writes)->toBe(['update:d-1']);
+});
+
+it('recovers a delegated-Date replacement only by known ID and exact intent without preserving the old Date', function (): void {
+    $gmail = new DraftGmailProvider;
+    $gmail->drafts['d-1'] = ['message' => 'm-old', 'thread' => 't-1', 'raw' => meaningfulDraftBytes()];
+    $gmail->rewrite = fn (string $raw): string => "Date: Fri, 2 Oct 2026 11:55:53 +0000\r\n".str_replace('<meaning@invented.test>', '<assigned@gmail.invented.test>', $raw);
+    $gmail->statusAfterApply = 503;
+    draftFake($gmail, new DraftJmapProvider);
+    $account = draftGmailAccount();
+    $target = draftTarget($account, 'd-1');
+    $service = app(MailWriteService::class);
+    $old = $service->draft($target);
+    $content = new DraftContent(str_replace("Date: Thu, 1 Oct 2026 17:04:05 -0700\r\n", '', meaningfulDraftBytes()));
+
+    expect(draftFailure(fn (MailWriteService $s) => $s->replaceDraft($target, $old->revision, $content))->writeSent)->toBeTrue();
+    $recovered = $service->replaceDraft($target, $old->revision, $content);
+    assert($recovered->draft !== null);
+    $gmail->drafts['d-1']['raw'] = str_replace('11:55:53 +0000', '12:58:07 +0000', $gmail->drafts['d-1']['raw']);
+    $again = $service->replaceDraft($target, $old->revision, $content);
+    assert($again->draft !== null);
+
+    expect($recovered->outcome)->toBe(MailWriteOutcome::AlreadyApplied)
+        ->and($recovered->draft->rawBytes)->toContain('Date: Fri, 2 Oct 2026 11:55:53 +0000')
+        ->and($recovered->draft->rawBytes)->not->toContain('Date: Thu, 1 Oct 2026 17:04:05 -0700')
+        ->and($again->outcome)->toBe(MailWriteOutcome::AlreadyApplied)->and($again->draft->draftId)->toBe('d-1')
+        ->and($again->draft->rawSha256)->toBe(hash('sha256', $gmail->drafts['d-1']['raw']))
+        ->and($again->draft->revision)->not->toBe($recovered->draft->revision)
+        ->and(draftFailure(fn (MailWriteService $s) => $s->replaceDraft($target, str_repeat('0', 64), $content))->safeCode)->toBe(MailWriteCode::StaleRevision)
+        ->and(draftFailure(fn (MailWriteService $s) => $s->replaceDraft($target, $old->revision, new DraftContent("Date: Fri, 2 Oct 2026 12:58:07 +0000\r\n".$content->bytes)))->safeCode)->toBe(MailWriteCode::StaleRevision)
+        ->and($gmail->writes)->toBe(['update:d-1']);
+});
+
+it('never recovers a deleted Gmail replacement through an unrelated Message-ID match', function (): void {
+    $gmail = new DraftGmailProvider;
+    $gmail->drafts['d-original'] = ['message' => 'm-old', 'thread' => 't-1', 'raw' => draftBytes('before@invented.test')];
+    $gmail->statusAfterApply = 503;
+    draftFake($gmail, new DraftJmapProvider);
+    $account = draftGmailAccount();
+    $service = app(MailWriteService::class);
+    $target = draftTarget($account, 'd-original');
+    $revision = $service->draft($target)->revision;
+    $content = new DraftContent(draftBytes('replacement@invented.test', 'Approved replacement.'));
+    expect(draftFailure(fn (MailWriteService $s) => $s->replaceDraft($target, $revision, $content))->writeSent)->toBeTrue();
+
+    unset($gmail->drafts['d-original']);
+    $gmail->drafts['d-unrelated'] = ['message' => 'm-unrelated', 'thread' => 't-1',
+        'raw' => "Received: unrelated synthetic trace\r\nDate: Fri, 2 Oct 2026 11:55:53 +0000\r\n".$content->bytes];
+    $requestsBeforeRetry = Http::recorded()->count();
+    $failure = draftFailure(fn (MailWriteService $s) => $s->replaceDraft($target, $revision, $content));
+
+    expect($failure->safeCode)->toBe(MailWriteCode::DraftNotFound)->and($failure->writeSent)->toBeFalse()
+        ->and($gmail->writes)->toBe(['update:d-original'])
+        ->and(Http::recorded()->slice($requestsBeforeRetry)->map(fn (array $pair): string => $pair[0]->url())->values()->all())
+        ->toBe(['https://gmail.googleapis.com/gmail/v1/users/me/drafts/d-original?format=raw']);
+});
+
+function draftDebugDump(mixed $value): string
+{
+    $cloner = new VarCloner;
+    $cloner->setMaxItems(-1);
+    $dump = (new CliDumper)->dump($cloner->cloneVar($value), true);
+
+    if (! is_string($dump) || $dump === '') {
+        throw new RuntimeException('The debug dump was empty.');
+    }
+
+    return $dump;
+}
+
+it('keeps a session capability encrypted in real object dumps and enabled exception argument traces', function (bool $transportFailure): void {
+    $original = ini_set('zend.exception_ignore_args', '0');
+
+    try {
+        $account = draftGmailAccount();
+        $target = draftAccountTarget($account);
+        $content = new DraftContent(draftBytes('private@invented.test', 'PRIVATE-MIME-MARKER'));
+        $uri = 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=FAKE-CAPABILITY&session_crd=FAKE-SESSION-CREDENTIAL';
+        $session = DraftUploadSession::issued($target, 'private-operation', $content, null, $uri);
+        $restored = DraftUploadSession::fromCheckpoint($session->checkpoint());
+
+        expect($session->checkpoint())->not->toContain('FAKE-CAPABILITY', 'FAKE-SESSION-CREDENTIAL')
+            ->and(json_encode($session, JSON_THROW_ON_ERROR))->not->toContain('FAKE-CAPABILITY', 'FAKE-SESSION-CREDENTIAL')
+            ->and(draftDebugDump([$session, $restored]))->not->toContain('FAKE-CAPABILITY', 'FAKE-SESSION-CREDENTIAL', 'PRIVATE-MIME-MARKER')
+            ->and(var_export([$session, $restored], true))->not->toContain('FAKE-CAPABILITY', 'FAKE-SESSION-CREDENTIAL')
+            ->and($restored->uri())->toBe($uri);
+
+        Http::fake(function (Request $request) use ($transportFailure) {
+            if ($request->body() === '') {
+                return Http::response('', 308);
+            }
+
+            if ($transportFailure) {
+                throw new ConnectionException('FAKE-CAPABILITY FAKE-SESSION-CREDENTIAL PRIVATE-MIME-MARKER');
+            }
+
+            return Http::response('PRIVATE-MIME-MARKER', 503, ['Location' => 'FAKE-CAPABILITY FAKE-SESSION-CREDENTIAL']);
+        });
+
+        try {
+            app(MailWriteService::class)->createDraft($target, $content, upload: $restored);
+            throw new RuntimeException('The synthetic upload unexpectedly succeeded.');
+        } catch (MailWriteFailure $failure) {
+            expect($failure->safeCode)->toBe(MailWriteCode::DraftUploadUnknown)->and($failure->getPrevious())->toBeNull();
+            // Exclude Pest's circular runner arguments, not any package frame.
+            $trace = var_export(array_filter($failure->getTrace(), fn (array $frame): bool => str_starts_with($frame['class'] ?? '', 'Jkudish\\MailMirror\\')), true);
+            expect($trace)->toContain('SensitiveParameterValue');
+            expect($trace)->not->toContain('FAKE-CAPABILITY', 'FAKE-SESSION-CREDENTIAL', 'PRIVATE-MIME-MARKER')
+                ->and(draftDebugDump([$failure, $failure->getTrace()]))->not->toContain('FAKE-CAPABILITY', 'FAKE-SESSION-CREDENTIAL', 'PRIVATE-MIME-MARKER');
+        }
+
+        try {
+            DraftUploadSession::issued($target, 'invalid', $content, null, str_replace('https:', 'http:', $uri));
+            throw new RuntimeException('The unsafe URI was accepted.');
+        } catch (MailWriteFailure $failure) {
+            expect(draftDebugDump([$failure, $failure->getTrace()]))->not->toContain('FAKE-CAPABILITY', 'FAKE-SESSION-CREDENTIAL', 'PRIVATE-MIME-MARKER');
+        }
+    } finally {
+        ini_set('zend.exception_ignore_args', $original === false ? '1' : $original);
+    }
+})->with(['HTTP rejection' => false, 'connection failure' => true]);
+
+it('does not leak recorded capability or MIME through a draft confirmation failure trace', function (): void {
+    $original = ini_set('zend.exception_ignore_args', '0');
+
+    try {
+        $gmail = new DraftGmailProvider;
+        $gmail->rewrite = fn (string $raw): string => str_replace('PRIVATE-MIME-MARKER', 'Changed externally.', $raw);
+        draftFake($gmail, new DraftJmapProvider);
+        $target = draftAccountTarget(draftGmailAccount());
+        $content = new DraftContent(draftBytes('confirm@invented.test', 'PRIVATE-MIME-MARKER'));
+        $service = app(MailWriteService::class);
+        $session = $service->prepareDraftUpload($target, 'confirm', $content);
+
+        try {
+            $service->createDraft($target, $content, upload: $session);
+            throw new RuntimeException('The changed content was accepted.');
+        } catch (MailWriteFailure $failure) {
+            expect($failure->safeCode)->toBe(MailWriteCode::RevisionConflict)->and($failure->draftId)->toBe('d-1')
+                ->and(draftDebugDump([$failure, $failure->getTrace(), $failure->getPrevious()?->getTrace()]))->not->toContain('upload_id=upload-1', 'PRIVATE-MIME-MARKER');
+        }
+    } finally {
+        ini_set('zend.exception_ignore_args', $original === false ? '1' : $original);
+    }
+});
+
+it('restores an old checkpoint without keeping its plaintext capability in the object', function (): void {
+    $account = draftGmailAccount();
+    $content = new DraftContent(draftBytes('legacy@invented.test'));
+    $uri = 'https://www.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=LEGACY-CAPABILITY';
+    $checkpoint = Crypt::encryptString(json_encode([
+        'version' => 1, 'account' => $account->id, 'owner_type' => $account->owner_type, 'owner_id' => $account->owner_id,
+        'operation' => 'legacy', 'sha256' => $content->sha256, 'size' => $content->size(), 'thread' => null, 'uri' => $uri,
+    ], JSON_THROW_ON_ERROR));
+    $session = DraftUploadSession::fromCheckpoint($checkpoint);
+
+    expect($session->uri())->toBe($uri)->and(var_export($session, true))->not->toContain('LEGACY-CAPABILITY')
+        ->and(DraftUploadSession::fromCheckpoint($session->checkpoint())->uri())->toBe($uri);
+});
+
+it('dispatches MIME once on real TLS despite a lost response or redirect and recovers by status', function (string $mode): void {
+    $server = new LocalWriteServer($mode);
+
+    try {
+        $http = new Factory;
+        $http->globalOptions(['verify' => $server->certificate, 'proxy' => '', 'timeout' => 3]);
+        // Route through a real wire, using the retained Laravel middleware seam.
+        $http->globalRequestMiddleware(fn (RequestInterface $request): RequestInterface => $request->withUri(
+            $request->getUri()->withHost('localhost')->withPort((int) parse_url($server->origin, PHP_URL_PORT)),
+        ));
+        $reader = new GmailMailboxReader($http, app(MailAccountConnection::class), app(GmailOAuth::class), app(MailMimeParser::class));
+        $account = draftGmailAccount();
+        $content = new DraftContent(draftBytes('wire@invented.test', 'Synthetic complete body.'));
+        $session = DraftUploadSession::issued(draftAccountTarget($account), 'wire', $content, null,
+            'https://www.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=wire');
+
+        try {
+            $reader->uploadDraft($account, $content, $session);
+            throw new RuntimeException('The ambiguous wire response was accepted.');
+        } catch (MailWriteFailure $failure) {
+            expect($failure->safeCode)->toBe(MailWriteCode::DraftUploadUnknown)->and($failure->writeSent)->toBeTrue();
+        }
+
+        expect($reader->uploadDraft($account, $content, DraftUploadSession::fromCheckpoint($session->checkpoint())))->toBe('d-wire');
+        $requests = $server->records();
+        expect($requests)->toHaveCount(3)
+            ->and(array_column($requests, 'range'))->toBe(['bytes */'.$content->size(), 'bytes 0-'.($content->size() - 1).'/'.$content->size(), 'bytes */'.$content->size()])
+            ->and(array_column($requests, 'length'))->toBe([0, $content->size(), 0])
+            ->and(array_column($requests, 'sha256')[1])->toBe(hash('sha256', $content->bytes))
+            ->and(array_column($requests, 'line'))->toBe(array_fill(0, 3, 'PUT /upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=wire HTTP/1.1'))
+            ->and($server->records(true))->toHaveCount(3);
+    } finally {
+        $server->close();
+    }
+})->with(['lost response' => 'close', 'redirect' => 'redirect']);
+
+it('routes provider writes through the fixed profile while leaving reads on the existing transport', function (string $operation): void {
+    $server = new LocalWriteServer('echo');
+
+    try {
+        $http = new Factory;
+        // Reads may use ordinary Guzzle options; writes must refuse this override.
+        // If the fixed write handler is not selected, the local peer records a request.
+        $http->globalOptions(['verify' => $server->certificate, 'curl' => [CURLOPT_FOLLOWLOCATION => true]]);
+        $gmail = new DraftGmailProvider;
+        $gmail->drafts['d-1'] = ['message' => 'm-1', 'thread' => 't-1', 'raw' => draftBytes('route@invented.test')];
+        $jmap = new DraftJmapProvider;
+        $jmap->put('e-1', draftBytes('route@invented.test'));
+        $gmailHandler = $gmail->handler();
+        $jmapHandler = $jmap->handler();
+        $http->globalRequestMiddleware(function (RequestInterface $request) use ($server): RequestInterface {
+            $payload = json_decode((string) $request->getBody(), true);
+            $calls = is_array($payload) ? ($payload['methodCalls'] ?? null) : null;
+            $call = is_array($calls) ? ($calls[0] ?? null) : null;
+            $write = $request->getMethod() === 'DELETE'
+                || str_contains($request->getUri()->getPath(), '/upload/')
+                || (is_array($call) && ($call[0] ?? null) === 'Email/set');
+
+            return $write ? $request->withUri($request->getUri()->withHost('localhost')->withPort((int) parse_url($server->origin, PHP_URL_PORT))) : $request;
+        });
+        $http->fake(function (Request $request) use ($gmailHandler, $jmapHandler) {
+            if (str_starts_with($request->url(), 'https://localhost:')) {
+                return null;
+            }
+
+            return str_contains($request->url(), 'fastmail') ? $jmapHandler($request) : $gmailHandler($request);
+        });
+
+        if ($operation === 'gmail-delete') {
+            $account = draftGmailAccount();
+            $reader = new GmailMailboxReader($http, app(MailAccountConnection::class), app(GmailOAuth::class), app(MailMimeParser::class));
+            $draft = $reader->draft($account, 'd-1');
+        } else {
+            $account = draftJmapAccount();
+            $reader = new FastmailJmapMailboxReader($http, app(MailAccountConnection::class));
+            $draft = $reader->draft($account, 'e-1');
+        }
+        expect($draft)->not->toBeNull();
+        if ($draft === null) {
+            throw new LogicException('The read was refused by write-only options.');
+        }
+
+        try {
+            if ($operation === 'jmap-upload') {
+                $reader->stageDraft($account, new DraftContent(draftBytes('stage@invented.test')));
+            } else {
+                $reader->deleteDraft($account, $draft);
+            }
+            throw new LogicException('The provider write used the ordinary transport.');
+        } catch (MailImportFailure|MailWriteFailure $failure) {
+            expect($failure instanceof MailImportFailure ? $failure->safeCode->value : $failure->providerCode?->value)->toBe('provider_unavailable');
+        }
+
+        expect($server->records(true))->toBe([])->and($gmail->writes)->toBe([])->and($jmap->writes)->toBe([]);
+    } finally {
+        $server->close();
+    }
+})->with(['gmail-delete', 'jmap-delete', 'jmap-upload']);

@@ -537,10 +537,23 @@ changes. Draft reads (`draft()`, `resolveDraft()`) need no write switch.
 ```php
 use Jkudish\MailMirror\Write\DraftContent;
 use Jkudish\MailMirror\Write\DraftTarget;
+use Jkudish\MailMirror\Write\DraftUploadSession;
 use Jkudish\MailMirror\Write\MailAccountTarget;
 
 $content = new DraftContent($rfc5322Bytes); // throws invalid_draft
-$created = $writes->createDraft(new MailAccountTarget($account->id, $account->owner_type, $account->owner_id), $content, $providerThreadId);
+$target = new MailAccountTarget($account->id, $account->owner_type, $account->owner_id);
+
+// Gmail only: prepare metadata, not MIME. Persist the checkpoint and immutable
+// input hash/thread under your durable operation key BEFORE authorizing upload.
+$session = $writes->prepareDraftUpload($target, $operationKey, $content, $providerThreadId);
+$checkpoint = $session->checkpoint(); // encrypted sensitive recovery state
+// Your draft aggregate durably stores $checkpoint here; outside provider calls.
+$restoredSession = DraftUploadSession::fromCheckpoint($checkpoint);
+$created = $writes->createDraft($target, $content, $providerThreadId, $restoredSession);
+// Retry/recover with that SAME checkpoint, input and thread, never prepare again.
+
+// JMAP only: existing Message-ID recovery, no upload-session checkpoint needed.
+// $created = $writes->createDraft($target, $content);
 $draft = $created->draft; // DraftRevision: draftId, providerMessageId, messageId, threadId, rawSha256, revision
 
 $replaced = $writes->replaceDraft(new DraftTarget($account->id, $account->owner_type, $account->owner_id, $draft->draftId), $draft->revision, $newContent);
@@ -553,28 +566,102 @@ fields, at most one of each RFC 5322 single-instance field, and exactly one
 `mail-mirror.writes.max_draft_bytes` fail `draft_too_large`. Both failures
 happen before any provider request.
 
-The Message-ID is your idempotency key; generate it once before the first
-write. `createDraft()` first looks for drafts with that Message-ID: the same
-bytes return `AlreadyApplied` without a write, and different bytes fail
-`message_id_conflict`. A replace fails the same way when another draft uses
-the new Message-ID with different bytes.
+Gmail assigns its own Message-ID, so an empty client-Message-ID lookup never
+authorizes another create. Gmail creation without a checkpoint fails
+`draft_upload_required` before any provider request. Preparation initiates a
+resumable session with metadata only. `createDraft()` always queries that same
+session first, returns its original draft when completed, or uploads only the
+missing suffix positively reported by a 308/Range response. It makes no fresh
+create or transparent transport retry. `Applied` means the session's draft was
+confirmed, not necessarily that this call uploaded MIME.
+
+The checkpoint is encrypted/authenticated with your Laravel encryption key and
+binds the account/owner, operation key, exact input SHA-256/size, and requested
+thread. Mismatches and invalid destinations fail `invalid_draft_upload` before
+network access. Do not log the checkpoint or session URL, or serialize the
+session into audits/jobs; PHP serialization refuses. Use `checkpoint()` and
+`fromCheckpoint()` explicitly in authorized durable storage. Session URLs are
+restricted to Google's HTTPS Gmail draft upload endpoint; redirects are off.
+The required `uploadType=resumable` and `upload_id` may be accompanied only by
+an optional nonempty scalar `session_crd`. Both capability values are sensitive;
+the exact provider-issued URI is preserved, never rebuilt or logged.
+The session object stores only encrypted URI ciphertext, including in real
+property dumps (`var_export` and Symfony VarDumper); only its driver transport
+accessor decrypts the destination. Version-1 checkpoints still restore the same
+session, converting the URI to encrypted in-memory storage. Raw capability and
+MIME parameters are redacted from resumable exception arguments, and underlying
+transport exceptions are not chained. This does not make caller-owned MIME or
+explicitly decrypted destinations safe to log.
+
+Provider writes use a fresh private single-execution ext-cURL base handler,
+with one Laravel attempt, retaining HTTP middleware/fakes. This applies to Gmail
+resumable requests, mailbox mutations, draft replace/delete/send, and JMAP blob
+upload/import/set/submission writes. Reads keep their existing transport.
+Writes require ext-cURL with asynchronous DNS and refuse instead of falling
+back to a replay-capable or per-I/O-timeout transport.
+
+The fixed profile performs one `curl_exec` on a fresh unshared HTTP/1.1 handle,
+with a positive remaining monotonic total timeout, verified TLS 1.2 minimum
+(TLS 1.3 permitted), no reuse,
+redirects, authentication negotiation, proxies, early data or Expect handshake.
+After body-inspecting middleware, a seekable body gets one initial rewind before
+native execution; an advanced nonseekable body refuses. During execution the
+body is forward-only with an exact length; it cannot rewind or reset for a retry.
+A second base-handler invocation refuses before connecting or rewinding. Explicit
+proxies, arbitrary cURL overrides, unverified TLS, debug/sink options and other
+unsupported behavior-changing options refuse. Status/Location/Range/body,
+informational headers in transfer stats, and stats/budget callbacks remain
+available; a later stats failure cannot mask an earlier budget abort.
+Transport errors are safe classifications, never raw cURL errors or
+underlying exception chains. A lost response remains ambiguous: consumers
+recover the same upload session or reconcile submission; they never re-send
+merely because the transport returned no response.
+
+An expired/missing session (404/410), ambiguous Range, malformed completion or
+failed upload/status request fails `draft_upload_unknown`, with `writeSent`
+true because an earlier upload may have completed. Keep the checkpoint; never
+prepare another session as recovery. If a draft ID is known but confirmation
+fails, `MailWriteFailure::$draftId` preserves it for recovery or cleanup, not
+success. Retrying the same completed session still re-reads meaningful content.
+
+Consumers must durably bind one session to each operation and prevent a second
+preparation after upload was authorized. The package stores no attempts or
+tables and cannot prove that your checkpoint was persisted. Preparation lost
+before checkpoint can be repeated only while no MIME upload was authorized.
+jMail production draft wiring remains blocked on #3125's durable draft owner;
+the approval engine is not a draft-create checkpoint.
+
+JMAP retains the caller Message-ID idempotency key: the same bytes return
+`AlreadyApplied` without a write, and different bytes fail `message_id_conflict`.
+A replace rejects another draft using its Message-ID with different content.
 
 Pass back the `revision` you read. A replace or delete of a draft whose
 current revision differs fails `stale_revision` without writing. A
 `DraftRevision` from a JMAP replace has a new `draftId`, because JMAP emails
 are immutable; Gmail keeps the draft ID and changes `providerMessageId`.
+A Gmail replace retry recovers only its known draft ID under the exact intent.
+If that ID is gone or its content does not match, it fails `draft_not_found` or
+`stale_revision` without a Message-ID fallback, search or write; another matching
+draft is not evidence of the in-place replacement. JMAP retains its interrupted
+import/destroy recovery through the replacement's Message-ID.
+
+`DraftRevision::$rawBytes` contains the exact MIME snapshot read from the
+provider, including sensitive headers, message bodies, and attachments. Do not
+serialize the whole revision into logs, audits, API responses, or jobs. Select
+explicit fields for each destination; treat the raw bytes as sensitive mail
+content and keep them within your application's authorized content boundary.
 
 | Operation | Gmail | Fastmail JMAP |
 | --- | --- | --- |
-| create | `drafts.create` with `raw` and optional `threadId` | blob upload, then `Email/import` into the Drafts role with `$draft` and `$seen` |
+| create | resumable `drafts.create`: metadata preparation (optional `threadId`), checkpoint, status query, one remaining MIME upload | blob upload, then `Email/import` into the Drafts role with `$draft` and `$seen` |
 | read | `drafts.get` with `format=raw` | `Email/get` plus blob download; must be in Drafts with `$draft` |
 | resolve by provider message ID | `drafts.list` pages, then `drafts.get` | the email ID is the draft ID |
 | replace | `drafts.update`, unconditional | `Email/import` with `ifInState`; after it is created, `Email/set destroy` of the old email with `ifInState` set to the import's `newState` |
 | delete | `drafts.delete` | `Email/set destroy` with `ifInState` |
 
 Gmail has no update precondition. MailMirror compares the revision under its
-lock and sends one update; an edit made elsewhere between that read and the
-update is detected by the confirming re-read and fails `revision_conflict`
+lock and sends one update; an edit to nondelegated content made elsewhere between
+that read and the update is detected by the confirming re-read and fails `revision_conflict`
 with `writeSent` true. Such an edit can be lost; re-read the draft before
 retrying.
 
@@ -584,15 +671,97 @@ Message-ID lock (a replace takes it before its draft lock); the second fails
 
 Content identity is provider-specific. JMAP stores an imported blob unchanged,
 so the raw SHA-256 and Message-ID of a re-read identify the bytes written.
-For Gmail, MailMirror assumes that `drafts.get` with `format=raw` returns
-exactly the bytes written, including the client Message-ID. This is not yet
-verified against live Gmail. If Gmail rewrites either, Gmail creates and
-replaces report `unconfirmed` or `revision_conflict` instead of `Applied`, and
-Message-ID lookups find nothing; nothing is written twice.
+Gmail confirmation permits a generated top-level Message-ID, added top-level
+Received fields, field-name case/order and outer field whitespace, and equivalent
+Date formatting. Date supports an optional weekday, day/month/four-digit year,
+time with seconds, and numeric timezone offset or GMT/UT; it validates the date
+and compares a caller-supplied instant exactly. Changing or removing a supplied
+Date fails confirmation; there is no time tolerance or automatic Date stripping.
+Unsupported, empty, invalid or duplicate Dates fail confirmation before any
+delegation. From, recipients (including Bcc), Reply-To, Subject, threading,
+arbitrary X-* and MIME headers remain significant. Ambiguous duplicate fields
+fail; body bytes (including every attachment and nested message header) must
+match exactly. Transfer-encoding transformations are unsupported, not decoded
+or normalized to make them pass.
+
+Omitting **top-level** Date delegates its instant to Gmail: confirmation,
+same-session recovery and known-ID/exact-intent replacement retry accept absence
+or one valid Date in the supported grammar. This also accepts a later valid
+Date-only edit; confirmation cannot distinguish it from a generated Date.
+Omission during replacement does not preserve the old draft's Date. Nested Dates
+remain byte-significant. Removing a supplied Date changes the caller input and
+cannot reuse its checkpoint or exact replacement intent.
+
+These comparison allowances never change exact provider revisions: returned
+Message-ID, raw bytes, raw SHA-256 and revision are the actual readback. A retry
+of a possibly applied Gmail replace confirms the known draft ID's meaningful
+content only with the recorded exact attempt intent, without Message-ID search
+or another update. Changed nondelegated content or lost intent fails stale revision.
+Consumers must bind send approval to the returned **exact revision**: even a
+delegated Date-only edit changes it, so an earlier revision fails `stale_revision`
+before submission. Gmail's accepted unconditional update race is unchanged.
 
 A JMAP replace interrupted after the import and before the destroy leaves both
 drafts. Retrying the same replace with the same revision and bytes finishes it:
 it destroys the old draft without importing again.
+
+## Send a draft
+
+Approve the send in your application first, and keep your own durable record
+of the attempt; MailMirror keeps no send history. Then submit the draft at the
+revision the approver saw:
+
+```php
+$result = $writes->submit(new DraftTarget($account->id, $account->owner_type, $account->owner_id, $draft->draftId), $draft->revision);
+
+$result->outcome;           // SubmissionOutcome::Submitted
+$result->providerMessageId; // the sent message (Gmail) or email (JMAP)
+$result->threadId;
+```
+
+Before sending, MailMirror re-reads the draft under the draft lock. A changed
+revision fails `stale_revision`. The draft's single From address must match,
+case-insensitively, exactly one identity mirrored for the account by the last
+import; otherwise the call fails `identity_mismatch` before any submission
+request. Gmail sends one `drafts.send` carrying the exact bytes read at the
+approved revision, so the approved content and From go out even if the draft
+is edited in Gmail during the submit; that concurrent edit is lost. Gmail
+deletes the draft on success. JMAP sends one `EmailSubmission/set` with that
+identity's `identityId` and `onSuccessUpdateEmail`, which moves the email from
+Drafts to Sent and removes `$draft`; JMAP emails are immutable, so the email
+ID pins the approved bytes. Neither request is retried. `Submitted` is returned
+only after a re-read shows the message sent.
+
+When a submit fails with `writeSent` true, the provider may have sent it.
+MailMirror records that and refuses every later `submit()` of the draft with
+`submission_unknown`, without any provider request. The record lives in the
+cache; if it is evicted, `submit()` still refuses when the provider links a
+submission to the draft's ID (a JMAP `EmailSubmission` that is `pending` or
+`final`, searched page by page). A search that reaches its page bound before
+it is exhausted, or whose `queryState` changes between pages, also refuses.
+Every submit makes that read first.
+
+`reconcileSubmission($target, $revision, $messageId)` only reads, and answers
+`submitted` or `unknown`:
+
+| Evidence | Outcome |
+| --- | --- |
+| JMAP `EmailSubmission` for the email ID, `pending` or `final` | `submitted` (`matchedBy` `provider_id`) |
+| Sent message with the Message-ID, draft gone | `submitted` (`matchedBy` `message_id`) |
+| Sent message with the Message-ID, draft still exists (any revision) | `unknown` |
+| No match, or a submission search that reached its bound or changed `queryState` | `unknown` |
+
+Absence is never proof that nothing was sent: a provider may destroy
+submission records after sending (RFC 8621), may rewrite Message-IDs, and a
+timed-out request may still be in flight. `submitted` clears the recorded
+attempt; `unknown` never does. Durable at-most-once and any decision to send
+again after `unknown` belong to your application's approval process, with a
+human decision; MailMirror never re-sends during reconciliation. Cache eviction
+or expiry under `mail-mirror.writes.intent_ttl_seconds` only removes the
+temporary guard; it never authorizes another submission. Keep durable attempt
+state in your application and require new explicit approval for any resend,
+even if both the cached intent and provider evidence are gone. While the intent
+exists, a newly approved resend needs a new draft (new draft ID and Message-ID).
 
 ### Concurrency and cache dependencies
 

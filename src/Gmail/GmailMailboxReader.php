@@ -12,8 +12,9 @@ use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Date;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Contracts\BudgetedDeltaMailboxReader;
-use Jkudish\MailMirror\Contracts\DraftDriver;
 use Jkudish\MailMirror\Contracts\MailboxMutationDriver;
+use Jkudish\MailMirror\Contracts\ResumableDraftDriver;
+use Jkudish\MailMirror\Contracts\SubmissionDriver;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
 use Jkudish\MailMirror\Enums\MailboxAction;
@@ -21,14 +22,17 @@ use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
 use Jkudish\MailMirror\Enums\MailWriteCode;
+use Jkudish\MailMirror\Enums\SubmissionOutcome;
 use Jkudish\MailMirror\Exceptions\DeltaRepairRequired;
 use Jkudish\MailMirror\Exceptions\GmailAuthorizationException;
 use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
 use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
+use Jkudish\MailMirror\Http\SingleExecutionWriteHandler;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAccountCredential;
+use Jkudish\MailMirror\Models\MailIdentity;
 use Jkudish\MailMirror\Read\AccountProfile;
 use Jkudish\MailMirror\Read\ChangedMessageState;
 use Jkudish\MailMirror\Read\InventoryPage;
@@ -43,13 +47,16 @@ use Jkudish\MailMirror\Read\RetrievedMessage;
 use Jkudish\MailMirror\Read\SyncWorkBudget;
 use Jkudish\MailMirror\Write\DraftContent;
 use Jkudish\MailMirror\Write\DraftRevision;
+use Jkudish\MailMirror\Write\DraftUploadSession;
+use Jkudish\MailMirror\Write\MailAccountTarget;
 use Jkudish\MailMirror\Write\MailboxChange;
 use Jkudish\MailMirror\Write\MessageState;
+use Jkudish\MailMirror\Write\SubmissionResult;
 use Throwable;
 use ZBateson\MailMimeParser\Header\AddressHeader;
 use ZBateson\MailMimeParser\MailMimeParser;
 
-final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDriver, MailboxMutationDriver
+final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMutationDriver, ResumableDraftDriver, SubmissionDriver
 {
     private const API = 'https://gmail.googleapis.com/gmail/v1';
 
@@ -811,6 +818,8 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDrive
                 $threadId,
                 hash('sha256', $bytes),
                 ['label_ids' => $labelIds],
+                DraftContent::fromAddressOf($bytes),
+                $bytes,
             );
         } catch (InvalidArgumentException) {
             throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
@@ -857,7 +866,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDrive
         foreach (array_keys($this->draftIds($native)) as $draftId) {
             $draft = $this->draft($account, $draftId);
 
-            if ($draft !== null && $this->sameContentIdentity($draft, $messageId, null)) {
+            if ($draft !== null && $this->sameContentIdentity($draft->messageId, null, $messageId, null)) {
                 $drafts[] = $draft;
             }
         }
@@ -867,19 +876,13 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDrive
 
     public function holdsContent(DraftRevision $draft, DraftContent $content): bool
     {
-        return $this->sameContentIdentity($draft, $content->messageId, $content->sha256);
+        return $draft->rawBytes !== null && GmailDraftContent::matches($draft->rawBytes, $content);
     }
 
-    /**
-     * Gmail content identity, in one place. ASSUMPTION, unverified against live
-     * Gmail (#3131): drafts.get format=raw returns exactly the bytes written,
-     * including the client Message-ID. If Gmail rewrites either, every Gmail
-     * create and replace reports unconfirmed or revision_conflict, and draft
-     * lookups by Message-ID find nothing; change only this method.
-     */
-    private function sameContentIdentity(DraftRevision $draft, string $messageId, ?string $sha256): bool
+    /** Message-ID lookup only; absence never proves no draft or submission was written. */
+    private function sameContentIdentity(?string $observedMessageId, ?string $observedSha256, string $messageId, ?string $sha256): bool
     {
-        return $draft->messageId === $messageId && ($sha256 === null || $draft->rawSha256 === $sha256);
+        return $observedMessageId === $messageId && ($sha256 === null || $observedSha256 === $sha256);
     }
 
     public function stageDraft(MailAccount $account, DraftContent $content): ?string
@@ -889,19 +892,118 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDrive
 
     public function createDraft(MailAccount $account, DraftContent $content, ?string $stagedBlobId, ?string $providerThreadId): string
     {
-        $this->assertAccount($account);
-        $this->credential($account, null);
-        $native = $this->sendDraftWrite($account, 'POST', self::API.'/users/me/drafts', [
-            'message' => array_filter([
-                'raw' => $this->base64UrlEncode($content->bytes),
-                'threadId' => $providerThreadId,
-            ], fn (mixed $value): bool => $value !== null),
-        ]);
-        $draftId = $native['id'] ?? null;
+        throw new MailWriteFailure(MailWriteCode::DraftUploadRequired);
+    }
 
-        return is_string($draftId) && $draftId !== ''
-            ? $draftId
-            : throw new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
+    public function prepareDraftUpload(MailAccount $account, string $operationKey, #[\SensitiveParameter] DraftContent $content, ?string $providerThreadId): DraftUploadSession
+    {
+        $this->assertAccount($account);
+        $response = $this->uploadRequest($account, 'POST', 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable', [
+            'X-Upload-Content-Type' => 'message/rfc822',
+            'X-Upload-Content-Length' => (string) $content->size(),
+        ], ['message' => $providerThreadId === null ? new \stdClass : ['threadId' => $providerThreadId]], null, false);
+
+        return DraftUploadSession::issued(new MailAccountTarget($account->id, $account->owner_type, $account->owner_id),
+            $operationKey, $content, $providerThreadId, $response->header('Location'));
+    }
+
+    public function uploadDraft(MailAccount $account, #[\SensitiveParameter] DraftContent $content, DraftUploadSession $session): string
+    {
+        $this->assertAccount($account);
+        $session->assertMatches(new MailAccountTarget($account->id, $account->owner_type, $account->owner_id), $content, $session->providerThreadId);
+        $size = $content->size();
+        $response = $this->uploadRequest($account, 'PUT', $session->uri(), [
+            'Content-Length' => '0', 'Content-Range' => 'bytes */'.$size,
+        ], null, '', true);
+
+        if ($response->status() !== 308) {
+            return $this->uploadedDraftId($response);
+        }
+
+        $range = $response->header('Range');
+        $offset = 0;
+
+        if ($range !== '') {
+            if (preg_match('/\A(?:bytes=)?0-(\d{1,10})\z/', $range, $matches) !== 1 || (int) $matches[1] >= $size - 1) {
+                throw new MailWriteFailure(MailWriteCode::DraftUploadUnknown, true);
+            }
+
+            $offset = (int) $matches[1] + 1;
+        }
+
+        // A 308 positively reports the stored prefix; send only the remaining
+        // suffix, once. Interrupted transfers return to this status query later.
+        $response = $this->uploadRequest($account, 'PUT', $session->uri(), [
+            'Content-Type' => 'message/rfc822', 'Content-Length' => (string) ($size - $offset),
+            'Content-Range' => 'bytes '.$offset.'-'.($size - 1).'/'.$size,
+        ], null, substr($content->bytes, $offset), true);
+
+        if ($response->status() === 308) {
+            throw new MailWriteFailure(MailWriteCode::DraftUploadUnknown, true);
+        }
+
+        return $this->uploadedDraftId($response);
+    }
+
+    private function uploadedDraftId(#[\SensitiveParameter] Response $response): string
+    {
+        $id = $response->json('id');
+
+        return is_string($id) && $id !== '' && strlen($id) <= 255
+            ? $id : throw new MailWriteFailure(MailWriteCode::DraftUploadUnknown, true);
+    }
+
+    /**
+     * Resumable transport: no redirects or retries, including 401/5xx. A status
+     * failure/expired session cannot prove an earlier upload did not complete.
+     *
+     * @param  array<string, string>  $headers
+     * @param  array<string, mixed>|null  $metadata
+     */
+    private function uploadRequest(MailAccount $account, string $method, #[\SensitiveParameter] string $uri, array $headers, ?array $metadata, #[\SensitiveParameter] ?string $bytes, bool $mayHaveUploaded): Response
+    {
+        if (config('mail-mirror.gmail.enabled') !== true) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedDriver);
+        }
+
+        [$credential, $stored] = $this->credential($account, null);
+        $this->budget?->claimHttpRequest();
+
+        try {
+            $response = SingleExecutionWriteHandler::prepare($this->prepareRequest($this->http->withToken($credential->accessToken())->acceptJson()))
+                ->withHeaders($headers)->send($method, $uri,
+                    $metadata !== null ? ['json' => $metadata] : ['body' => $bytes ?? '']);
+            $this->budget?->recordDownloadedBytes(strlen($response->body()));
+        } catch (Throwable) {
+            throw new MailWriteFailure($mayHaveUploaded ? MailWriteCode::DraftUploadUnknown : MailWriteCode::ProviderFailed, $mayHaveUploaded);
+        }
+
+        if ($response->status() === 401) {
+            try {
+                $this->refresh($account, $stored, $credential);
+            } catch (MailImportFailure) {
+                // Prepare the next call only; never retry this request.
+            }
+        }
+
+        if (! in_array($response->status(), $mayHaveUploaded ? [200, 201, 308] : [200], true)) {
+            // Do not build a URL/Response-bearing exception just to classify it:
+            // exception argument capture must not retain the session capability.
+            $code = match ($response->status()) {
+                400 => MailImportCode::StateMismatch,
+                401 => MailImportCode::AuthenticationFailed,
+                403 => MailImportCode::PermissionDenied,
+                404, 410 => MailImportCode::MessageUnavailable,
+                408, 425, 429 => MailImportCode::RateLimited,
+                500, 502, 503, 504 => MailImportCode::ProviderUnavailable,
+                default => MailImportCode::UnexpectedFailure,
+            };
+
+            throw new MailWriteFailure($mayHaveUploaded ? MailWriteCode::DraftUploadUnknown : MailWriteCode::ProviderFailed,
+                $mayHaveUploaded, $code);
+        }
+
+        return $response;
     }
 
     /**
@@ -937,6 +1039,114 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDrive
         $this->assertDraft($account, $observed);
         $this->credential($account, null);
         $this->sendDraftWrite($account, 'DELETE', self::API.'/users/me/drafts/'.rawurlencode($observed->draftId), null);
+    }
+
+    /** drafts.send sends the approved bytes and deletes the draft on success. */
+    public function submitDraft(MailAccount $account, DraftRevision $observed, MailIdentity $identity): string
+    {
+        $this->assertAccount($account);
+        $this->assertDraft($account, $observed);
+
+        if ($identity->mail_account_id !== $account->id) {
+            throw new MailWriteFailure(MailWriteCode::IdentityMismatch);
+        }
+
+        if ($observed->rawBytes === null) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedState);
+        }
+
+        // Send the approved snapshot, not whatever the draft holds now: drafts.send with
+        // only an ID would send an edit made in Gmail after the revision and identity
+        // checks. A concurrent Gmail edit to the draft is lost (accepted Gmail draft race).
+        $this->credential($account, null);
+        $native = $this->sendDraftWrite($account, 'POST', self::API.'/users/me/drafts/send', [
+            'id' => $observed->draftId,
+            'message' => ['raw' => $this->base64UrlEncode($observed->rawBytes), 'threadId' => $observed->threadId],
+        ]);
+        $messageId = $native['id'] ?? null;
+
+        return is_string($messageId) && $messageId !== '' && mb_strlen($messageId) <= 255
+            ? $messageId
+            : throw new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
+    }
+
+    public function sentMessage(MailAccount $account, string $providerMessageId): ?SubmissionResult
+    {
+        $this->assertAccount($account);
+
+        try {
+            $native = $this->request($account, 'GET', self::API.'/users/me/messages/'.rawurlencode($providerMessageId), ['format' => 'minimal']);
+        } catch (MailImportFailure $failure) {
+            if ($failure->httpStatus === 404) {
+                return null;
+            }
+
+            throw $failure;
+        }
+
+        $threadId = $native['threadId'] ?? null;
+        $labelIds = $native['labelIds'] ?? null;
+
+        if (($native['id'] ?? null) !== $providerMessageId || ! is_string($threadId) || $threadId === ''
+            || ! is_array($labelIds) || array_filter($labelIds, fn (mixed $labelId): bool => ! is_string($labelId)) !== []) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+        }
+
+        if (! in_array('SENT', $labelIds, true) || in_array('DRAFT', $labelIds, true)) {
+            return null;
+        }
+
+        return new SubmissionResult($account->id, MailDriver::Gmail, SubmissionOutcome::Submitted, $providerMessageId, $threadId, 'provider_id', [
+            'label_ids' => array_values($labelIds),
+        ]);
+    }
+
+    /**
+     * Gmail keeps no link from a sent message to the draft it came from, so the
+     * only evidence is a SENT message whose Message-ID header matches.
+     */
+    public function findSubmission(MailAccount $account, string $draftId, ?string $messageId): ?SubmissionResult
+    {
+        $this->assertAccount($account);
+
+        if ($messageId === null) {
+            return null;
+        }
+        $native = $this->request($account, 'GET', self::API.'/users/me/messages', [
+            'q' => 'rfc822msgid:'.$messageId,
+            'labelIds' => 'SENT',
+            'maxResults' => 10,
+        ]);
+        $messages = $native['messages'] ?? [];
+
+        if (! is_array($messages) || ! array_is_list($messages)) {
+            throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+        }
+
+        foreach ($messages as $message) {
+            $id = is_array($message) ? ($message['id'] ?? null) : null;
+
+            if (! is_string($id) || $id === '') {
+                throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
+            }
+
+            $metadata = $this->request($account, 'GET', self::API.'/users/me/messages/'.rawurlencode($id), [
+                'format' => 'metadata',
+                'metadataHeaders' => 'Message-ID',
+            ]);
+            $threadId = $metadata['threadId'] ?? null;
+            $labelIds = $metadata['labelIds'] ?? [];
+            $header = $this->headerValue($this->headers($metadata), 'Message-ID');
+
+            if (is_string($threadId) && $threadId !== '' && is_array($labelIds) && in_array('SENT', $labelIds, true)
+                && $header !== null && $this->sameContentIdentity(DraftContent::parseMessageId($header), null, $messageId, null)) {
+                return new SubmissionResult($account->id, MailDriver::Gmail, SubmissionOutcome::Submitted, $id, $threadId, 'message_id', [
+                    'label_ids' => array_values(array_filter($labelIds, 'is_string')),
+                ]);
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -1022,7 +1232,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDrive
         }
 
         [$credential, $stored] = $this->credential($account, $refreshCredential ? 30 : null);
-        $response = $this->send($credential, $method, $url, $query, $json);
+        $response = $this->send($credential, $method, $url, $query, $json, ! $resendAfterReauthorization);
 
         if ($response->status() === 401 && ! $resendAfterReauthorization) {
             try {
@@ -1068,14 +1278,18 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, DraftDrive
      * @param  array<string, int|string|null>  $query
      * @param  array<string, mixed>|null  $json
      */
-    private function send(OAuthTokenSetCredential $credential, string $method, string $url, array $query, ?array $json = null): Response
+    private function send(OAuthTokenSetCredential $credential, string $method, string $url, array $query, #[\SensitiveParameter] ?array $json = null, bool $write = false): Response
     {
         $this->budget?->claimHttpRequest();
 
         try {
-            $response = $this->prepareRequest(
+            $pending = $this->prepareRequest(
                 $this->http->withToken($credential->accessToken())->acceptJson(),
-            )->send($method, $url, ['query' => $query] + ($json === null ? [] : ['json' => $json]));
+            );
+            if ($write) {
+                $pending = SingleExecutionWriteHandler::prepare($pending);
+            }
+            $response = $pending->send($method, $url, ['query' => $query] + ($json === null ? [] : ['json' => $json]));
             $this->budget?->recordDownloadedBytes(strlen($response->body()));
 
             return $response;

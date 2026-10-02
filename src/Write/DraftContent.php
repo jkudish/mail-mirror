@@ -8,12 +8,13 @@ use Jkudish\MailMirror\Enums\MailWriteCode;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
 
 /**
- * Caller-built RFC 5322 message bytes for a provider draft. MailMirror stores
- * and sends these bytes unchanged; building MIME is the caller's job.
+ * Caller-built RFC 5322 bytes, uploaded unchanged; building MIME is the caller's
+ * job. Providers may add supported headers on readback (Gmail).
  *
  * The bytes must have a CRLF-delimited header section with well-formed fields,
  * at most one of each single-instance field, and exactly one Message-ID. That
- * Message-ID is the caller's idempotency key for creating and sending.
+ * Message-ID is JMAP's create idempotency key. Gmail recovery uses a caller-held
+ * upload session because Gmail can assign another Message-ID.
  */
 final readonly class DraftContent
 {
@@ -63,6 +64,39 @@ final readonly class DraftContent
         $values = self::parseHeaders($bytes)['message-id'] ?? [];
 
         return count($values) === 1 ? self::messageIdValue($values[0]) : null;
+    }
+
+    /**
+     * The lower-cased address of the single From mailbox in provider bytes, or
+     * null when there is no From field, several mailboxes, or no address.
+     */
+    public static function fromAddressOf(string $bytes): ?string
+    {
+        $values = self::parseHeaders($bytes)['from'] ?? [];
+
+        if (count($values) !== 1) {
+            return null;
+        }
+
+        // Quoted display names and comments may contain commas and angle brackets.
+        $value = (string) preg_replace(['/"(?:[^"\\\\]|\\\\.)*"/', '/\([^()]*\)/'], ['""', ''], $values[0]);
+
+        if (str_contains($value, ',')) {
+            return null;
+        }
+
+        if (preg_match('/<([^<>\s@]+@[^<>\s@]+)>\s*\z/', $value, $matches) === 1
+            || preg_match('/\A\s*([^<>\s@"]+@[^<>\s@"]+)\s*\z/', $value, $matches) === 1) {
+            return strtolower($matches[1]);
+        }
+
+        return null;
+    }
+
+    /** A Message-ID field value without angle brackets, or null when it is malformed. */
+    public static function parseMessageId(string $value): ?string
+    {
+        return self::messageIdValue($value);
     }
 
     /** @return array<string, list<string>>|null null when the header section is malformed */

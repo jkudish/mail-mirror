@@ -12,8 +12,8 @@ use Illuminate\Http\Client\Response;
 use Illuminate\Support\Sleep;
 use InvalidArgumentException;
 use Jkudish\MailMirror\Contracts\BudgetedDeltaMailboxReader;
-use Jkudish\MailMirror\Contracts\DraftDriver;
 use Jkudish\MailMirror\Contracts\MailboxMutationDriver;
+use Jkudish\MailMirror\Contracts\SubmissionDriver;
 use Jkudish\MailMirror\Credentials\ApiTokenCredential;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Enums\MailboxAction;
@@ -21,13 +21,16 @@ use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailImportStage;
 use Jkudish\MailMirror\Enums\MailWriteCode;
+use Jkudish\MailMirror\Enums\SubmissionOutcome;
 use Jkudish\MailMirror\Exceptions\DeltaRepairRequired;
 use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
 use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
+use Jkudish\MailMirror\Http\SingleExecutionWriteHandler;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAccountCredential;
+use Jkudish\MailMirror\Models\MailIdentity;
 use Jkudish\MailMirror\Read\AccountProfile;
 use Jkudish\MailMirror\Read\ChangedMessageState;
 use Jkudish\MailMirror\Read\InventoryPage;
@@ -44,9 +47,10 @@ use Jkudish\MailMirror\Write\DraftContent;
 use Jkudish\MailMirror\Write\DraftRevision;
 use Jkudish\MailMirror\Write\MailboxChange;
 use Jkudish\MailMirror\Write\MessageState;
+use Jkudish\MailMirror\Write\SubmissionResult;
 use Throwable;
 
-final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, DraftDriver, MailboxMutationDriver
+final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, MailboxMutationDriver, SubmissionDriver
 {
     private const CORE = 'urn:ietf:params:jmap:core';
 
@@ -55,6 +59,9 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Dra
     private const SUBMISSION = 'urn:ietf:params:jmap:submission';
 
     private const SESSION_URL = 'https://api.fastmail.com/jmap/session';
+
+    /** EmailSubmission/query pages read before submission evidence counts as unknown. */
+    private const SUBMISSION_QUERY_PAGES = 20;
 
     /** @var array<int, array{api_url: string, download_url: string, session_state: string}> */
     private array $sessions = [];
@@ -920,6 +927,8 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Dra
                     'drafts_mailbox_id' => $draftsMailboxId,
                     'email_state' => $emailState,
                 ],
+                DraftContent::fromAddressOf($bytes),
+                $bytes,
             );
         } catch (InvalidArgumentException) {
             throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::MalformedPayload);
@@ -985,10 +994,15 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Dra
         [$credential, $stored] = $this->credential($account, MailImportStage::Retrieve);
 
         try {
-            $response = $this->prepareRequest($this->http->withToken($credential->token())->acceptJson())
+            $this->budget?->claimHttpRequest();
+            $response = SingleExecutionWriteHandler::prepare($this->prepareRequest($this->http->withToken($credential->token())->acceptJson()))
                 ->withBody($content->bytes, 'message/rfc822')
                 ->post($url);
-        } catch (Throwable) {
+            $this->budget?->recordDownloadedBytes(strlen($response->body()));
+        } catch (Throwable $failure) {
+            if (($budgetFailure = $this->budgetFailure($failure)) !== null) {
+                throw $budgetFailure;
+            }
             throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::ProviderUnavailable, true);
         }
 
@@ -1062,6 +1076,205 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Dra
         }
 
         $this->destroyEmail($account, $observed->draftId, $state, false);
+    }
+
+    /**
+     * One EmailSubmission/set as $identity. On success the server moves the
+     * email from Drafts to Sent and removes $draft. JMAP emails are immutable,
+     * so the email ID pins the bytes the revision check approved.
+     */
+    public function submitDraft(MailAccount $account, DraftRevision $observed, MailIdentity $identity): string
+    {
+        $this->assertAccount($account);
+        $draftsMailboxId = $observed->providerEvidence['drafts_mailbox_id'] ?? null;
+
+        if ($observed->mailAccountId !== $account->id || $observed->driver !== MailDriver::Jmap || ! is_string($draftsMailboxId)) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedState);
+        }
+
+        if ($identity->mail_account_id !== $account->id) {
+            throw new MailWriteFailure(MailWriteCode::IdentityMismatch);
+        }
+
+        // The pre-write draft read cached the mailboxes.
+        $sentMailboxId = $this->writableMailboxId($this->mailboxWithRole($this->mailboxes[$account->id] ?? [], 'sent'));
+        $draftsMailboxId = $this->writableMailboxId($draftsMailboxId);
+        $emailId = $observed->draftId;
+        $this->credential($account, MailImportStage::Retrieve);
+        $result = $this->sendSet($account, $this->session($account), 'EmailSubmission/set', [
+            'accountId' => $account->provider_account_id,
+            'create' => ['send' => ['identityId' => $identity->provider_identity_id, 'emailId' => $emailId]],
+            'onSuccessUpdateEmail' => ['#send' => [
+                'mailboxIds/'.$draftsMailboxId => null,
+                'mailboxIds/'.$sentMailboxId => true,
+                'keywords/$draft' => null,
+            ]],
+        ], 'submit', [self::CORE, self::MAIL, self::SUBMISSION], true);
+        $created = $result['created'] ?? null;
+        $submission = is_array($created) ? ($created['send'] ?? null) : null;
+
+        if (is_array($submission) && is_string($submission['id'] ?? null)) {
+            return $emailId;
+        }
+
+        $notCreated = $result['notCreated'] ?? null;
+        $error = is_array($notCreated) ? ($notCreated['send'] ?? null) : null;
+
+        if (! is_array($error)) {
+            throw new MailWriteFailure(MailWriteCode::ProviderFailed, true, MailImportCode::MalformedPayload);
+        }
+
+        throw ($error['type'] ?? null) === 'forbiddenFrom'
+            ? new MailWriteFailure(MailWriteCode::IdentityMismatch, false, MailImportCode::PermissionDenied)
+            : $this->setItemFailure($error);
+    }
+
+    /** Sent means in the Sent-role mailbox, out of Drafts, and without $draft. */
+    public function sentMessage(MailAccount $account, string $providerMessageId): ?SubmissionResult
+    {
+        $this->assertAccount($account);
+        $session = $this->session($account);
+        $mailboxes = $this->fetchMailboxes($account, $session)['mailboxes'];
+        $sentMailboxId = $this->mailboxWithRole($mailboxes, 'sent');
+        $draftsMailboxId = $this->mailboxWithRole($mailboxes, 'drafts');
+        $result = $this->call($account, $session, 'Email/get', [
+            'accountId' => $account->provider_account_id,
+            'ids' => [$providerMessageId],
+            'properties' => ['id', 'threadId', 'mailboxIds', 'keywords'],
+        ], 'sent', MailImportStage::Retrieve);
+
+        if (in_array($providerMessageId, $this->stringList($result['notFound'] ?? [], 255, MailImportStage::Retrieve), true)) {
+            return null;
+        }
+
+        $email = $this->singleObject($result, $providerMessageId, MailImportStage::Retrieve);
+        $mailboxIds = array_keys($this->truthMap($email['mailboxIds'] ?? null, MailImportStage::Retrieve));
+        $keywords = $this->truthMap($email['keywords'] ?? null, MailImportStage::Retrieve);
+        sort($mailboxIds);
+
+        if (! in_array($sentMailboxId, $mailboxIds, true) || in_array($draftsMailboxId, $mailboxIds, true) || isset($keywords['$draft'])) {
+            return null;
+        }
+
+        return new SubmissionResult(
+            $account->id,
+            MailDriver::Jmap,
+            SubmissionOutcome::Submitted,
+            $providerMessageId,
+            $this->boundedString($email['threadId'] ?? null, 255, MailImportStage::Retrieve),
+            'provider_id',
+            ['mailbox_ids' => $mailboxIds, 'sent_mailbox_id' => $sentMailboxId],
+        );
+    }
+
+    /**
+     * An EmailSubmission for the email ID is the primary evidence; a canceled
+     * one does not count. Only without one does a Sent-role email with the
+     * Message-ID count, as weaker evidence.
+     */
+    public function findSubmission(MailAccount $account, string $draftId, ?string $messageId): ?SubmissionResult
+    {
+        $this->assertAccount($account);
+        $session = $this->session($account);
+        $position = 0;
+        $queryState = null;
+
+        // Canceled submissions do not count, so page until linked pending or final
+        // evidence appears or the query is exhausted. Reaching the bound is never
+        // treated as absence, nor is a query that changes between pages.
+        for ($page = 0; $page < self::SUBMISSION_QUERY_PAGES; $page++) {
+            $query = $this->call($account, $session, 'EmailSubmission/query', [
+                'accountId' => $account->provider_account_id,
+                'filter' => ['emailIds' => [$draftId]],
+                'position' => $position,
+                'limit' => 50,
+                'calculateTotal' => true,
+            ], 'submissions', MailImportStage::Retrieve);
+            $pageState = $this->boundedString($query['queryState'] ?? null, 255, MailImportStage::Retrieve);
+
+            if ($queryState !== null && $pageState !== $queryState) {
+                // A deletion can move an unseen submission behind the cursor. Do
+                // not accept even an empty page or its total as proof of absence.
+                throw new MailWriteFailure(MailWriteCode::SubmissionUnknown);
+            }
+
+            $queryState ??= $pageState;
+            $submissionIds = $this->stringList($query['ids'] ?? null, 255, MailImportStage::Retrieve);
+
+            if ($submissionIds === []) {
+                break;
+            }
+
+            $submissions = $this->objectList($this->call($account, $session, 'EmailSubmission/get', [
+                'accountId' => $account->provider_account_id,
+                'ids' => $submissionIds,
+                'properties' => ['id', 'emailId', 'threadId', 'undoStatus'],
+            ], 'submission', MailImportStage::Retrieve), MailImportStage::Retrieve);
+
+            foreach ($submissions as $submission) {
+                if (($submission['emailId'] ?? null) === $draftId && in_array($submission['undoStatus'] ?? null, ['pending', 'final'], true)) {
+                    return new SubmissionResult(
+                        $account->id,
+                        MailDriver::Jmap,
+                        SubmissionOutcome::Submitted,
+                        $draftId,
+                        $this->boundedString($submission['threadId'] ?? null, 255, MailImportStage::Retrieve),
+                        'provider_id',
+                        [
+                            'submission_id' => $this->boundedString($submission['id'] ?? null, 255, MailImportStage::Retrieve),
+                            'undo_status' => $submission['undoStatus'],
+                        ],
+                    );
+                }
+            }
+
+            $position += count($submissionIds);
+            $total = $query['total'] ?? null;
+
+            if (is_int($total) && $position >= $total) {
+                break;
+            }
+
+            if ($page === self::SUBMISSION_QUERY_PAGES - 1) {
+                throw new MailWriteFailure(MailWriteCode::SubmissionUnknown);
+            }
+        }
+
+        if ($messageId === null) {
+            return null;
+        }
+
+        $sentMailboxId = $this->mailboxWithRole($this->fetchMailboxes($account, $session)['mailboxes'], 'sent');
+        $sent = $this->call($account, $session, 'Email/query', [
+            'accountId' => $account->provider_account_id,
+            'filter' => ['operator' => 'AND', 'conditions' => [
+                ['inMailbox' => $sentMailboxId],
+                ['header' => ['Message-ID', '<'.$messageId.'>']],
+            ]],
+            'limit' => 10,
+        ], 'sent-query', MailImportStage::Retrieve);
+
+        foreach ($this->stringList($sent['ids'] ?? null, 255, MailImportStage::Retrieve) as $emailId) {
+            $email = $this->singleObject($this->call($account, $session, 'Email/get', [
+                'accountId' => $account->provider_account_id,
+                'ids' => [$emailId],
+                'properties' => ['id', 'threadId', 'messageId'],
+            ], 'sent-email', MailImportStage::Retrieve), $emailId, MailImportStage::Retrieve);
+
+            if (in_array($messageId, $this->stringList($email['messageId'] ?? [], 255, MailImportStage::Retrieve), true)) {
+                return new SubmissionResult(
+                    $account->id,
+                    MailDriver::Jmap,
+                    SubmissionOutcome::Submitted,
+                    $emailId,
+                    $this->boundedString($email['threadId'] ?? null, 255, MailImportStage::Retrieve),
+                    'message_id',
+                    ['sent_mailbox_id' => $sentMailboxId],
+                );
+            }
+        }
+
+        return null;
     }
 
     /** Import one staged blob into Drafts as a seen draft, and return its email ID. */
@@ -1184,6 +1397,7 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Dra
         array $arguments,
         string $callId,
         array $capabilities = [self::CORE, self::MAIL],
+        bool $implicitEmailSet = false,
     ): array {
         try {
             $payload = $this->jsonRequest($account, 'POST', $session['api_url'], [
@@ -1202,7 +1416,10 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Dra
         }
 
         $responses = $payload['methodResponses'] ?? null;
-        $response = is_array($responses) && count($responses) === 1 ? ($responses[0] ?? null) : null;
+        // An EmailSubmission/set with onSuccessUpdateEmail may add one implicit Email/set
+        // response; the confirming re-read, not that response, decides the outcome.
+        $count = is_array($responses) ? count($responses) : 0;
+        $response = $count === 1 || ($implicitEmailSet && $count === 2) ? ($responses[0] ?? null) : null;
 
         if (! is_array($response) || count($response) !== 3 || ! is_array($response[1] ?? null)
             || ($response[2] ?? null) !== $callId) {
@@ -1429,6 +1646,9 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Dra
 
             try {
                 $pending = $this->prepareRequest($this->http->withToken($credential->token())->acceptJson());
+                if (! $retryTransport) {
+                    $pending = SingleExecutionWriteHandler::prepare($pending);
+                }
                 $response = $pending->send($method, $url, $body === null ? [] : ['json' => $body]);
                 $this->budget?->recordDownloadedBytes(strlen($response->body()));
             } catch (Throwable $failure) {

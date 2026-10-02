@@ -12,6 +12,11 @@ use Jkudish\MailMirror\Enums\MailDriver;
  * token a caller passes back to replace, delete, or submit this exact draft;
  * it changes whenever the provider message or its raw bytes change.
  *
+ * $fromAddress is the lower-cased single From address, or null. $rawBytes are
+ * the exact bytes the read found, so a submit can send the approved snapshot.
+ * They contain sensitive MIME (headers, body, attachments). Consumers must
+ * select explicit fields for serialization, audits, and jobs, not the whole object.
+ *
  * Gmail keeps the draft ID across updates and changes the message ID. JMAP
  * emails are immutable, so the draft ID is the email ID and changes on replace.
  */
@@ -29,6 +34,8 @@ final readonly class DraftRevision
         public string $threadId,
         public string $rawSha256,
         public array $providerEvidence,
+        public ?string $fromAddress = null,
+        public ?string $rawBytes = null,
     ) {
         foreach ([$draftId, $providerMessageId, $threadId] as $id) {
             if (trim($id) === '' || mb_strlen($id) > 255) {
@@ -38,6 +45,10 @@ final readonly class DraftRevision
 
         if ($mailAccountId < 1 || preg_match('/\A[0-9a-f]{64}\z/', $rawSha256) !== 1) {
             throw new InvalidArgumentException('A draft revision requires an account and a raw SHA-256.');
+        }
+
+        if ($rawBytes !== null && hash('sha256', $rawBytes) !== $rawSha256) {
+            throw new InvalidArgumentException('Draft bytes do not match their SHA-256.');
         }
 
         $this->revision = hash('sha256', $draftId."\0".$providerMessageId."\0".$rawSha256);
