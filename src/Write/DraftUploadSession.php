@@ -138,6 +138,10 @@ final readonly class DraftUploadSession
     private static function validateUri(#[\SensitiveParameter] string $uri): void
     {
         $parts = parse_url($uri);
+        $parameters = explode('&', is_array($parts) ? ($parts['query'] ?? '') : '');
+        // Check actual keys as well as parsed values: parse_str normalizes dots
+        // and spaces to underscores and collapses duplicate scalar keys.
+        $keys = array_map(static fn (string $parameter): string => rawurldecode(explode('=', $parameter, 2)[0]), $parameters);
         $query = [];
         parse_str(is_array($parts) ? ($parts['query'] ?? '') : '', $query);
 
@@ -147,7 +151,9 @@ final readonly class DraftUploadSession
             || ($parts['path'] ?? null) !== '/upload/gmail/v1/users/me/drafts'
             || ($query['uploadType'] ?? null) !== 'resumable'
             || ! is_string($query['upload_id'] ?? null) || $query['upload_id'] === ''
-            || count($query) !== 2 || count(explode('&', $parts['query'] ?? '')) !== 2) {
+            || (array_key_exists('session_crd', $query) && (! is_string($query['session_crd']) || $query['session_crd'] === ''))
+            || array_diff($keys, ['uploadType', 'upload_id', 'session_crd']) !== []
+            || count($query) !== count($keys)) {
             throw new MailWriteFailure(MailWriteCode::InvalidDraftUpload);
         }
     }

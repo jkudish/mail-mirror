@@ -62,6 +62,9 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   real property dumps. Raw capability/MIME arguments are sensitive in resumable
   failure traces; URL/Response-bearing transport exceptions are not retained.
   Existing version-1 checkpoints still restore the same session.
+  Google's optional nonempty scalar `session_crd` is accepted alongside required
+  upload parameters and preserved as part of the sensitive session capability;
+  duplicate, unknown, empty and array-valued parameters remain rejected.
 - Provider writes use a fresh single-execution ext-cURL base handler, one native
   execution and one Laravel attempt, retaining HTTP middleware/fakes. Gmail
   resumable/mailbox/draft/send writes and JMAP upload/import/set/submission writes

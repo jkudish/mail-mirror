@@ -87,7 +87,7 @@ final class DraftGmailProvider
                     $this->sessions[$id] = ['bytes' => '', 'size' => (int) $size,
                         'thread' => $metadata['message']['threadId'] ?? 't-new', 'draft' => null];
 
-                    return Http::response('', 200, ['Location' => 'https://www.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id='.$id]);
+                    return Http::response('', 200, ['Location' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id='.$id.'&session_crd='.str_repeat('s', 586)]);
                 }
 
                 $uploadId = $query['upload_id'] ?? '';
@@ -908,10 +908,12 @@ it('prepares without MIME and recovers a completed Gmail session twice despite a
         ->and($checkpoint)->not->toContain('googleapis.com')
         ->and(json_encode($session, JSON_THROW_ON_ERROR))->not->toContain('upload_id')
         ->and(fn () => serialize($session))->toThrow(LogicException::class);
+    expect(strlen($session->uri()))->toBe(699);
     $gmail->statusAfterApply = 503;
     expect(draftFailure(fn (MailWriteService $s) => $s->createDraft($target, $content, 'thread-reply', $session))->writeSent)->toBeTrue();
 
     $restored = DraftUploadSession::fromCheckpoint($checkpoint);
+    expect($restored->uri())->toBe($session->uri());
     $result = $service->createDraft($target, $content, 'thread-reply', $restored);
     $again = $service->createDraft($target, $content, 'thread-reply', $restored);
 
@@ -922,6 +924,8 @@ it('prepares without MIME and recovers a completed Gmail session twice despite a
         ->and($result->draft?->rawSha256)->not->toBe($content->sha256)
         ->and($gmail->sessions)->toHaveCount(1)->and($gmail->uploadBodies)->toBe([$content->bytes])
         ->and($gmail->writes)->toBe(['create']);
+    Http::assertSent(fn (Request $request): bool => $request->method() === 'PUT'
+        && $request->url() === $session->uri() && $request->body() === $content->bytes);
 });
 
 it('resumes only the missing Gmail upload suffix established by provider Range', function (): void {
@@ -996,6 +1000,19 @@ it('rejects unsafe Gmail session destinations before transport', function (strin
     'https://evil@www.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x',
     'https://www.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=resumable&upload_id=x',
     'https://www.googleapis.com/upload/gmail/v1/users/another/drafts?uploadType=resumable&upload_id=x',
+    'unknown key' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&other=y',
+    'unknown fourth key' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd=y&other=z',
+    'duplicate required key' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&upload_id=y',
+    'duplicate optional key' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd=y&session_crd=z',
+    'encoded duplicate optional key' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd=y&session%5Fcrd=z',
+    'empty optional value' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd=',
+    'array optional value' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd[]=y',
+    'normalized unknown key' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session.crd=y',
+    'missing required key' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&session_crd=y',
+    'explicit port' => 'https://gmail.googleapis.com:443/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd=y',
+    'fragment' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd=y#fragment',
+    'control character' => "https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd=y\n",
+    'oversized capability' => 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=x&session_crd='.str_repeat('s', 8192),
 ]);
 
 function meaningfulDraftBytes(): string
@@ -1123,12 +1140,14 @@ it('keeps a session capability encrypted in real object dumps and enabled except
         $account = draftGmailAccount();
         $target = draftAccountTarget($account);
         $content = new DraftContent(draftBytes('private@invented.test', 'PRIVATE-MIME-MARKER'));
-        $uri = 'https://www.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=FAKE-CAPABILITY';
+        $uri = 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable&upload_id=FAKE-CAPABILITY&session_crd=FAKE-SESSION-CREDENTIAL';
         $session = DraftUploadSession::issued($target, 'private-operation', $content, null, $uri);
         $restored = DraftUploadSession::fromCheckpoint($session->checkpoint());
 
-        expect(draftDebugDump([$session, $restored]))->not->toContain('FAKE-CAPABILITY', 'PRIVATE-MIME-MARKER')
-            ->and(var_export([$session, $restored], true))->not->toContain('FAKE-CAPABILITY')
+        expect($session->checkpoint())->not->toContain('FAKE-CAPABILITY', 'FAKE-SESSION-CREDENTIAL')
+            ->and(json_encode($session, JSON_THROW_ON_ERROR))->not->toContain('FAKE-CAPABILITY', 'FAKE-SESSION-CREDENTIAL')
+            ->and(draftDebugDump([$session, $restored]))->not->toContain('FAKE-CAPABILITY', 'FAKE-SESSION-CREDENTIAL', 'PRIVATE-MIME-MARKER')
+            ->and(var_export([$session, $restored], true))->not->toContain('FAKE-CAPABILITY', 'FAKE-SESSION-CREDENTIAL')
             ->and($restored->uri())->toBe($uri);
 
         Http::fake(function (Request $request) use ($transportFailure) {
@@ -1137,10 +1156,10 @@ it('keeps a session capability encrypted in real object dumps and enabled except
             }
 
             if ($transportFailure) {
-                throw new ConnectionException('FAKE-CAPABILITY PRIVATE-MIME-MARKER');
+                throw new ConnectionException('FAKE-CAPABILITY FAKE-SESSION-CREDENTIAL PRIVATE-MIME-MARKER');
             }
 
-            return Http::response('PRIVATE-MIME-MARKER', 503, ['Location' => 'FAKE-CAPABILITY']);
+            return Http::response('PRIVATE-MIME-MARKER', 503, ['Location' => 'FAKE-CAPABILITY FAKE-SESSION-CREDENTIAL']);
         });
 
         try {
@@ -1151,15 +1170,15 @@ it('keeps a session capability encrypted in real object dumps and enabled except
             // Exclude Pest's circular runner arguments, not any package frame.
             $trace = var_export(array_filter($failure->getTrace(), fn (array $frame): bool => str_starts_with($frame['class'] ?? '', 'Jkudish\\MailMirror\\')), true);
             expect($trace)->toContain('SensitiveParameterValue');
-            expect($trace)->not->toContain('FAKE-CAPABILITY', 'PRIVATE-MIME-MARKER')
-                ->and(draftDebugDump([$failure, $failure->getTrace()]))->not->toContain('FAKE-CAPABILITY', 'PRIVATE-MIME-MARKER');
+            expect($trace)->not->toContain('FAKE-CAPABILITY', 'FAKE-SESSION-CREDENTIAL', 'PRIVATE-MIME-MARKER')
+                ->and(draftDebugDump([$failure, $failure->getTrace()]))->not->toContain('FAKE-CAPABILITY', 'FAKE-SESSION-CREDENTIAL', 'PRIVATE-MIME-MARKER');
         }
 
         try {
             DraftUploadSession::issued($target, 'invalid', $content, null, str_replace('https:', 'http:', $uri));
             throw new RuntimeException('The unsafe URI was accepted.');
         } catch (MailWriteFailure $failure) {
-            expect(draftDebugDump([$failure, $failure->getTrace()]))->not->toContain('FAKE-CAPABILITY', 'PRIVATE-MIME-MARKER');
+            expect(draftDebugDump([$failure, $failure->getTrace()]))->not->toContain('FAKE-CAPABILITY', 'FAKE-SESSION-CREDENTIAL', 'PRIVATE-MIME-MARKER');
         }
     } finally {
         ini_set('zend.exception_ignore_args', $original === false ? '1' : $original);

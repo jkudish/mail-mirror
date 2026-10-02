@@ -582,6 +582,9 @@ network access. Do not log the checkpoint or session URL, or serialize the
 session into audits/jobs; PHP serialization refuses. Use `checkpoint()` and
 `fromCheckpoint()` explicitly in authorized durable storage. Session URLs are
 restricted to Google's HTTPS Gmail draft upload endpoint; redirects are off.
+The required `uploadType=resumable` and `upload_id` may be accompanied only by
+an optional nonempty scalar `session_crd`. Both capability values are sensitive;
+the exact provider-issued URI is preserved, never rebuilt or logged.
 The session object stores only encrypted URI ciphertext, including in real
 property dumps (`var_export` and Symfony VarDumper); only its driver transport
 accessor decrypts the destination. Version-1 checkpoints still restore the same
