@@ -14,6 +14,8 @@ use Jkudish\MailMirror\Enums\MailDriver;
  *
  * $fromAddress is the lower-cased single From address, or null. $rawBytes are
  * the exact bytes the read found, so a submit can send the approved snapshot.
+ * They contain sensitive MIME (headers, body, attachments). Consumers must
+ * select explicit fields for serialization, audits, and jobs, not the whole object.
  *
  * Gmail keeps the draft ID across updates and changes the message ID. JMAP
  * emails are immutable, so the draft ID is the email ID and changes on replace.

@@ -1171,10 +1171,11 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
         $this->assertAccount($account);
         $session = $this->session($account);
         $position = 0;
+        $queryState = null;
 
         // Canceled submissions do not count, so page until linked pending or final
         // evidence appears or the query is exhausted. Reaching the bound is never
-        // treated as absence.
+        // treated as absence, nor is a query that changes between pages.
         for ($page = 0; $page < self::SUBMISSION_QUERY_PAGES; $page++) {
             $query = $this->call($account, $session, 'EmailSubmission/query', [
                 'accountId' => $account->provider_account_id,
@@ -1183,6 +1184,15 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
                 'limit' => 50,
                 'calculateTotal' => true,
             ], 'submissions', MailImportStage::Retrieve);
+            $pageState = $this->boundedString($query['queryState'] ?? null, 255, MailImportStage::Retrieve);
+
+            if ($queryState !== null && $pageState !== $queryState) {
+                // A deletion can move an unseen submission behind the cursor. Do
+                // not accept even an empty page or its total as proof of absence.
+                throw new MailWriteFailure(MailWriteCode::SubmissionUnknown);
+            }
+
+            $queryState ??= $pageState;
             $submissionIds = $this->stringList($query['ids'] ?? null, 255, MailImportStage::Retrieve);
 
             if ($submissionIds === []) {

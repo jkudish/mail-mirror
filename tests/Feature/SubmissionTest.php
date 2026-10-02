@@ -161,6 +161,9 @@ final class SubmitJmapProvider
     /** Accept the submission but leave the email in Drafts, as if onSuccessUpdateEmail never applied. */
     public bool $skipOnSuccess = false;
 
+    /** @var Closure(int): void|null */
+    public ?Closure $onSubmissionQuery = null;
+
     /** @return Closure(Request): mixed */
     public function handler(): Closure
     {
@@ -228,16 +231,21 @@ final class SubmitJmapProvider
                 'EmailSubmission/query' => (function () use ($arguments, $reply): mixed {
                     /** @var array{emailIds: list<string>} $filter */
                     $filter = $arguments['filter'];
+                    $position = is_int($arguments['position'] ?? null) ? $arguments['position'] : 0;
+
+                    if ($this->onSubmissionQuery !== null) {
+                        ($this->onSubmissionQuery)($position);
+                    }
 
                     $all = array_keys(array_filter(
                         $this->submissions,
                         fn (array $submission): bool => in_array($submission['emailId'], $filter['emailIds'], true),
                     ));
-                    $position = is_int($arguments['position'] ?? null) ? $arguments['position'] : 0;
                     $limit = min(10, is_int($arguments['limit'] ?? null) ? $arguments['limit'] : 10);
 
                     return $reply('EmailSubmission/query', [
-                        'queryState' => 'q', 'position' => $position, 'limit' => $limit, 'total' => count($all),
+                        'queryState' => hash('sha256', serialize($this->submissions)),
+                        'position' => $position, 'limit' => $limit, 'total' => count($all),
                         'ids' => array_slice($all, $position, $limit),
                     ]);
                 })(),
@@ -664,6 +672,72 @@ it('treats a JMAP submission search that reaches its bound as unknown, never as 
     expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->safeCode)->toBe(MailWriteCode::SubmissionUnknown)
         ->and($jmap->sends)->toBe([])
         ->and($service->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test')->outcome)->toBe(SubmissionOutcome::Unknown);
+});
+
+it('refuses submit after intent eviction when a JMAP submission moves behind the pagination cursor', function (): void {
+    [, $jmap, $account] = submitSetup(MailDriver::Jmap);
+
+    for ($i = 1; $i <= 10; $i++) {
+        $jmap->submissions['canceled-'.$i] = ['emailId' => 'd-1', 'undoStatus' => 'canceled'];
+    }
+
+    $jmap->skipOnSuccess = true;
+    $jmap->sendStatusAfterApply = 503;
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
+    expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->writeSent)->toBeTrue();
+    cache()->flush();
+
+    $jmap->onSubmissionQuery = function (int $position) use ($jmap): void {
+        if ($position === 10) {
+            // The final submission moves from index 10 to 9. This page is empty,
+            // but its changed queryState cannot prove the query is exhausted.
+            unset($jmap->submissions['canceled-1']);
+            $jmap->onSubmissionQuery = null;
+        }
+    };
+
+    $failure = submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision));
+
+    expect($failure->safeCode)->toBe(MailWriteCode::SubmissionUnknown)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and($jmap->onSubmissionQuery)->toBeNull()
+        ->and($jmap->sends)->toHaveCount(1);
+});
+
+it('reports unknown and retains the intent when the JMAP submission query changes between pages', function (): void {
+    [, $jmap, $account] = submitSetup(MailDriver::Jmap);
+
+    for ($i = 1; $i <= 10; $i++) {
+        $jmap->submissions['canceled-'.$i] = ['emailId' => 'd-1', 'undoStatus' => 'canceled'];
+    }
+
+    $jmap->skipOnSuccess = true;
+    $jmap->sendStatusAfterApply = 503;
+    $service = app(MailWriteService::class);
+    $revision = $service->draft(submitTarget($account, 'd-1'))->revision;
+    expect(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->writeSent)->toBeTrue();
+    unset($jmap->emails['d-1']);
+
+    $jmap->onSubmissionQuery = function (int $position) use ($jmap): void {
+        if ($position === 10) {
+            unset($jmap->submissions['canceled-1']);
+            $jmap->onSubmissionQuery = null;
+            // A Sent Message-ID match must not rescue an inconsistent scan.
+            $jmap->put('sent-copy', submitBytes('send-1@invented.test'));
+            $jmap->emails['sent-copy']['mailboxIds'] = ['mb-sent' => true];
+        }
+    };
+
+    $result = $service->reconcileSubmission(submitTarget($account, 'd-1'), $revision, 'send-1@invented.test');
+    $requests = count(Http::recorded());
+
+    expect($result->outcome)->toBe(SubmissionOutcome::Unknown)
+        ->and($result->matchedBy)->toBeNull()
+        ->and($jmap->onSubmissionQuery)->toBeNull()
+        ->and(submitFailure(fn (MailWriteService $s) => $s->submit(submitTarget($account, 'd-1'), $revision))->safeCode)->toBe(MailWriteCode::SubmissionUnknown)
+        ->and(count(Http::recorded()))->toBe($requests)
+        ->and($jmap->sends)->toHaveCount(1);
 });
 
 it('reports unknown after an accepted JMAP submission whose record was destroyed, and keeps refusing', function (): void {

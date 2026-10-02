@@ -564,6 +564,12 @@ current revision differs fails `stale_revision` without writing. A
 `DraftRevision` from a JMAP replace has a new `draftId`, because JMAP emails
 are immutable; Gmail keeps the draft ID and changes `providerMessageId`.
 
+`DraftRevision::$rawBytes` contains the exact MIME snapshot read from the
+provider, including sensitive headers, message bodies, and attachments. Do not
+serialize the whole revision into logs, audits, API responses, or jobs. Select
+explicit fields for each destination; treat the raw bytes as sensitive mail
+content and keep them within your application's authorized content boundary.
+
 | Operation | Gmail | Fastmail JMAP |
 | --- | --- | --- |
 | create | `drafts.create` with `raw` and optional `threadId` | blob upload, then `Email/import` into the Drafts role with `$draft` and `$seen` |
@@ -627,7 +633,8 @@ MailMirror records that and refuses every later `submit()` of the draft with
 cache; if it is evicted, `submit()` still refuses when the provider links a
 submission to the draft's ID (a JMAP `EmailSubmission` that is `pending` or
 `final`, searched page by page). A search that reaches its page bound before
-it is exhausted also refuses. Every submit makes that read first.
+it is exhausted, or whose `queryState` changes between pages, also refuses.
+Every submit makes that read first.
 
 `reconcileSubmission($target, $revision, $messageId)` only reads, and answers
 `submitted` or `unknown`:
@@ -637,16 +644,19 @@ it is exhausted also refuses. Every submit makes that read first.
 | JMAP `EmailSubmission` for the email ID, `pending` or `final` | `submitted` (`matchedBy` `provider_id`) |
 | Sent message with the Message-ID, draft gone | `submitted` (`matchedBy` `message_id`) |
 | Sent message with the Message-ID, draft still exists (any revision) | `unknown` |
-| No match, or a submission search that reached its bound | `unknown` |
+| No match, or a submission search that reached its bound or changed `queryState` | `unknown` |
 
 Absence is never proof that nothing was sent: a provider may destroy
 submission records after sending (RFC 8621), may rewrite Message-IDs, and a
 timed-out request may still be in flight. `submitted` clears the recorded
 attempt; `unknown` never does. Durable at-most-once and any decision to send
 again after `unknown` belong to your application's approval process, with a
-human decision; MailMirror never re-sends. While the record exists, a resend
-needs a new draft (new draft ID and Message-ID) or the record's expiry under
-`mail-mirror.writes.intent_ttl_seconds`.
+human decision; MailMirror never re-sends during reconciliation. Cache eviction
+or expiry under `mail-mirror.writes.intent_ttl_seconds` only removes the
+temporary guard; it never authorizes another submission. Keep durable attempt
+state in your application and require new explicit approval for any resend,
+even if both the cached intent and provider evidence are gone. While the intent
+exists, a newly approved resend needs a new draft (new draft ID and Message-ID).
 
 ### Concurrency and cache dependencies
 

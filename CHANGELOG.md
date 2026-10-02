@@ -56,10 +56,13 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reported as not sent. A possibly sent submit blocks further submits of that
   draft with `submission_unknown` until reconciliation answers `submitted`,
   and a provider submission linked to the draft's ID (JMAP, paginated, with a
-  bound that also refuses) blocks it even if that cached record is lost.
-  Durable at-most-once and any human-authorized resend belong to the
-  consumer's approval engine.
-- `DraftRevision::$rawBytes`: the exact bytes the read found.
+  bound and `queryState` check that also refuse) blocks it even if that cached
+  record is lost. Cache eviction or TTL expiry only removes the temporary
+  guard, never authorizes another submission. Durable attempt state and new
+  explicit approval for any resend belong to the consumer's approval engine.
+- `DraftRevision::$rawBytes`: the exact bytes the read found, containing
+  sensitive MIME. Consumers must select explicit fields for serialization,
+  audits, and jobs instead of serializing the whole revision.
 - `mail-mirror.writes.max_draft_bytes` (25 MiB) and draft codes
   `invalid_draft`, `draft_too_large`, `draft_not_found`, `stale_revision`,
   `revision_conflict`, `message_id_conflict`, `identity_mismatch`, and
