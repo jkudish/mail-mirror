@@ -11,6 +11,7 @@ use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Support\Facades\Date;
 use Jkudish\MailMirror\Contracts\DraftDriver;
 use Jkudish\MailMirror\Contracts\MailboxMutationDriver;
+use Jkudish\MailMirror\Contracts\ResumableDraftDriver;
 use Jkudish\MailMirror\Contracts\SubmissionDriver;
 use Jkudish\MailMirror\Enums\MailDriver;
 use Jkudish\MailMirror\Enums\MailWriteCode;
@@ -238,25 +239,85 @@ final readonly class MailWriteService
         return $this->ownedDraft($account, $draft);
     }
 
-    /**
-     * Create one provider draft from $content. The content's Message-ID is the
-     * idempotency key: a draft that already has it and the same bytes returns
-     * AlreadyApplied without a write, so a retry never creates a second draft.
-     *
-     * @throws AccountResourceMismatch before any provider request
-     * @throws MailWriteFailure
-     */
-    public function createDraft(MailAccountTarget $target, DraftContent $content, ?string $providerThreadId = null): DraftWriteResult
+    /** Prepare Gmail metadata only. The consumer must persist checkpoint() before uploading MIME. */
+    public function prepareDraftUpload(MailAccountTarget $target, string $operationKey, DraftContent $content, ?string $providerThreadId = null): DraftUploadSession
     {
         $this->assertWritesEnabled();
         $this->assertDraftSize($content);
         $account = $this->account($target);
         $driver = $this->draftDriver($account);
 
+        if (! $driver instanceof ResumableDraftDriver) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedDriver);
+        }
+
+        if (trim($operationKey) === '' || strlen($operationKey) > 255
+            || ($providerThreadId !== null && (trim($providerThreadId) === '' || strlen($providerThreadId) > 255))) {
+            throw new MailWriteFailure(MailWriteCode::InvalidDraftUpload);
+        }
+
+        return $this->withLock($account, $this->uploadKey($account, $operationKey),
+            function (\DateTimeInterface $sendBy, int $sendSeconds) use ($driver, $account, $operationKey, $content, $providerThreadId): DraftUploadSession {
+                $this->prepareDraftWrite($driver, $account, $sendSeconds, $sendBy, null);
+
+                try {
+                    return $driver->prepareDraftUpload($account, $operationKey, $content, $providerThreadId);
+                } catch (MailImportFailure $failure) {
+                    throw MailWriteFailure::fromProvider($failure, false);
+                }
+            });
+    }
+
+    /**
+     * Create/recover Gmail only through the same caller-checkpointed $upload.
+     * JMAP keeps its Message-ID/byte-identity recovery. Never prepare another
+     * Gmail session because an earlier upload is unknown or expired.
+     *
+     * @throws AccountResourceMismatch before any provider request
+     * @throws MailWriteFailure
+     */
+    public function createDraft(MailAccountTarget $target, DraftContent $content, ?string $providerThreadId = null, ?DraftUploadSession $upload = null): DraftWriteResult
+    {
+        $this->assertWritesEnabled();
+        $this->assertDraftSize($content);
+        $account = $this->account($target);
+        $driver = $this->draftDriver($account);
+
+        if ($driver instanceof ResumableDraftDriver) {
+            if ($upload === null) {
+                throw new MailWriteFailure(MailWriteCode::DraftUploadRequired);
+            }
+
+            $upload->assertMatches($target, $content, $providerThreadId);
+        } elseif ($upload !== null) {
+            throw new MailWriteFailure(MailWriteCode::InvalidDraftUpload);
+        }
+
         return $this->withLock(
             $account,
             $this->messageIdKey($account, $content->messageId).':write-lock',
-            function (\DateTimeInterface $sendBy, int $sendSeconds) use ($driver, $account, $content, $providerThreadId): DraftWriteResult {
+            function (\DateTimeInterface $sendBy, int $sendSeconds) use ($driver, $account, $content, $providerThreadId, $upload): DraftWriteResult {
+                if ($driver instanceof ResumableDraftDriver) {
+                    return $this->withLock($account, $this->uploadKey($account, $upload->operationKey),
+                        function (\DateTimeInterface $innerSendBy, int $uploadSeconds) use ($driver, $account, $content, $upload, $sendBy): DraftWriteResult {
+                            $this->prepareDraftWrite($driver, $account, $uploadSeconds, min($sendBy, $innerSendBy), null);
+
+                            try {
+                                $draftId = $driver->uploadDraft($account, $content, $upload);
+                            } catch (MailImportFailure $failure) {
+                                throw MailWriteFailure::fromProvider($failure, false);
+                            }
+
+                            $confirmed = $this->confirmDraft($driver, $account, $draftId, $content);
+
+                            if ($upload->providerThreadId !== null && $confirmed->threadId !== $upload->providerThreadId) {
+                                throw new MailWriteFailure(MailWriteCode::RevisionConflict, true, draftId: $draftId);
+                            }
+
+                            return $this->draftResult($account, MailWriteOutcome::Applied, $confirmed);
+                        }, 2);
+                }
+
                 $existing = $this->draftsWithMessageId($driver, $account, $content->messageId);
 
                 if ($existing !== []) {
@@ -277,6 +338,7 @@ final readonly class MailWriteService
 
                 return $this->draftResult($account, MailWriteOutcome::Applied, $confirmed);
             },
+            $driver instanceof ResumableDraftDriver ? 2 : 1,
         );
     }
 
@@ -333,6 +395,13 @@ final readonly class MailWriteService
         $current = $this->readDraft($driver, $account, $target->draftId);
 
         if ($current === null || $current->revision !== $expectedRevision) {
+            // Gmail rewrites Message-ID. Retry the known in-place draft instead
+            // of searching the caller's old Message-ID; still require the exact
+            // recorded attempt and meaningful content, never identity alone.
+            if ($current !== null && $this->cache->get($intent) === $intentValue && $driver->holdsContent($current, $content)) {
+                return $this->draftResult($account, MailWriteOutcome::AlreadyApplied, $current);
+            }
+
             $replacement = $this->cache->get($intent) === $intentValue
                 ? $this->draftsWithMessageId($driver, $account, $content->messageId)
                 : [];
@@ -678,18 +747,22 @@ final readonly class MailWriteService
      */
     private function confirmDraft(DraftDriver $driver, MailAccount $account, string $draftId, DraftContent $content): DraftRevision
     {
-        $confirmed = $this->confirmingRead(fn () => $driver->draft($account, $draftId));
+        try {
+            $confirmed = $this->confirmingRead(fn () => $driver->draft($account, $draftId));
 
-        if (! $confirmed instanceof DraftRevision || $confirmed->draftId !== $draftId
-            || $confirmed->mailAccountId !== $account->id || $confirmed->driver !== $account->driver) {
-            throw new MailWriteFailure(MailWriteCode::Unconfirmed, true);
+            if (! $confirmed instanceof DraftRevision || $confirmed->draftId !== $draftId
+                || $confirmed->mailAccountId !== $account->id || $confirmed->driver !== $account->driver) {
+                throw new MailWriteFailure(MailWriteCode::Unconfirmed, true);
+            }
+
+            if (! $driver->holdsContent($confirmed, $content)) {
+                throw new MailWriteFailure(MailWriteCode::RevisionConflict, true);
+            }
+
+            return $confirmed;
+        } catch (MailWriteFailure $failure) {
+            throw new MailWriteFailure($failure->safeCode, $failure->writeSent, $failure->providerCode, $failure, $draftId);
         }
-
-        if (! $driver->holdsContent($confirmed, $content)) {
-            throw new MailWriteFailure(MailWriteCode::RevisionConflict, true);
-        }
-
-        return $confirmed;
     }
 
     /**
@@ -733,6 +806,11 @@ final readonly class MailWriteService
     private function draftKey(MailAccount $account, string $draftId): string
     {
         return sprintf('mail-mirror:account:%d:draft:%s', $account->id, hash('sha256', $draftId));
+    }
+
+    private function uploadKey(MailAccount $account, string $operationKey): string
+    {
+        return sprintf('mail-mirror:account:%d:draft-upload:%s:write-lock', $account->id, hash('sha256', $operationKey));
     }
 
     /** Creates, and later submissions, of one caller Message-ID share this key. */

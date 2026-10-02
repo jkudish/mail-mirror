@@ -8,12 +8,13 @@ use Jkudish\MailMirror\Enums\MailWriteCode;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
 
 /**
- * Caller-built RFC 5322 message bytes for a provider draft. MailMirror stores
- * and sends these bytes unchanged; building MIME is the caller's job.
+ * Caller-built RFC 5322 bytes, uploaded unchanged; building MIME is the caller's
+ * job. Providers may add supported headers on readback (Gmail).
  *
  * The bytes must have a CRLF-delimited header section with well-formed fields,
  * at most one of each single-instance field, and exactly one Message-ID. That
- * Message-ID is the caller's idempotency key for creating and sending.
+ * Message-ID is JMAP's create idempotency key. Gmail recovery uses a caller-held
+ * upload session because Gmail can assign another Message-ID.
  */
 final readonly class DraftContent
 {

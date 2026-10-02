@@ -16,6 +16,13 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `MessageState`. Custom drivers implement `messageState()` and
   `applyChange()` for a `MailboxChange` instead of `trashState()` and
   `restoreFromTrash()`.
+- Gmail `createDraft()` now requires a `DraftUploadSession` as its fourth
+  argument; the one-shot form refuses before network access. Call
+  `prepareDraftUpload(target, operationKey, content, thread)` and durably persist
+  its encrypted `checkpoint()` before authorizing MIME upload. Restore with
+  `DraftUploadSession::fromCheckpoint()` and recover only through that SAME
+  session. Expiry, absence, ambiguous status, or lost completion never initiate
+  another create. No package persistence; consumers own durable attempts.
 
 ### Added
 
@@ -35,14 +42,23 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   message ID, including drafts started outside the consumer),
   `replaceDraft()`, and `deleteDraft()`. Each returns or takes a
   `DraftRevision` whose opaque `revision` must still match before a replace or
-  delete writes anything; a mismatch fails `stale_revision`. The Message-ID is
-  the create idempotency key: a retry finds the existing draft and never
-  creates a second one. Gmail uses `users.drafts` create, get (`format=raw`),
-  update, and delete; a confirming read with other bytes than those written
-  fails `revision_conflict`. JMAP uploads a blob and uses `Email/import` into
+  delete writes anything; a mismatch fails `stale_revision`. JMAP keeps the
+  caller Message-ID create idempotency key. Gmail uses resumable draft upload
+  preparation, status and one remaining MIME transfer, plus get (`format=raw`),
+  update, and delete. Gmail confirms meaningful content while permitting only
+  generated top-level Message-ID/added Received and equivalent Date instants;
+  exact provider bytes and revisions remain unchanged. Changed recipients
+  (including Bcc), From, threading, MIME headers, body/attachment bytes or Date
+  instant fail `revision_conflict`. JMAP uploads a blob and uses `Email/import` into
   the Drafts role with `$draft` and `$seen`; a replace imports the new email
   and, only after it is created, destroys the old one, each guarded by
   `ifInState`, and a retry finishes an interrupted replace.
+- Gmail replace recovery confirms the known draft ID under its recorded exact
+  attempt intent, not a client Message-ID search. Meaningful external edits or
+  lost intent still fail stale revision; the unconditional update race remains.
+- Draft upload codes `draft_upload_required`, `invalid_draft_upload`, and
+  `draft_upload_unknown`. Known-ID confirmation failures expose
+  `MailWriteFailure::$draftId` as recoverable evidence, never success.
 - `MailWriteService::submit()` sends one draft exactly once, only at the
   expected revision and only when its single From address matches exactly one
   mirrored identity (`identity_mismatch` otherwise). Gmail sends one

@@ -30,10 +30,9 @@ interface DraftDriver
     public function draftForMessage(MailAccount $account, string $providerMessageId): ?DraftRevision;
 
     /**
-     * The provider's content-identity predicate: true when $draft holds exactly
-     * $content as written. The service uses it for every create, replace, and
-     * confirmation comparison, so a provider that stores bytes differently
-     * changes this one method.
+     * The provider's meaningful-content predicate. JMAP requires exact bytes;
+     * Gmail permits only explicitly supported generated header differences.
+     * This never canonicalizes DraftRevision or replaces exact revision checks.
      */
     public function holdsContent(DraftRevision $draft, DraftContent $content): bool;
 

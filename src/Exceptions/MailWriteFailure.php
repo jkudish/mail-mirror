@@ -25,6 +25,7 @@ final class MailWriteFailure extends RuntimeException
         public readonly bool $writeSent = false,
         public readonly ?MailImportCode $providerCode = null,
         ?Throwable $previous = null,
+        public readonly ?string $draftId = null,
     ) {
         parent::__construct($safeCode->summary(), 0, $previous);
     }

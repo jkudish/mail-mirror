@@ -11,8 +11,11 @@ enum MailWriteCode: string
     case ContainerNotFound = 'container_not_found';
     case DraftNotFound = 'draft_not_found';
     case DraftTooLarge = 'draft_too_large';
+    case DraftUploadRequired = 'draft_upload_required';
+    case DraftUploadUnknown = 'draft_upload_unknown';
     case IdentityMismatch = 'identity_mismatch';
     case InvalidDraft = 'invalid_draft';
+    case InvalidDraftUpload = 'invalid_draft_upload';
     case LockExpired = 'lock_expired';
     case MessageIdConflict = 'message_id_conflict';
     case MessageNotFound = 'message_not_found';
@@ -36,8 +39,11 @@ enum MailWriteCode: string
             self::ContainerNotFound => 'The requested provider label or mailbox does not exist in the supplied account.',
             self::DraftNotFound => 'The provider draft does not exist in the supplied account.',
             self::DraftTooLarge => 'The draft exceeds mail-mirror.writes.max_draft_bytes.',
+            self::DraftUploadRequired => 'Gmail draft creation requires a caller-checkpointed upload session.',
+            self::DraftUploadUnknown => 'The draft upload outcome is unknown; retain the same checkpoint, never start another create.',
             self::IdentityMismatch => 'The draft From address does not match exactly one mirrored provider identity.',
             self::InvalidDraft => 'The draft bytes lack exactly one valid Message-ID or have malformed headers.',
+            self::InvalidDraftUpload => 'The draft upload checkpoint or its account, input, thread, or destination binding is invalid.',
             self::LockExpired => 'The write lock had too little time left to send the write safely; retry.',
             self::MessageIdConflict => 'Another provider draft already uses this Message-ID.',
             self::MessageNotFound => 'The provider message does not exist in the supplied account.',
