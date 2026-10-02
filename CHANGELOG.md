@@ -55,7 +55,20 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ifInState`, and a retry finishes an interrupted replace.
 - Gmail replace recovery confirms the known draft ID under its recorded exact
   attempt intent, not a client Message-ID search. Meaningful external edits or
-  lost intent still fail stale revision; the unconditional update race remains.
+  lost intent still fail stale revision; a missing known ID fails draft-not-found
+  without adopting another matching draft. JMAP's Message-ID recovery remains.
+  The unconditional Gmail update race remains.
+- Draft upload sessions store only encrypted URI ciphertext in memory, including
+  real property dumps. Raw capability/MIME arguments are sensitive in resumable
+  failure traces; URL/Response-bearing transport exceptions are not retained.
+  Existing version-1 checkpoints still restore the same session.
+- Provider writes use a fresh single-execution ext-cURL base handler, one native
+  execution and one Laravel attempt, retaining HTTP middleware/fakes. Gmail
+  resumable/mailbox/draft/send writes and JMAP upload/import/set/submission writes
+  use the fixed verified-TLS HTTP/1.1 profile with a monotonic total timeout,
+  forward-only bodies, no redirects/reuse/auth negotiation/proxies/early data.
+  Writes require ext-cURL with asynchronous DNS; unsupported transport options
+  refuse without fallback or replay. Reads retain their existing transport.
 - Draft upload codes `draft_upload_required`, `invalid_draft_upload`, and
   `draft_upload_unknown`. Known-ID confirmation failures expose
   `MailWriteFailure::$draftId` as recoverable evidence, never success.

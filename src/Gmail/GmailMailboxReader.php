@@ -29,6 +29,7 @@ use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
 use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
+use Jkudish\MailMirror\Http\SingleExecutionWriteHandler;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAccountCredential;
 use Jkudish\MailMirror\Models\MailIdentity;
@@ -894,7 +895,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
         throw new MailWriteFailure(MailWriteCode::DraftUploadRequired);
     }
 
-    public function prepareDraftUpload(MailAccount $account, string $operationKey, DraftContent $content, ?string $providerThreadId): DraftUploadSession
+    public function prepareDraftUpload(MailAccount $account, string $operationKey, #[\SensitiveParameter] DraftContent $content, ?string $providerThreadId): DraftUploadSession
     {
         $this->assertAccount($account);
         $response = $this->uploadRequest($account, 'POST', 'https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=resumable', [
@@ -906,7 +907,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
             $operationKey, $content, $providerThreadId, $response->header('Location'));
     }
 
-    public function uploadDraft(MailAccount $account, DraftContent $content, DraftUploadSession $session): string
+    public function uploadDraft(MailAccount $account, #[\SensitiveParameter] DraftContent $content, DraftUploadSession $session): string
     {
         $this->assertAccount($account);
         $session->assertMatches(new MailAccountTarget($account->id, $account->owner_type, $account->owner_id), $content, $session->providerThreadId);
@@ -944,7 +945,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
         return $this->uploadedDraftId($response);
     }
 
-    private function uploadedDraftId(Response $response): string
+    private function uploadedDraftId(#[\SensitiveParameter] Response $response): string
     {
         $id = $response->json('id');
 
@@ -959,7 +960,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
      * @param  array<string, string>  $headers
      * @param  array<string, mixed>|null  $metadata
      */
-    private function uploadRequest(MailAccount $account, string $method, string $uri, array $headers, ?array $metadata, ?string $bytes, bool $mayHaveUploaded): Response
+    private function uploadRequest(MailAccount $account, string $method, #[\SensitiveParameter] string $uri, array $headers, ?array $metadata, #[\SensitiveParameter] ?string $bytes, bool $mayHaveUploaded): Response
     {
         if (config('mail-mirror.gmail.enabled') !== true) {
             throw new MailWriteFailure(MailWriteCode::UnsupportedDriver);
@@ -969,8 +970,8 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
         $this->budget?->claimHttpRequest();
 
         try {
-            $response = $this->prepareRequest($this->http->withToken($credential->accessToken())->acceptJson())
-                ->withoutRedirecting()->withHeaders($headers)->send($method, $uri,
+            $response = SingleExecutionWriteHandler::prepare($this->prepareRequest($this->http->withToken($credential->accessToken())->acceptJson()))
+                ->withHeaders($headers)->send($method, $uri,
                     $metadata !== null ? ['json' => $metadata] : ['body' => $bytes ?? '']);
             $this->budget?->recordDownloadedBytes(strlen($response->body()));
         } catch (Throwable) {
@@ -986,8 +987,20 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
         }
 
         if (! in_array($response->status(), $mayHaveUploaded ? [200, 201, 308] : [200], true)) {
+            // Do not build a URL/Response-bearing exception just to classify it:
+            // exception argument capture must not retain the session capability.
+            $code = match ($response->status()) {
+                400 => MailImportCode::StateMismatch,
+                401 => MailImportCode::AuthenticationFailed,
+                403 => MailImportCode::PermissionDenied,
+                404, 410 => MailImportCode::MessageUnavailable,
+                408, 425, 429 => MailImportCode::RateLimited,
+                500, 502, 503, 504 => MailImportCode::ProviderUnavailable,
+                default => MailImportCode::UnexpectedFailure,
+            };
+
             throw new MailWriteFailure($mayHaveUploaded ? MailWriteCode::DraftUploadUnknown : MailWriteCode::ProviderFailed,
-                $mayHaveUploaded, $this->failureFor($response, $uri)->safeCode);
+                $mayHaveUploaded, $code);
         }
 
         return $response;
@@ -1219,7 +1232,7 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
         }
 
         [$credential, $stored] = $this->credential($account, $refreshCredential ? 30 : null);
-        $response = $this->send($credential, $method, $url, $query, $json);
+        $response = $this->send($credential, $method, $url, $query, $json, ! $resendAfterReauthorization);
 
         if ($response->status() === 401 && ! $resendAfterReauthorization) {
             try {
@@ -1265,14 +1278,18 @@ final class GmailMailboxReader implements BudgetedDeltaMailboxReader, MailboxMut
      * @param  array<string, int|string|null>  $query
      * @param  array<string, mixed>|null  $json
      */
-    private function send(OAuthTokenSetCredential $credential, string $method, string $url, array $query, ?array $json = null): Response
+    private function send(OAuthTokenSetCredential $credential, string $method, string $url, array $query, #[\SensitiveParameter] ?array $json = null, bool $write = false): Response
     {
         $this->budget?->claimHttpRequest();
 
         try {
-            $response = $this->prepareRequest(
+            $pending = $this->prepareRequest(
                 $this->http->withToken($credential->accessToken())->acceptJson(),
-            )->send($method, $url, ['query' => $query] + ($json === null ? [] : ['json' => $json]));
+            );
+            if ($write) {
+                $pending = SingleExecutionWriteHandler::prepare($pending);
+            }
+            $response = $pending->send($method, $url, ['query' => $query] + ($json === null ? [] : ['json' => $json]));
             $this->budget?->recordDownloadedBytes(strlen($response->body()));
 
             return $response;

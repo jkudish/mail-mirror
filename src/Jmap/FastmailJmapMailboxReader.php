@@ -27,6 +27,7 @@ use Jkudish\MailMirror\Exceptions\InventoryRestartRequired;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
 use Jkudish\MailMirror\Exceptions\SyncBudgetExhausted;
+use Jkudish\MailMirror\Http\SingleExecutionWriteHandler;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailAccountCredential;
 use Jkudish\MailMirror\Models\MailIdentity;
@@ -993,10 +994,15 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
         [$credential, $stored] = $this->credential($account, MailImportStage::Retrieve);
 
         try {
-            $response = $this->prepareRequest($this->http->withToken($credential->token())->acceptJson())
+            $this->budget?->claimHttpRequest();
+            $response = SingleExecutionWriteHandler::prepare($this->prepareRequest($this->http->withToken($credential->token())->acceptJson()))
                 ->withBody($content->bytes, 'message/rfc822')
                 ->post($url);
-        } catch (Throwable) {
+            $this->budget?->recordDownloadedBytes(strlen($response->body()));
+        } catch (Throwable $failure) {
+            if (($budgetFailure = $this->budgetFailure($failure)) !== null) {
+                throw $budgetFailure;
+            }
             throw new MailImportFailure(MailImportStage::Retrieve, MailImportCode::ProviderUnavailable, true);
         }
 
@@ -1640,6 +1646,9 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
 
             try {
                 $pending = $this->prepareRequest($this->http->withToken($credential->token())->acceptJson());
+                if (! $retryTransport) {
+                    $pending = SingleExecutionWriteHandler::prepare($pending);
+                }
                 $response = $pending->send($method, $url, $body === null ? [] : ['json' => $body]);
                 $this->budget?->recordDownloadedBytes(strlen($response->body()));
             } catch (Throwable $failure) {

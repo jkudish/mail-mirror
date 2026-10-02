@@ -582,6 +582,33 @@ network access. Do not log the checkpoint or session URL, or serialize the
 session into audits/jobs; PHP serialization refuses. Use `checkpoint()` and
 `fromCheckpoint()` explicitly in authorized durable storage. Session URLs are
 restricted to Google's HTTPS Gmail draft upload endpoint; redirects are off.
+The session object stores only encrypted URI ciphertext, including in real
+property dumps (`var_export` and Symfony VarDumper); only its driver transport
+accessor decrypts the destination. Version-1 checkpoints still restore the same
+session, converting the URI to encrypted in-memory storage. Raw capability and
+MIME parameters are redacted from resumable exception arguments, and underlying
+transport exceptions are not chained. This does not make caller-owned MIME or
+explicitly decrypted destinations safe to log.
+
+Provider writes use a fresh private single-execution ext-cURL base handler,
+with one Laravel attempt, retaining HTTP middleware/fakes. This applies to Gmail
+resumable requests, mailbox mutations, draft replace/delete/send, and JMAP blob
+upload/import/set/submission writes. Reads keep their existing transport.
+Writes require ext-cURL with asynchronous DNS and refuse instead of falling
+back to a replay-capable or per-I/O-timeout transport.
+
+The fixed profile performs one `curl_exec` on a fresh unshared HTTP/1.1 handle,
+with a positive remaining monotonic total timeout, verified TLS, no reuse,
+redirects, authentication negotiation, proxies, early data or Expect handshake.
+The body is forward-only with an exact length; it cannot rewind or reset for a
+retry. A second base-handler invocation refuses before connecting. Explicit
+proxies, arbitrary cURL overrides, unverified TLS, debug/sink options and other
+unsupported behavior-changing options refuse. Status/Location/Range/body,
+informational headers in transfer stats, and stats/budget callbacks remain
+available. Transport errors are safe classifications, never raw cURL errors or
+underlying exception chains. A lost response remains ambiguous: consumers
+recover the same upload session or reconcile submission; they never re-send
+merely because the transport returned no response.
 
 An expired/missing session (404/410), ambiguous Range, malformed completion or
 failed upload/status request fails `draft_upload_unknown`, with `writeSent`
@@ -605,6 +632,11 @@ Pass back the `revision` you read. A replace or delete of a draft whose
 current revision differs fails `stale_revision` without writing. A
 `DraftRevision` from a JMAP replace has a new `draftId`, because JMAP emails
 are immutable; Gmail keeps the draft ID and changes `providerMessageId`.
+A Gmail replace retry recovers only its known draft ID under the exact intent.
+If that ID is gone or its content does not match, it fails `draft_not_found` or
+`stale_revision` without a Message-ID fallback, search or write; another matching
+draft is not evidence of the in-place replacement. JMAP retains its interrupted
+import/destroy recovery through the replacement's Message-ID.
 
 `DraftRevision::$rawBytes` contains the exact MIME snapshot read from the
 provider, including sensitive headers, message bodies, and attachments. Do not

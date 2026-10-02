@@ -108,7 +108,7 @@ final readonly class MailWriteService
      * @param  int  $sendRequests  sequential write requests the send step may need
      * @return TResult
      */
-    private function withLock(MailAccount $account, string $lockKey, Closure $write, int $sendRequests = 1): mixed
+    private function withLock(MailAccount $account, string $lockKey, #[\SensitiveParameter] Closure $write, int $sendRequests = 1): mixed
     {
         $store = $this->cache->getStore();
 
@@ -240,7 +240,7 @@ final readonly class MailWriteService
     }
 
     /** Prepare Gmail metadata only. The consumer must persist checkpoint() before uploading MIME. */
-    public function prepareDraftUpload(MailAccountTarget $target, string $operationKey, DraftContent $content, ?string $providerThreadId = null): DraftUploadSession
+    public function prepareDraftUpload(MailAccountTarget $target, string $operationKey, #[\SensitiveParameter] DraftContent $content, ?string $providerThreadId = null): DraftUploadSession
     {
         $this->assertWritesEnabled();
         $this->assertDraftSize($content);
@@ -276,7 +276,7 @@ final readonly class MailWriteService
      * @throws AccountResourceMismatch before any provider request
      * @throws MailWriteFailure
      */
-    public function createDraft(MailAccountTarget $target, DraftContent $content, ?string $providerThreadId = null, ?DraftUploadSession $upload = null): DraftWriteResult
+    public function createDraft(MailAccountTarget $target, #[\SensitiveParameter] DraftContent $content, ?string $providerThreadId = null, ?DraftUploadSession $upload = null): DraftWriteResult
     {
         $this->assertWritesEnabled();
         $this->assertDraftSize($content);
@@ -400,6 +400,12 @@ final readonly class MailWriteService
             // recorded attempt and meaningful content, never identity alone.
             if ($current !== null && $this->cache->get($intent) === $intentValue && $driver->holdsContent($current, $content)) {
                 return $this->draftResult($account, MailWriteOutcome::AlreadyApplied, $current);
+            }
+
+            // Gmail updates only this ID in place. A different matching draft
+            // cannot be evidence of this operation, even if this draft is gone.
+            if ($account->driver === MailDriver::Gmail) {
+                throw new MailWriteFailure($current === null ? MailWriteCode::DraftNotFound : MailWriteCode::StaleRevision);
             }
 
             $replacement = $this->cache->get($intent) === $intentValue
@@ -724,7 +730,7 @@ final readonly class MailWriteService
     }
 
     /** Prepare credentials, stage content, then check the lock deadline; nothing visible is written. */
-    private function prepareDraftWrite(DraftDriver $driver, MailAccount $account, int $sendSeconds, \DateTimeInterface $sendBy, ?DraftContent $content): ?string
+    private function prepareDraftWrite(#[\SensitiveParameter] DraftDriver $driver, MailAccount $account, int $sendSeconds, \DateTimeInterface $sendBy, #[\SensitiveParameter] ?DraftContent $content): ?string
     {
         try {
             $driver->prepareWrite($account, $sendSeconds);
@@ -745,7 +751,7 @@ final readonly class MailWriteService
      * draft changed during the write, for example a Gmail edit racing the
      * unconditional update: a conflict, never Applied.
      */
-    private function confirmDraft(DraftDriver $driver, MailAccount $account, string $draftId, DraftContent $content): DraftRevision
+    private function confirmDraft(#[\SensitiveParameter] DraftDriver $driver, MailAccount $account, string $draftId, #[\SensitiveParameter] DraftContent $content): DraftRevision
     {
         try {
             $confirmed = $this->confirmingRead(fn () => $driver->draft($account, $draftId));
@@ -773,7 +779,7 @@ final readonly class MailWriteService
      * @param  Closure(): TRead  $read
      * @return TRead
      */
-    private function confirmingRead(Closure $read): mixed
+    private function confirmingRead(#[\SensitiveParameter] Closure $read): mixed
     {
         try {
             return $read();
@@ -792,7 +798,7 @@ final readonly class MailWriteService
         return new DraftWriteResult($account->id, $account->driver, $outcome, $draft);
     }
 
-    private function assertDraftSize(DraftContent $content): void
+    private function assertDraftSize(#[\SensitiveParameter] DraftContent $content): void
     {
         $maximum = config('mail-mirror.writes.max_draft_bytes', 26214400);
         $maximum = is_int($maximum) && $maximum >= 1024 && $maximum <= 52428800 ? $maximum : 26214400;
