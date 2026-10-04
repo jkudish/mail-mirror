@@ -720,29 +720,44 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
             throw new MailWriteFailure(MailWriteCode::UnsupportedContainer);
         }
 
-        $keywordChange = in_array($change->action, [
-            MailboxAction::MarkRead, MailboxAction::MarkUnread, MailboxAction::Star, MailboxAction::Unstar,
-        ], true);
         $result = $this->call($account, $session, 'Email/get', [
             'accountId' => $account->provider_account_id,
             'ids' => [$providerMessageId],
-            'properties' => $keywordChange ? ['id', 'mailboxIds', 'keywords'] : ['id', 'mailboxIds'],
+            'properties' => ['id', 'mailboxIds', 'keywords'],
         ], 'email', MailImportStage::Retrieve);
         $emailState = $this->boundedString($result['state'] ?? null, 255, MailImportStage::Retrieve);
         $email = $this->singleObject($result, $providerMessageId, MailImportStage::Retrieve);
-        $mailboxIds = array_keys($this->truthMap($email['mailboxIds'] ?? null, MailImportStage::Retrieve));
-        sort($mailboxIds);
-        $keywords = $keywordChange ? array_keys($this->truthMap($email['keywords'] ?? null, MailImportStage::Retrieve)) : [];
-        sort($keywords);
+        // JSON object keys like "2" become PHP integer keys. Restore their
+        // exact string representation; never sort opaque IDs numerically.
+        $mailboxIds = array_map(strval(...), array_keys($this->truthMap($email['mailboxIds'] ?? null, MailImportStage::Retrieve)));
+        sort($mailboxIds, SORT_STRING);
+        $keywords = array_map(strval(...), array_keys($this->truthMap($email['keywords'] ?? null, MailImportStage::Retrieve)));
+        sort($keywords, SORT_STRING);
         $in = fn (string $role): bool => in_array($roles[$role], $mailboxIds, true);
-        $evidence = ['mailbox_ids' => $mailboxIds];
+        $evidence = ['mailbox_ids' => $mailboxIds, 'keywords' => $keywords];
+        $roleIds = [];
+        $ambiguousRoles = [];
 
-        foreach ($roles as $role => $mailboxId) {
-            $evidence[$role.'_mailbox_id'] = $mailboxId;
+        // Keep role evidence independent of the action: a confirming trash
+        // read and a later untrash read must fingerprint the same provider state.
+        // Required roles were checked above; ambiguity in any other role still
+        // belongs to the evidence without making this action unsupported.
+        foreach ($mailboxes as $mailbox) {
+            if ($mailbox['role'] !== null) {
+                $roleIds[$mailbox['role']][] = $mailbox['id'];
+            }
         }
 
-        if ($keywordChange) {
-            $evidence['keywords'] = $keywords;
+        foreach ($roleIds as $role => $ids) {
+            if (count($ids) === 1) {
+                $evidence[$role.'_mailbox_id'] = $ids[0];
+            } else {
+                $ambiguousRoles[$role] = $ids;
+            }
+        }
+
+        if ($ambiguousRoles !== []) {
+            $evidence['ambiguous_mailbox_roles'] = $ambiguousRoles;
         }
 
         if ($container !== null) {
@@ -2001,14 +2016,16 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
     /** @return array<string, true> */
     private function truthMap(mixed $value, MailImportStage $stage): array
     {
-        if (! is_array($value) || ($value !== [] && array_is_list($value)) || count($value) > 10000) {
+        if (! is_array($value) || count($value) > 10000) {
             throw new MailImportFailure($stage, MailImportCode::MalformedPayload);
         }
 
         $result = [];
 
         foreach ($value as $key => $present) {
-            if (! is_string($key) || $key === '' || mb_strlen($key) > 255 || $present !== true) {
+            $key = (string) $key;
+
+            if ($key === '' || mb_strlen($key) > 255 || $present !== true) {
                 throw new MailImportFailure($stage, MailImportCode::MalformedPayload);
             }
 

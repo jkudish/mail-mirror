@@ -3,6 +3,9 @@
 declare(strict_types=1);
 
 use Illuminate\Http\Client\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Date;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Jkudish\MailMirror\Credentials\ApiTokenCredential;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
@@ -18,6 +21,7 @@ use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Write\MailboxChange;
 use Jkudish\MailMirror\Write\MailWriteService;
 use Jkudish\MailMirror\Write\MailWriteTarget;
+use Jkudish\MailMirror\Write\MessageState;
 
 /** Synthetic Gmail labels for one account; records every request path. */
 final class MutationGmailProvider
@@ -201,7 +205,7 @@ final class MutationJmapProvider
     }
 }
 
-function mutationGmailAccount(string $owner = 'owner-a'): MailAccount
+function mutationGmailAccount(string $owner = 'owner-a', ?DateTimeImmutable $expiresAt = null): MailAccount
 {
     $account = MailAccount::query()->create([
         'owner_type' => 'synthetic-workspace',
@@ -212,7 +216,7 @@ function mutationGmailAccount(string $owner = 'owner-a'): MailAccount
     app(MailAccountConnection::class)->store($account, new OAuthTokenSetCredential(
         'synthetic-mutation-access',
         'synthetic-mutation-refresh',
-        new DateTimeImmutable('+1 hour'),
+        $expiresAt ?? new DateTimeImmutable('+1 hour'),
         [GmailOAuth::SCOPE],
     ));
 
@@ -278,6 +282,322 @@ beforeEach(function (): void {
 
 afterEach(function (): void {
     putenv('MAIL_MIRROR_GMAIL_CLIENT_SECRET');
+    Date::setTestNow();
+});
+
+it('observes with writes disabled and holds the mutation lock through receipt reconciliation', function (): void {
+    $gmail = new MutationGmailProvider;
+    $gmail->labels = ['gm-1' => ['INBOX', 'UNREAD']];
+    Http::fake($gmail->handler());
+    $account = mutationGmailAccount();
+    $target = mutationTarget($account, 'gm-1');
+    $other = mutationTarget(mutationGmailAccount('owner-b'), 'gm-1');
+    $intentKey = 'mail-mirror:account:'.$account->id.':message:'.hash('sha256', 'gm-1').':intent:mailbox';
+    Cache::put($intentKey, 'star', 1000);
+    $service = app(MailWriteService::class);
+    config()->set('mail-mirror.writes.enabled', false);
+    $receipt = null;
+    $state = $service->observe($target, MailboxChange::markRead(), function (MessageState $observed) use ($service, $target, $other, &$receipt): void {
+        expect(fn () => $service->observe($target, MailboxChange::star()))->toThrow(MailWriteFailure::class, MailWriteCode::TargetBusy->summary());
+        expect($service->observe($other, MailboxChange::markRead())->mailAccountId)->toBe($other->mailAccountId);
+        config()->set('mail-mirror.writes.enabled', true);
+        expect(fn () => $service->apply($target, MailboxChange::markRead()))->toThrow(MailWriteFailure::class, MailWriteCode::TargetBusy->summary());
+        config()->set('mail-mirror.writes.enabled', false);
+        $receipt = $observed;
+    });
+
+    expect($state)->toBe($receipt)
+        ->and($state->desiredStateHolds)->toBeFalse()
+        ->and(json_encode($state, JSON_THROW_ON_ERROR))->not->toContain('synthetic-mutation-access', 'synthetic-mutation-refresh', 'raw')
+        ->and(Cache::get($intentKey))->toBe('star')
+        ->and($service->observe($target, MailboxChange::markRead())->fingerprint())->toBe($state->fingerprint())
+        ->and($gmail->writes)->toBe([]);
+    // Observation must not leave an intent claiming that this package performed a later external change.
+    $gmail->labels['gm-1'] = ['INBOX'];
+    config()->set('mail-mirror.writes.enabled', true);
+    expect(mutationFailure($target, MailboxChange::markRead())->safeCode)->toBe(MailWriteCode::AlreadyInState);
+});
+
+it('rejects mismatched observation owner tuples before reading or invoking the callback', function (): void {
+    Http::fake();
+    $account = mutationGmailAccount();
+    $called = false;
+    foreach ([['synthetic-workspace', 'owner-b'], ['synthetic-team', 'owner-a'], [null, null]] as [$type, $id]) {
+        expect(fn () => app(MailWriteService::class)->observe(
+            new MailWriteTarget($account->id, $type, $id, 'gm-1'), MailboxChange::markRead(),
+            function () use (&$called): void {
+                $called = true;
+            },
+        ))->toThrow(AccountResourceMismatch::class);
+    }
+    expect($called)->toBeFalse();
+    Http::assertNothingSent();
+});
+
+it('fingerprints unordered evidence without normalizing opaque IDs or derived destination predicates', function (): void {
+    $evidence = ['label_ids' => ['10', '02', '2'], 'history_id' => '00100'];
+    $state = new MessageState(1, MailDriver::Gmail, '0001', false, $evidence);
+    $reordered = new MessageState(1, MailDriver::Gmail, '0001', true, ['history_id' => '00100', 'label_ids' => ['2', '10', '02']]);
+    expect($state->fingerprint())->toBe($reordered->fingerprint());
+    foreach ([
+        new MessageState(1, MailDriver::Gmail, '1', false, $evidence),
+        new MessageState(2, MailDriver::Gmail, '0001', false, $evidence),
+        new MessageState(1, MailDriver::Jmap, '0001', false, $evidence),
+        new MessageState(1, MailDriver::Gmail, '0001', false, ['label_ids' => ['10', '2'], 'history_id' => '00100']),
+        new MessageState(1, MailDriver::Gmail, '0001', false, ['label_ids' => ['10', '02', '2'], 'history_id' => '100']),
+    ] as $different) {
+        expect($different->fingerprint())->not->toBe($state->fingerprint());
+    }
+});
+
+it('rejects a stale observation before writes or intent changes even when the desired state now holds', function (bool $desired): void {
+    $gmail = new MutationGmailProvider;
+    $gmail->labels = ['gm-1' => ['INBOX', 'UNREAD']];
+    Http::fake($gmail->handler());
+    $target = mutationTarget(mutationGmailAccount(), 'gm-1');
+    $service = app(MailWriteService::class);
+    $fingerprint = $service->observe($target, MailboxChange::markRead())->fingerprint();
+    $gmail->labels['gm-1'] = $desired ? ['INBOX'] : ['INBOX', 'UNREAD', 'Label_8'];
+    $key = 'mail-mirror:account:'.$target->mailAccountId.':message:'.hash('sha256', 'gm-1').':intent:mailbox';
+    Cache::put($key, 'star', 1000);
+    try {
+        $service->apply($target, MailboxChange::markRead(), $fingerprint);
+        $failure = null;
+    } catch (MailWriteFailure $caught) {
+        $failure = $caught;
+    }
+    expect($failure)->toBeInstanceOf(MailWriteFailure::class);
+    assert($failure instanceof MailWriteFailure);
+    expect($failure->safeCode)->toBe(MailWriteCode::StaleState)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and(Cache::get($key))->toBe('star')
+        ->and($gmail->writes)->toBe([]);
+})->with([false, true]);
+
+it('distinguishes guarded satisfaction from execution without changing the legacy unguarded result', function (bool $fingerprintGuard): void {
+    $gmail = new MutationGmailProvider;
+    $gmail->labels = ['gm-1' => ['INBOX']];
+    Http::fake($gmail->handler());
+    $target = mutationTarget(mutationGmailAccount(), 'gm-1');
+    $service = app(MailWriteService::class);
+    $state = $service->observe($target, MailboxChange::markRead());
+    $calls = 0;
+    $guard = function () use (&$calls): void {
+        $calls++;
+    };
+    $result = $service->apply($target, MailboxChange::markRead(), $fingerprintGuard ? $state->fingerprint() : null, $fingerprintGuard ? null : $guard);
+    expect($result->outcome)->toBe(MailWriteOutcome::AlreadySatisfied)
+        ->and($calls)->toBe($fingerprintGuard ? 0 : 1)
+        ->and(mutationFailure($target, MailboxChange::markRead())->safeCode)->toBe(MailWriteCode::AlreadyInState)
+        ->and($gmail->writes)->toBe([]);
+})->with([false, true]);
+
+it('checks a superseded consumer claim before returning an already-state outcome or preparing a write', function (bool $desired): void {
+    $gmail = new MutationGmailProvider;
+    $gmail->labels = ['gm-1' => $desired ? ['INBOX'] : ['INBOX', 'UNREAD']];
+    Http::fake($gmail->handler());
+    $target = mutationTarget(mutationGmailAccount(), 'gm-1');
+    try {
+        app(MailWriteService::class)->apply($target, MailboxChange::markRead(), null, function (): void {
+            throw new MailWriteFailure(MailWriteCode::ClaimSuperseded);
+        });
+        $failure = null;
+    } catch (MailWriteFailure $caught) {
+        $failure = $caught;
+    }
+    assert($failure instanceof MailWriteFailure);
+    expect($failure->safeCode)->toBe(MailWriteCode::ClaimSuperseded)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and($gmail->writes)->toBe([]);
+})->with([false, true]);
+
+it('checks the consumer claim again after credential preparation and the send deadline after that callback', function (bool $superseded): void {
+    Date::setTestNow('2026-01-01 12:00:00');
+    $gmail = new MutationGmailProvider;
+    $gmail->labels = ['gm-1' => ['INBOX', 'UNREAD']];
+    Http::fake($gmail->handler());
+    $target = mutationTarget(mutationGmailAccount(), 'gm-1');
+    $calls = 0;
+    try {
+        app(MailWriteService::class)->apply($target, MailboxChange::markRead(), null, function () use (&$calls, $superseded): void {
+            if (++$calls === 2) {
+                Date::setTestNow(Date::now()->addSeconds(266));
+                if ($superseded) {
+                    throw new MailWriteFailure(MailWriteCode::ClaimSuperseded);
+                }
+            }
+        });
+        $failure = null;
+    } catch (MailWriteFailure $caught) {
+        $failure = $caught;
+    }
+    assert($failure instanceof MailWriteFailure);
+    expect($calls)->toBe(2)
+        ->and($failure->safeCode)->toBe($superseded ? MailWriteCode::ClaimSuperseded : MailWriteCode::LockExpired)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and($gmail->writes)->toBe([]);
+})->with([false, true]);
+
+it('fences a delayed writer after read-only recovery commits a superseding durable receipt', function (): void {
+    Date::setTestNow('2026-01-01 12:00:00');
+    DB::statement('CREATE TABLE synthetic_write_receipts (id INTEGER PRIMARY KEY, claim VARCHAR(50), status VARCHAR(50))');
+    DB::table('synthetic_write_receipts')->insert(['id' => 1, 'claim' => 'old', 'status' => 'applying']);
+    $gmail = new MutationGmailProvider;
+    $gmail->labels = ['gm-1' => ['INBOX', 'UNREAD']];
+    Http::fake($gmail->handler());
+    $target = mutationTarget(mutationGmailAccount(), 'gm-1');
+    $service = app(MailWriteService::class);
+    $calls = 0;
+    try {
+        $service->apply($target, MailboxChange::markRead(), null, function () use (&$calls, $service, $target): void {
+            if (++$calls === 2) {
+                // Pause the old process beyond its cache lease. Another worker
+                // acquires the same lock and commits recovery before it resumes.
+                Date::setTestNow(Date::now()->addSeconds(301));
+                config()->set('mail-mirror.writes.enabled', false);
+                $service->observe($target, MailboxChange::markRead(), function (MessageState $state) use ($service, $target): void {
+                    DB::transaction(function () use ($state, $service, $target): void {
+                        DB::table('synthetic_write_receipts')->where('id', 1)->update(['claim' => 'recovery', 'status' => $state->desiredStateHolds ? 'satisfied' : 'divergent']);
+                        expect(fn () => $service->observe($target, MailboxChange::markRead()))->toThrow(MailWriteFailure::class, MailWriteCode::TargetBusy->summary());
+                    });
+                    expect(DB::transactionLevel())->toBe(0);
+                });
+            }
+            if (DB::table('synthetic_write_receipts')->where('id', 1)->value('claim') !== 'old') {
+                throw new MailWriteFailure(MailWriteCode::ClaimSuperseded);
+            }
+        });
+        $failure = null;
+    } catch (MailWriteFailure $caught) {
+        $failure = $caught;
+    }
+    assert($failure instanceof MailWriteFailure);
+    expect($calls)->toBe(2)
+        ->and($failure->safeCode)->toBe(MailWriteCode::ClaimSuperseded)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and(DB::table('synthetic_write_receipts')->where('id', 1)->value('status'))->toBe('divergent')
+        ->and($gmail->writes)->toBe([]);
+});
+
+it('rechecks the claim after slow Gmail credential preparation supersedes it', function (): void {
+    Date::setTestNow('2026-01-01 12:00:00');
+    $gmail = new MutationGmailProvider;
+    $gmail->labels = ['gm-1' => ['INBOX', 'UNREAD']];
+    $handler = $gmail->handler();
+    $currentClaim = true;
+    $refreshes = 0;
+    Http::fake(function (Request $request) use ($handler, &$currentClaim, &$refreshes) {
+        if ($request->url() === 'https://oauth2.googleapis.com/token') {
+            $refreshes++;
+            $currentClaim = false;
+
+            return Http::response(['access_token' => 'synthetic-new-access', 'expires_in' => 3600, 'token_type' => 'Bearer', 'scope' => GmailOAuth::SCOPE]);
+        }
+        $response = $handler($request);
+        if ($request->method() === 'GET') {
+            Date::setTestNow(Date::now()->addSeconds(80));
+        }
+
+        return $response;
+    });
+    $account = mutationGmailAccount('owner-a', Date::now()->addSeconds(100)->toDateTimeImmutable());
+    $calls = 0;
+    try {
+        app(MailWriteService::class)->apply(mutationTarget($account, 'gm-1'), MailboxChange::markRead(), null, function () use (&$calls, &$currentClaim): void {
+            $calls++;
+            if (! $currentClaim) {
+                throw new MailWriteFailure(MailWriteCode::ClaimSuperseded);
+            }
+        });
+        $failure = null;
+    } catch (MailWriteFailure $caught) {
+        $failure = $caught;
+    }
+    assert($failure instanceof MailWriteFailure);
+    expect($calls)->toBe(2)
+        ->and($refreshes)->toBe(1)
+        ->and($failure->safeCode)->toBe(MailWriteCode::ClaimSuperseded)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and($failure->getMessage())->not->toContain('synthetic-mutation-access', 'synthetic-new-access', 'synthetic-mutation-refresh', 'gm-1')
+        ->and($gmail->writes)->toBe([]);
+});
+
+it('recovers cache-lost or divergent outcomes through observation only', function (bool $divergent): void {
+    $gmail = new MutationGmailProvider;
+    $gmail->labels = ['gm-1' => ['INBOX', 'UNREAD']];
+    $gmail->statusAfterApply = 503;
+    Http::fake($gmail->handler());
+    $target = mutationTarget(mutationGmailAccount(), 'gm-1');
+    expect(mutationFailure($target, MailboxChange::markRead())->writeSent)->toBeTrue();
+    Cache::flush();
+    if ($divergent) {
+        $gmail->labels['gm-1'] = ['INBOX', 'UNREAD', 'Label_8'];
+    }
+    config()->set('mail-mirror.writes.enabled', false);
+    $receipt = null;
+    $state = app(MailWriteService::class)->observe($target, MailboxChange::markRead(), function (MessageState $observed) use (&$receipt): void {
+        $receipt = $observed->desiredStateHolds ? 'satisfied_without_execution_proof' : 'divergent';
+    });
+    expect($state->desiredStateHolds)->toBe(! $divergent)
+        ->and($receipt)->toBe($divergent ? 'divergent' : 'satisfied_without_execution_proof')
+        ->and($gmail->writes)->toHaveCount(1);
+})->with([false, true]);
+
+it('observes complete JMAP evidence preserving exact numeric-looking mailbox and keyword IDs', function (): void {
+    $jmap = new MutationJmapProvider;
+    $jmap->mailboxes = [
+        ['id' => '02', 'name' => 'Inbox', 'role' => 'inbox'],
+        ['id' => '2', 'name' => 'Archive', 'role' => 'archive'],
+        ['id' => '10', 'name' => 'Projects', 'role' => null],
+    ];
+    $jmap->put('0001', ['10', '02'], ['2', '02', '$flagged']);
+    Http::fake($jmap->handler());
+    $target = mutationTarget(mutationJmapAccount(), '0001');
+    $service = app(MailWriteService::class);
+    config()->set('mail-mirror.writes.enabled', false);
+    $state = $service->observe($target, MailboxChange::archive());
+    expect($state->providerEvidence['mailbox_ids'])->toBe(['02', '10'])
+        ->and($state->providerEvidence['keywords'])->toBe(['$flagged', '02', '2'])
+        ->and($state->providerEvidence['archive_mailbox_id'])->toBe('2')
+        ->and($state->providerMessageId)->toBe('0001');
+    $jmap->put('0001', ['02', '10'], ['$flagged', '02', '2']);
+    expect($service->observe($target, MailboxChange::archive())->fingerprint())->toBe($state->fingerprint());
+    // Role changes are action-relevant even when Email state and membership do not change.
+    $jmap->mailboxes[1] = ['id' => '20', 'name' => 'Archive', 'role' => 'archive'];
+    expect($service->observe($target, MailboxChange::archive())->fingerprint())->not->toBe($state->fingerprint())
+        ->and($jmap->writes)->toBe([]);
+    $jmap->mailboxes[1] = ['id' => '2', 'name' => 'Archive', 'role' => 'archive'];
+    config()->set('mail-mirror.writes.enabled', true);
+    $result = $service->apply($target, MailboxChange::archive(), $state->fingerprint());
+    expect($result->outcome)->toBe(MailWriteOutcome::Applied)
+        ->and($result->providerEvidence['mailbox_ids'])->toBe(['10', '2'])
+        ->and($jmap->writes[0]['update'])->toBe(['0001' => ['mailboxIds/02' => null, 'mailboxIds/2' => true]]);
+});
+
+it('compares JMAP action and inverse evidence and applies a fingerprint-guarded undo', function (): void {
+    $jmap = new MutationJmapProvider;
+    $jmap->put('jm-1', ['mb-inbox'], ['$seen', '$flagged']);
+    Http::fake($jmap->handler());
+    $target = mutationTarget(mutationJmapAccount(), 'jm-1');
+    $service = app(MailWriteService::class);
+    $service->apply($target, MailboxChange::trash());
+    $trashed = $service->observe($target, MailboxChange::trash());
+    $undo = $service->observe($target, MailboxChange::untrash());
+    expect($trashed->desiredStateHolds)->toBeTrue()
+        ->and($undo->desiredStateHolds)->toBeFalse()
+        ->and($trashed->fingerprint())->toBe($undo->fingerprint());
+    $calls = 0;
+    $guard = function () use (&$calls): void {
+        $calls++;
+    };
+    expect($service->apply($target, MailboxChange::untrash(), $trashed->fingerprint(), $guard)->outcome)->toBe(MailWriteOutcome::Applied)
+        ->and($calls)->toBe(2)
+        ->and($jmap->mailboxesOf('jm-1'))->toBe(['mb-inbox'])
+        ->and($jmap->writes)->toHaveCount(2);
+    $current = $service->observe($target, MailboxChange::untrash());
+    expect($service->apply($target, MailboxChange::untrash(), $current->fingerprint(), $guard)->outcome)->toBe(MailWriteOutcome::AlreadyApplied)
+        ->and($calls)->toBe(3)
+        ->and($jmap->writes)->toHaveCount(2);
 });
 
 it('ships with provider writes disabled', function (): void {

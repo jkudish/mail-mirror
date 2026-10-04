@@ -8,6 +8,7 @@ enum MailWriteCode: string
 {
     case AlreadyInState = 'already_in_state';
     case AmbiguousMailboxRole = 'ambiguous_mailbox_role';
+    case ClaimSuperseded = 'claim_superseded';
     case ContainerNotFound = 'container_not_found';
     case DraftNotFound = 'draft_not_found';
     case DraftTooLarge = 'draft_too_large';
@@ -23,6 +24,7 @@ enum MailWriteCode: string
     case ProviderFailed = 'provider_failed';
     case RevisionConflict = 'revision_conflict';
     case StaleRevision = 'stale_revision';
+    case StaleState = 'stale_state';
     case SubmissionUnknown = 'submission_unknown';
     case TargetBusy = 'target_busy';
     case Unconfirmed = 'unconfirmed';
@@ -36,6 +38,7 @@ enum MailWriteCode: string
         return match ($this) {
             self::AlreadyInState => 'The provider message is already in the requested state and no earlier request by this package is known to have changed it.',
             self::AmbiguousMailboxRole => 'The provider mailbox roles do not identify exactly one source and destination.',
+            self::ClaimSuperseded => 'The consumer claim is no longer current; nothing was written.',
             self::ContainerNotFound => 'The requested provider label or mailbox does not exist in the supplied account.',
             self::DraftNotFound => 'The provider draft does not exist in the supplied account.',
             self::DraftTooLarge => 'The draft exceeds mail-mirror.writes.max_draft_bytes.',
@@ -51,6 +54,7 @@ enum MailWriteCode: string
             self::ProviderFailed => 'The provider request failed.',
             self::RevisionConflict => 'The provider draft changed during the write; re-read it before trying again.',
             self::StaleRevision => 'The provider draft no longer matches the expected revision; nothing was written.',
+            self::StaleState => 'The provider message no longer matches the expected state; nothing was written.',
             self::SubmissionUnknown => 'An earlier submit of this draft may have been sent; reconcile it before submitting again.',
             self::TargetBusy => 'Another write for the same provider message is in progress.',
             self::Unconfirmed => 'The provider state did not confirm the write.',
