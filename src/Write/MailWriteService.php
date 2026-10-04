@@ -598,10 +598,18 @@ final readonly class MailWriteService
      * refuses the send. MailMirror never re-sends on its own. Durable
      * at-most-once and any human-authorized resend belong to the consumer.
      *
+     * A consumer claim guard throws MailWriteFailure(ClaimSuperseded) when its
+     * durable authorization is no longer current. It runs under the draft lock
+     * before any provider request or intent handling, then after credential
+     * preparation immediately before the send deadline check. It cannot fence
+     * an arbitrary process pause after that final check.
+     *
+     * @param  Closure(): void|null  $claimGuard
+     *
      * @throws AccountResourceMismatch before any provider request
      * @throws MailWriteFailure
      */
-    public function submit(DraftTarget $target, string $expectedRevision): SubmissionResult
+    public function submit(DraftTarget $target, string $expectedRevision, ?Closure $claimGuard = null): SubmissionResult
     {
         $this->assertWritesEnabled();
         $account = $this->account($target);
@@ -612,7 +620,9 @@ final readonly class MailWriteService
         return $this->withLock(
             $account,
             $draftKey.':write-lock',
-            function (\DateTimeInterface $sendBy, int $sendSeconds) use ($driver, $account, $target, $expectedRevision, $intent): SubmissionResult {
+            function (\DateTimeInterface $sendBy, int $sendSeconds) use ($driver, $account, $target, $expectedRevision, $intent, $claimGuard): SubmissionResult {
+                $claimGuard?->__invoke();
+
                 if ($this->cache->get($intent) !== null) {
                     throw new MailWriteFailure(MailWriteCode::SubmissionUnknown);
                 }
@@ -639,7 +649,7 @@ final readonly class MailWriteService
                     throw new MailWriteFailure(MailWriteCode::SubmissionUnknown);
                 }
 
-                $this->prepareDraftWrite($driver, $account, $sendSeconds, $sendBy, null);
+                $this->prepareDraftWrite($driver, $account, $sendSeconds, $sendBy, null, $claimGuard);
 
                 try {
                     $sentMessageId = $driver->submitDraft($account, $current, $identity);
@@ -802,8 +812,13 @@ final readonly class MailWriteService
         return $draft;
     }
 
-    /** Prepare credentials, stage content, then check the lock deadline; nothing visible is written. */
-    private function prepareDraftWrite(#[\SensitiveParameter] DraftDriver $driver, MailAccount $account, int $sendSeconds, \DateTimeInterface $sendBy, #[\SensitiveParameter] ?DraftContent $content): ?string
+    /**
+     * Prepare credentials, stage content, then check the claim and lock deadline;
+     * nothing visible is written.
+     *
+     * @param  Closure(): void|null  $claimGuard
+     */
+    private function prepareDraftWrite(#[\SensitiveParameter] DraftDriver $driver, MailAccount $account, int $sendSeconds, \DateTimeInterface $sendBy, #[\SensitiveParameter] ?DraftContent $content, ?Closure $claimGuard = null): ?string
     {
         try {
             $driver->prepareWrite($account, $sendSeconds);
@@ -811,6 +826,8 @@ final readonly class MailWriteService
         } catch (MailImportFailure $failure) {
             throw MailWriteFailure::fromProvider($failure, false);
         }
+
+        $claimGuard?->__invoke();
 
         if (Date::now()->greaterThan($sendBy)) {
             throw new MailWriteFailure(MailWriteCode::LockExpired);

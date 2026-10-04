@@ -775,6 +775,20 @@ $result->providerMessageId; // the sent message (Gmail) or email (JMAP)
 $result->threadId;
 ```
 
+`submit($target, $expectedRevision, claimGuard: $guard)` also accepts an optional
+no-argument closure, like `apply()`. Recheck your durable authorization and
+claim token in it; throw `new MailWriteFailure(MailWriteCode::ClaimSuperseded)`
+when either is no longer current. The guard runs under the existing draft lock
+before any provider request or submit-intent handling, then again after
+credential preparation immediately before the send deadline check and dispatch.
+Rejection has `writeSent` false and sends no submission request; an initial
+rejection makes no provider request at all. The two-argument call is unchanged.
+The guard fences authorization lost before the final check, not an arbitrary
+process pause after it. The consumer must durably authorize one attempt and
+serialize its approval/draft-operation state; this callback adds no lock or
+at-most-once framework. `reconcileSubmission()` remains a read-only recovery
+operation and does not accept or invoke this guard.
+
 Before sending, MailMirror re-reads the draft under the draft lock. A changed
 revision fails `stale_revision`. The draft's single From address must match,
 case-insensitively, exactly one identity mirrored for the account by the last
