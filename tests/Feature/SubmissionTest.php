@@ -3,6 +3,8 @@
 declare(strict_types=1);
 
 use Illuminate\Http\Client\Request;
+use Illuminate\Support\Facades\Date;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Jkudish\MailMirror\Credentials\ApiTokenCredential;
 use Jkudish\MailMirror\Credentials\MailAccountConnection;
@@ -367,6 +369,127 @@ beforeEach(function (): void {
 
 afterEach(function (): void {
     putenv('MAIL_MIRROR_GMAIL_CLIENT_SECRET');
+    Date::setTestNow();
+});
+
+it('refuses an initial submission claim before any provider request and leaves legacy submit available', function (MailDriver $driver): void {
+    [$gmail, $jmap, $account] = submitSetup($driver);
+    $service = app(MailWriteService::class);
+    $target = submitTarget($account, 'd-1');
+    $revision = $service->draft($target)->revision;
+    $requests = count(Http::recorded());
+    $calls = 0;
+
+    $failure = submitFailure(function (MailWriteService $s) use ($target, $revision, &$calls): void {
+        $s->submit($target, $revision, function () use (&$calls): void {
+            $calls++;
+            throw new MailWriteFailure(MailWriteCode::ClaimSuperseded);
+        });
+    });
+
+    expect($calls)->toBe(1)
+        ->and($failure->safeCode)->toBe(MailWriteCode::ClaimSuperseded)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and(count(Http::recorded()))->toBe($requests)
+        ->and($gmail->sends)->toBe([])
+        ->and($jmap->sends)->toBe([]);
+
+    expect($service->submit($target, $revision)->outcome)->toBe(SubmissionOutcome::Submitted)
+        ->and($driver === MailDriver::Gmail ? $gmail->sends : $jmap->sends)->toHaveCount(1);
+})->with([MailDriver::Gmail, MailDriver::Jmap]);
+
+it('submits once with a current consumer claim checked twice', function (MailDriver $driver): void {
+    [$gmail, $jmap, $account] = submitSetup($driver);
+    $service = app(MailWriteService::class);
+    $target = submitTarget($account, 'd-1');
+    $revision = $service->draft($target)->revision;
+    $calls = 0;
+
+    $result = $service->submit($target, $revision, function () use (&$calls, $gmail, $jmap): void {
+        $calls++;
+        expect($gmail->sends)->toBe([])->and($jmap->sends)->toBe([]);
+    });
+
+    expect($calls)->toBe(2)
+        ->and($result->outcome)->toBe(SubmissionOutcome::Submitted)
+        ->and($driver === MailDriver::Gmail ? $gmail->sends : $jmap->sends)->toHaveCount(1);
+})->with([MailDriver::Gmail, MailDriver::Jmap]);
+
+it('checks the submission deadline after the final consumer callback finishes', function (MailDriver $driver): void {
+    Date::setTestNow('2026-01-01 12:00:00');
+    [$gmail, $jmap, $account] = submitSetup($driver);
+    $service = app(MailWriteService::class);
+    $target = submitTarget($account, 'd-1');
+    $revision = $service->draft($target)->revision;
+    $calls = 0;
+
+    $failure = submitFailure(function (MailWriteService $s) use ($target, $revision, &$calls): void {
+        $s->submit($target, $revision, function () use (&$calls): void {
+            if (++$calls === 2) {
+                Date::setTestNow(Date::now()->addSeconds(301));
+            }
+        });
+    });
+
+    expect($calls)->toBe(2)
+        ->and($failure->safeCode)->toBe(MailWriteCode::LockExpired)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and($gmail->sends)->toBe([])
+        ->and($jmap->sends)->toBe([]);
+})->with([MailDriver::Gmail, MailDriver::Jmap]);
+
+it('fences a submission claimant superseded during slow Gmail credential preparation', function (): void {
+    Date::setTestNow('2026-01-01 12:00:00');
+    DB::statement('CREATE TABLE synthetic_submission_claims (id INTEGER PRIMARY KEY, claim VARCHAR(50))');
+    DB::table('synthetic_submission_claims')->insert(['id' => 1, 'claim' => 'original']);
+    $gmail = new SubmitGmailProvider;
+    $gmail->drafts['d-1'] = ['message' => 'm-1', 'thread' => 't-1', 'raw' => submitBytes('send-1@invented.test')];
+    $account = submitAccount(MailDriver::Gmail);
+    $handler = $gmail->handler();
+    $refreshes = 0;
+    $calls = 0;
+    Http::fake(function (Request $request) use ($handler, &$refreshes, &$calls) {
+        if ($request->url() === 'https://oauth2.googleapis.com/token') {
+            expect($calls)->toBe(1);
+            $refreshes++;
+            // Recovery commits a new durable claim while the old worker waits.
+            Date::setTestNow(Date::now()->addSeconds(301));
+            DB::transaction(fn () => DB::table('synthetic_submission_claims')->where('id', 1)->update(['claim' => 'recovery']));
+
+            return Http::response(['access_token' => 'synthetic-new-access', 'expires_in' => 3600, 'token_type' => 'Bearer', 'scope' => GmailOAuth::SCOPE]);
+        }
+
+        $response = $handler($request);
+        if ($request->method() === 'GET') {
+            Date::setTestNow(Date::now()->addSeconds(40));
+        }
+
+        return $response;
+    });
+    $service = app(MailWriteService::class);
+    $target = submitTarget($account, 'd-1');
+    $revision = $service->draft($target)->revision;
+    $stored = $account->credential()->firstOrFail();
+    app(MailAccountConnection::class)->rotate($account, $stored, new OAuthTokenSetCredential(
+        'synthetic-submit-access', 'synthetic-submit-refresh', Date::now()->addSeconds(100)->toDateTimeImmutable(), [GmailOAuth::SCOPE],
+    ), $stored->version);
+
+    $failure = submitFailure(function (MailWriteService $s) use ($target, $revision, &$calls): void {
+        $s->submit($target, $revision, function () use (&$calls): void {
+            $calls++;
+            if (DB::table('synthetic_submission_claims')->where('id', 1)->value('claim') !== 'original') {
+                throw new MailWriteFailure(MailWriteCode::ClaimSuperseded);
+            }
+        });
+    });
+
+    expect($calls)->toBe(2)
+        ->and($refreshes)->toBe(1)
+        ->and($failure->safeCode)->toBe(MailWriteCode::ClaimSuperseded)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and($gmail->sends)->toBe([])
+        ->and($gmail->drafts)->toHaveKey('d-1');
+    Http::assertNotSent(fn (Request $request): bool => str_ends_with($request->url(), '/drafts/send'));
 });
 
 it('sends a Gmail draft with exactly one drafts.send and returns the confirmed sent message', function (): void {
