@@ -20,6 +20,7 @@ use Jkudish\MailMirror\Enums\SubmissionOutcome;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
+use Jkudish\MailMirror\Jmap\FastmailJmapMailboxReader;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailIdentity;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
@@ -106,6 +107,8 @@ final readonly class MailWriteService
      * commit an expired observation. One-argument callbacks remain supported.
      * The lease is finite and does not stop other provider clients; bound the
      * final transaction commit within the reserved send-step margin.
+     * JMAP unavailable mutation prerequisites are evidence with a false desired
+     * state, not a read failure. apply() still requires strict prerequisites.
      *
      * @param  (Closure(MessageState, Closure(): void): void)|null  $callback
      *
@@ -125,7 +128,7 @@ final readonly class MailWriteService
             $account,
             $this->targetKey($account, $target->providerMessageId).':write-lock',
             function (\DateTimeInterface $sendBy) use ($driver, $account, $target, $change, $callback): MessageState {
-                $state = $this->messageState($driver, $account, $target->providerMessageId, $change);
+                $state = $this->messageState($driver, $account, $target->providerMessageId, $change, forObservation: true);
                 $assertFresh = static function () use ($sendBy): void {
                     if (Date::now()->greaterThan($sendBy)) {
                         throw new MailWriteFailure(MailWriteCode::LockExpired);
@@ -895,10 +898,12 @@ final readonly class MailWriteService
         return sprintf('mail-mirror:account:%d:message-id:%s', $account->id, hash('sha256', $messageId));
     }
 
-    private function messageState(MailboxMutationDriver $driver, MailAccount $account, string $providerMessageId, MailboxChange $change): MessageState
+    private function messageState(MailboxMutationDriver $driver, MailAccount $account, string $providerMessageId, MailboxChange $change, bool $forObservation = false): MessageState
     {
         try {
-            $state = $driver->messageState($account, $providerMessageId, $change);
+            $state = $forObservation && $driver instanceof FastmailJmapMailboxReader
+                ? $driver->messageState($account, $providerMessageId, $change, forObservation: true)
+                : $driver->messageState($account, $providerMessageId, $change);
         } catch (MailImportFailure $failure) {
             throw MailWriteFailure::fromProvider($failure, false);
         }

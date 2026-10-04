@@ -699,25 +699,39 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
         ];
     }
 
-    public function messageState(MailAccount $account, string $providerMessageId, MailboxChange $change): MessageState
+    /**
+     * Observation may describe conclusive unavailable prerequisites, never a
+     * failed provider read. The default remains strict for every mutation read.
+     */
+    public function messageState(MailAccount $account, string $providerMessageId, MailboxChange $change, bool $forObservation = false): MessageState
     {
         $this->assertAccount($account);
         $session = $this->session($account);
         $mailboxes = $this->fetchMailboxes($account, $session)['mailboxes'];
         $roles = [];
-
-        foreach ($this->rolesFor($change->action) as $role) {
-            $roles[$role] = $this->mailboxWithRole($mailboxes, $role);
-        }
-
         $container = $change->containerId;
+        $unavailable = null;
 
-        if ($container !== null && ! isset($mailboxes[$container])) {
-            throw new MailWriteFailure(MailWriteCode::ContainerNotFound);
-        }
+        // Only prerequisite validation is recoverable. Session, mailbox and
+        // email transport/payload failures still propagate without evidence.
+        try {
+            foreach ($this->rolesFor($change->action) as $role) {
+                $roles[$role] = $this->mailboxWithRole($mailboxes, $role);
+            }
 
-        if ($container !== null && $mailboxes[$container]['role'] !== null) {
-            throw new MailWriteFailure(MailWriteCode::UnsupportedContainer);
+            if ($container !== null && ! isset($mailboxes[$container])) {
+                throw new MailWriteFailure(MailWriteCode::ContainerNotFound);
+            }
+
+            if ($container !== null && $mailboxes[$container]['role'] !== null) {
+                throw new MailWriteFailure(MailWriteCode::UnsupportedContainer);
+            }
+        } catch (MailWriteFailure $failure) {
+            if (! $forObservation || ! in_array($failure->safeCode, [MailWriteCode::AmbiguousMailboxRole, MailWriteCode::ContainerNotFound, MailWriteCode::UnsupportedContainer], true)) {
+                throw $failure;
+            }
+
+            $unavailable = $failure->safeCode;
         }
 
         $result = $this->call($account, $session, 'Email/get', [
@@ -740,8 +754,7 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
 
         // Keep role evidence independent of the action: a confirming trash
         // read and a later untrash read must fingerprint the same provider state.
-        // Required roles were checked above; ambiguity in any other role still
-        // belongs to the evidence without making this action unsupported.
+        // Ambiguity belongs to the evidence even when this action needs no roles.
         foreach ($mailboxes as $mailbox) {
             if ($mailbox['role'] !== null) {
                 $roleIds[$mailbox['role']][] = $mailbox['id'];
@@ -764,13 +777,17 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
             $evidence['container_id'] = $container;
         }
 
+        if ($unavailable !== null) {
+            $evidence['unavailable_prerequisite'] = $unavailable->value;
+        }
+
         $evidence['email_state'] = $emailState;
 
         return new MessageState(
             $account->id,
             MailDriver::Jmap,
             $providerMessageId,
-            match ($change->action) {
+            $unavailable === null && match ($change->action) {
                 MailboxAction::MarkRead => in_array('$seen', $keywords, true),
                 MailboxAction::MarkUnread => ! in_array('$seen', $keywords, true),
                 MailboxAction::Star => in_array('$flagged', $keywords, true),
@@ -807,7 +824,7 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
 
         if ($observed->mailAccountId !== $account->id || $observed->driver !== MailDriver::Jmap
             || $observed->desiredStateHolds || ! is_string($state) || ! is_array($observedIds)
-            || ! array_is_list($observedIds)) {
+            || ! array_is_list($observedIds) || array_key_exists('unavailable_prerequisite', $evidence)) {
             throw new MailWriteFailure(MailWriteCode::UnsupportedState);
         }
 

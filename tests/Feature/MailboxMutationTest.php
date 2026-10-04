@@ -12,11 +12,13 @@ use Jkudish\MailMirror\Credentials\MailAccountConnection;
 use Jkudish\MailMirror\Credentials\OAuthTokenSetCredential;
 use Jkudish\MailMirror\Enums\MailboxAction;
 use Jkudish\MailMirror\Enums\MailDriver;
+use Jkudish\MailMirror\Enums\MailImportCode;
 use Jkudish\MailMirror\Enums\MailWriteCode;
 use Jkudish\MailMirror\Enums\MailWriteOutcome;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
 use Jkudish\MailMirror\Gmail\GmailOAuth;
+use Jkudish\MailMirror\Jmap\FastmailJmapMailboxReader;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Write\MailboxChange;
 use Jkudish\MailMirror\Write\MailWriteService;
@@ -911,6 +913,94 @@ it('refuses JMAP role mailboxes and unknown mailboxes as containers without writ
     'the Trash role' => ['mb-trash', MailWriteCode::UnsupportedContainer],
     'the Inbox role' => ['mb-inbox', MailWriteCode::UnsupportedContainer],
     'an unknown mailbox' => ['mb-missing', MailWriteCode::ContainerNotFound],
+]);
+
+it('observes unavailable JMAP prerequisites under the target lock but never uses them to mutate', function (MailboxChange $change, string $unavailable, MailWriteCode $code): void {
+    $jmap = new MutationJmapProvider;
+    $jmap->put('jm-1', ['mb-inbox', 'mb-projects']);
+    Http::fake($jmap->handler());
+    $account = mutationJmapAccount();
+    $target = mutationTarget($account, 'jm-1');
+    $service = app(MailWriteService::class);
+    $before = $service->observe($target, $change);
+
+    if ($unavailable === 'deleted') {
+        $jmap->mailboxes = array_values(array_filter($jmap->mailboxes, fn (array $mailbox): bool => $mailbox['id'] !== 'mb-projects'));
+    } elseif ($unavailable === 'roleful') {
+        $jmap->mailboxes[4]['role'] = 'sent';
+    } elseif ($unavailable === 'missing role') {
+        $jmap->mailboxes[1]['role'] = null;
+    } else {
+        $jmap->mailboxes[] = ['id' => 'mb-archive-2', 'name' => 'Archive 2', 'role' => 'archive'];
+    }
+
+    $receipt = null;
+    $state = $service->observe($target, $change, function (MessageState $observed, Closure $assertFresh) use ($service, $target, $change, &$receipt): void {
+        expect(fn () => $service->observe($target, $change))->toThrow(MailWriteFailure::class, MailWriteCode::TargetBusy->summary());
+        $assertFresh();
+        $receipt = $observed;
+    });
+
+    expect($receipt)->toBe($state)
+        ->and($state->desiredStateHolds)->toBeFalse()
+        ->and($state->providerEvidence['unavailable_prerequisite'])->toBe($code->value)
+        ->and($state->providerEvidence['mailbox_ids'])->toBe(['mb-inbox', 'mb-projects'])
+        ->and($state->providerEvidence['email_state'])->toBe('email-state-10')
+        ->and($state->fingerprint())->not->toBe($before->fingerprint())
+        ->and($service->observe($target, $change)->fingerprint())->toBe($state->fingerprint());
+
+    // Even an approved fingerprint cannot turn unavailable evidence into a no-op or send.
+    try {
+        $service->apply($target, $change, $state->fingerprint());
+        throw new RuntimeException('Unavailable prerequisites reported success.');
+    } catch (MailWriteFailure $failure) {
+        expect($failure->safeCode)->toBe($code)->and($failure->writeSent)->toBeFalse();
+    }
+
+    // The concrete driver's direct mutation surface must refuse this evidence too.
+    expect(fn () => app(FastmailJmapMailboxReader::class)->applyChange($account, $state, $change))
+        ->toThrow(MailWriteFailure::class, MailWriteCode::UnsupportedState->summary())
+        ->and($jmap->writes)->toBe([]);
+})->with([
+    'add deleted container still in membership' => [MailboxChange::addContainer('mb-projects'), 'deleted', MailWriteCode::ContainerNotFound],
+    'remove deleted container' => [MailboxChange::removeContainer('mb-projects'), 'deleted', MailWriteCode::ContainerNotFound],
+    'add now-roleful container already in membership' => [MailboxChange::addContainer('mb-projects'), 'roleful', MailWriteCode::UnsupportedContainer],
+    'remove now-roleful container' => [MailboxChange::removeContainer('mb-projects'), 'roleful', MailWriteCode::UnsupportedContainer],
+    'missing archive role' => [MailboxChange::archive(), 'missing role', MailWriteCode::AmbiguousMailboxRole],
+    'ambiguous archive role' => [MailboxChange::archive(), 'ambiguous role', MailWriteCode::AmbiguousMailboxRole],
+]);
+
+it('does not convert failed JMAP observation reads into unavailable prerequisite evidence', function (string $method, bool $malformed): void {
+    $jmap = new MutationJmapProvider;
+    $jmap->put('jm-1', ['mb-inbox']);
+    $handler = $jmap->handler();
+    Http::fake(function (Request $request) use ($handler, $method, $malformed): mixed {
+        $calls = $request->data()['methodCalls'] ?? [];
+        $call = is_array($calls) ? ($calls[0] ?? null) : null;
+        if (is_array($call) && ($call[0] ?? null) === $method) {
+            return Http::response($malformed ? ['methodResponses' => []] : [], $malformed ? 200 : 503);
+        }
+
+        return $handler($request);
+    });
+    $called = false;
+
+    try {
+        app(MailWriteService::class)->observe(mutationTarget(mutationJmapAccount(), 'jm-1'), MailboxChange::addContainer('mb-missing'), function () use (&$called): void {
+            $called = true;
+        });
+        throw new RuntimeException('A failed read reported evidence.');
+    } catch (MailWriteFailure $failure) {
+        expect($failure->safeCode)->toBe(MailWriteCode::ProviderFailed)
+            ->and($failure->providerCode)->toBe($malformed ? MailImportCode::MalformedPayload : MailImportCode::ProviderUnavailable)
+            ->and($failure->writeSent)->toBeFalse();
+    }
+
+    expect($called)->toBeFalse()->and($jmap->writes)->toBe([]);
+})->with([
+    'Mailbox/get unavailable' => ['Mailbox/get', false],
+    'Email/get unavailable after missing container' => ['Email/get', false],
+    'Email/get malformed after missing container' => ['Email/get', true],
 ]);
 
 it('confirms a possibly applied write on retry as already applied without a second write', function (MailboxChange $change): void {
