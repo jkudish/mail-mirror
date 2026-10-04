@@ -334,6 +334,95 @@ it('rejects mismatched observation owner tuples before reading or invoking the c
     Http::assertNothingSent();
 });
 
+it('refuses expired observations before callbacks or rolls back receipts before their transaction commits', function (string $delayAt): void {
+    Date::setTestNow('2026-01-01 12:00:00');
+    DB::statement('CREATE TABLE synthetic_observation_receipts (id INTEGER PRIMARY KEY, status VARCHAR(50))');
+    DB::table('synthetic_observation_receipts')->insert(['id' => 1, 'status' => 'applying']);
+    $gmail = new MutationGmailProvider;
+    $gmail->labels = ['gm-1' => ['INBOX']];
+    $handler = $gmail->handler();
+    Http::fake(function (Request $request) use ($handler, $delayAt) {
+        $response = $handler($request);
+        if ($delayAt === 'read') {
+            Date::setTestNow(Date::now()->addSeconds(266));
+        }
+
+        return $response;
+    });
+    $target = mutationTarget(mutationGmailAccount(), 'gm-1');
+    config()->set('mail-mirror.writes.enabled', false);
+    $called = false;
+    try {
+        app(MailWriteService::class)->observe($target, MailboxChange::markRead(), function (MessageState $state, ?Closure $assertFresh = null) use ($delayAt, &$called): void {
+            $called = true;
+            DB::transaction(function () use ($state, $assertFresh, $delayAt): void {
+                DB::table('synthetic_observation_receipts')->where('id', 1)->lockForUpdate()->first();
+                if ($delayAt === 'rows') {
+                    Date::setTestNow(Date::now()->addSeconds(266));
+                }
+                $assertFresh?->__invoke();
+                DB::table('synthetic_observation_receipts')->where('id', 1)->update(['status' => $state->desiredStateHolds ? 'satisfied' : 'divergent']);
+                if ($delayAt === 'commit') {
+                    Date::setTestNow(Date::now()->addSeconds(266));
+                }
+                $assertFresh?->__invoke();
+            });
+        });
+        $failure = null;
+    } catch (MailWriteFailure $caught) {
+        $failure = $caught;
+    }
+    expect($failure)->toBeInstanceOf(MailWriteFailure::class);
+    assert($failure instanceof MailWriteFailure);
+    expect($failure->safeCode)->toBe(MailWriteCode::LockExpired)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and($called)->toBe($delayAt !== 'read')
+        ->and(DB::table('synthetic_observation_receipts')->where('id', 1)->value('status'))->toBe('applying')
+        ->and($gmail->writes)->toBe([]);
+})->with(['read', 'rows', 'commit']);
+
+it('does not resolve an old observation after another writer acquires its expired target lease and sends', function (): void {
+    Date::setTestNow('2026-01-01 12:00:00');
+    DB::statement('CREATE TABLE synthetic_race_receipts (id INTEGER PRIMARY KEY, status VARCHAR(50))');
+    DB::table('synthetic_race_receipts')->insert(['id' => 1, 'status' => 'applying']);
+    $gmail = new MutationGmailProvider;
+    $gmail->labels = ['gm-1' => ['INBOX']];
+    Http::fake($gmail->handler());
+    $target = mutationTarget(mutationGmailAccount(), 'gm-1');
+    $service = app(MailWriteService::class);
+    config()->set('mail-mirror.writes.enabled', false);
+    try {
+        $service->observe($target, MailboxChange::markUnread(), function (MessageState $state, Closure $assertFresh) use ($service, $target): void {
+            expect($state->desiredStateHolds)->toBeFalse();
+            // Deterministically interleave a delayed original writer while the
+            // observer is waiting for consumer rows and its cache lease expires.
+            Date::setTestNow(Date::now()->addSeconds(301));
+            config()->set('mail-mirror.writes.enabled', true);
+            $result = $service->apply($target, MailboxChange::markUnread(), null, function (): void {
+                if (DB::table('synthetic_race_receipts')->where('id', 1)->value('status') !== 'applying') {
+                    throw new MailWriteFailure(MailWriteCode::ClaimSuperseded);
+                }
+            });
+            expect($result->outcome)->toBe(MailWriteOutcome::Applied);
+            DB::transaction(function () use ($state, $assertFresh): void {
+                DB::table('synthetic_race_receipts')->where('id', 1)->lockForUpdate()->first();
+                $assertFresh();
+                DB::table('synthetic_race_receipts')->where('id', 1)->update(['status' => $state->desiredStateHolds ? 'satisfied' : 'divergent']);
+                $assertFresh();
+            });
+        });
+        $failure = null;
+    } catch (MailWriteFailure $caught) {
+        $failure = $caught;
+    }
+    assert($failure instanceof MailWriteFailure);
+    expect($failure->safeCode)->toBe(MailWriteCode::LockExpired)
+        ->and($failure->writeSent)->toBeFalse()
+        ->and(DB::table('synthetic_race_receipts')->where('id', 1)->value('status'))->toBe('applying')
+        ->and($gmail->labels['gm-1'])->toBe(['INBOX', 'UNREAD'])
+        ->and($gmail->writes)->toHaveCount(1);
+});
+
 it('fingerprints unordered evidence without normalizing opaque IDs or derived destination predicates', function (): void {
     $evidence = ['label_ids' => ['10', '02', '2'], 'history_id' => '00100'];
     $state = new MessageState(1, MailDriver::Gmail, '0001', false, $evidence);

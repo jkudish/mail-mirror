@@ -537,9 +537,22 @@ only reads provider metadata. It works with writes disabled and neither records
 nor clears mutation intents. The callback receives the returned `MessageState`
 while the lock is held. Commit your receipt-reconciliation transaction inside
 that callback, before returning; a transaction surrounding `observe()` commits
-too late. Callback exceptions propagate and release the lock. Bound reads and
-callback work to the configured lock lease; this is not an indefinitely renewed
-lock and does not block other provider clients.
+too late. The callback's optional second argument is `Closure $assertFresh`.
+Invoke it inside your transaction after acquiring account/receipt rows and
+immediately before returning from the transaction. It throws `LockExpired`
+with `writeSent` false when the conservative observation deadline has passed,
+so the transaction rolls back instead of committing an expired read. The
+service also checks freshness before invoking the callback; existing
+one-argument callbacks remain supported. There is no post-callback check that
+could undo your already-committed receipt.
+
+Callback exceptions propagate and release the lock. Bound reads and callback
+work to the configured lock lease. The freshness deadline reserves the same
+send-step margin as writes (35 seconds with default timeouts) for the final
+commit; an arbitrary process pause between the final check and commit is not
+fenced by a time check. Consumers still need account/receipt row locking and
+durable claim fencing. This is not an indefinitely renewed lock and does not
+block other provider clients.
 
 `MessageState::fingerprint(): string` returns a versioned SHA-256 of account,
 driver, exact opaque message ID, and canonical provider evidence. Evidence map

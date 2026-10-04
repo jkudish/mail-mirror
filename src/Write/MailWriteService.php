@@ -100,10 +100,14 @@ final readonly class MailWriteService
      * Read live provider metadata without writes or intent changes, even when
      * writes are disabled. The optional callback receives that same state under
      * the mutation target lock: commit consumer receipt reconciliation before
-     * returning from it. Keep it bounded by the configured lock lease; the lock
-     * does not stop other provider clients from changing the mailbox.
+     * returning from it. Its second argument, assertFresh(), throws LockExpired
+     * after the conservative lock deadline. Call it inside that transaction
+     * after acquiring rows and immediately before returning, so a wait cannot
+     * commit an expired observation. One-argument callbacks remain supported.
+     * The lease is finite and does not stop other provider clients; bound the
+     * final transaction commit within the reserved send-step margin.
      *
-     * @param  Closure(MessageState): void|null  $callback
+     * @param  (Closure(MessageState, Closure(): void): void)|null  $callback
      *
      * @throws AccountResourceMismatch before any provider request
      * @throws MailWriteFailure
@@ -120,9 +124,15 @@ final readonly class MailWriteService
         return $this->withLock(
             $account,
             $this->targetKey($account, $target->providerMessageId).':write-lock',
-            function () use ($driver, $account, $target, $change, $callback): MessageState {
+            function (\DateTimeInterface $sendBy) use ($driver, $account, $target, $change, $callback): MessageState {
                 $state = $this->messageState($driver, $account, $target->providerMessageId, $change);
-                $callback?->__invoke($state);
+                $assertFresh = static function () use ($sendBy): void {
+                    if (Date::now()->greaterThan($sendBy)) {
+                        throw new MailWriteFailure(MailWriteCode::LockExpired);
+                    }
+                };
+                $assertFresh();
+                $callback?->__invoke($state, $assertFresh);
 
                 return $state;
             },

@@ -30,6 +30,9 @@ The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reads live metadata with writes disabled and holds the mutation lock through
   consumer receipt reconciliation, without mutation intents. `MessageState`
   fingerprints canonical unordered evidence with exact opaque IDs.
+  Observation callbacks can take a second `assertFresh()` closure to check
+  the lease deadline inside their receipt transaction before it commits;
+  expired reads fail `lock_expired` before the callback is invoked.
 - Optional expected fingerprint and consumer claim guard on `apply()` refuse
   stale state or superseded claims before writing. Claims are rechecked after
   credential preparation and before the send deadline check. Guarded no-ops
