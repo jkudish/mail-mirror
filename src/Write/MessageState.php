@@ -30,4 +30,39 @@ final readonly class MessageState
             throw new InvalidArgumentException('Message state requires an account and a bounded opaque provider message ID.');
         }
     }
+
+    /**
+     * Versioned SHA-256 of account, driver, exact opaque message ID and all
+     * provider evidence. Evidence maps and set lists are unordered; scalar
+     * types and bytes are preserved. The derived destination predicate is not
+     * provider state, so an action and its inverse can compare the same read.
+     */
+    public function fingerprint(): string
+    {
+        return hash('sha256', serialize([
+            'mail-mirror-message-state-v1',
+            $this->mailAccountId,
+            $this->driver->value,
+            $this->providerMessageId,
+            self::canonicalEvidence($this->providerEvidence),
+        ]));
+    }
+
+    private static function canonicalEvidence(mixed $value): mixed
+    {
+        if (! is_array($value)) {
+            return $value;
+        }
+
+        $list = array_is_list($value);
+        $value = array_map(self::canonicalEvidence(...), $value);
+
+        if ($list) {
+            usort($value, fn (mixed $a, mixed $b): int => strcmp(serialize($a), serialize($b)));
+        } else {
+            ksort($value, SORT_STRING);
+        }
+
+        return $value;
+    }
 }

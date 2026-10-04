@@ -20,6 +20,7 @@ use Jkudish\MailMirror\Enums\SubmissionOutcome;
 use Jkudish\MailMirror\Exceptions\AccountResourceMismatch;
 use Jkudish\MailMirror\Exceptions\MailImportFailure;
 use Jkudish\MailMirror\Exceptions\MailWriteFailure;
+use Jkudish\MailMirror\Jmap\FastmailJmapMailboxReader;
 use Jkudish\MailMirror\Models\MailAccount;
 use Jkudish\MailMirror\Models\MailIdentity;
 use Jkudish\MailMirror\Read\MailDriverRegistry;
@@ -55,11 +56,19 @@ final readonly class MailWriteService
 
     /**
      * Apply one reversible mailbox change to exactly one provider message.
+     * An expected fingerprint must match a live read under the target lock,
+     * before changing intents or preparing a write. A claim guard throws
+     * MailWriteFailure(ClaimSuperseded) when the consumer's durable claim is
+     * no longer current; it runs before any already-state result and again
+     * after credential preparation, immediately before the send deadline check.
+     * Either guard opts into AlreadySatisfied when no matching intent exists.
+     *
+     * @param  Closure(): void|null  $claimGuard
      *
      * @throws AccountResourceMismatch before any provider request
      * @throws MailWriteFailure
      */
-    public function apply(MailWriteTarget $target, MailboxChange $change): MailWriteResult
+    public function apply(MailWriteTarget $target, MailboxChange $change, ?string $expectedFingerprint = null, ?Closure $claimGuard = null): MailWriteResult
     {
         $this->assertWritesEnabled();
         $account = $this->account($target);
@@ -82,7 +91,54 @@ final readonly class MailWriteService
                 $targetKey,
                 $sendBy,
                 $sendSeconds,
+                $expectedFingerprint,
+                $claimGuard,
             ),
+        );
+    }
+
+    /**
+     * Read live provider metadata without writes or intent changes, even when
+     * writes are disabled. The optional callback receives that same state under
+     * the mutation target lock: commit consumer receipt reconciliation before
+     * returning from it. Its second argument, assertFresh(), throws LockExpired
+     * after the conservative lock deadline. Call it inside that transaction
+     * after acquiring rows and immediately before returning, so a wait cannot
+     * commit an expired observation. One-argument callbacks remain supported.
+     * The lease is finite and does not stop other provider clients; bound the
+     * final transaction commit within the reserved send-step margin.
+     * JMAP unavailable mutation prerequisites are evidence with a false desired
+     * state, not a read failure. apply() still requires strict prerequisites.
+     *
+     * @param  (Closure(MessageState, Closure(): void): void)|null  $callback
+     *
+     * @throws AccountResourceMismatch before any provider request
+     * @throws MailWriteFailure
+     */
+    public function observe(MailWriteTarget $target, MailboxChange $change, ?Closure $callback = null): MessageState
+    {
+        $account = $this->account($target);
+        $driver = $this->drivers->reader($account->driver);
+
+        if (! $driver instanceof MailboxMutationDriver) {
+            throw new MailWriteFailure(MailWriteCode::UnsupportedDriver);
+        }
+
+        return $this->withLock(
+            $account,
+            $this->targetKey($account, $target->providerMessageId).':write-lock',
+            function (\DateTimeInterface $sendBy) use ($driver, $account, $target, $change, $callback): MessageState {
+                $state = $this->messageState($driver, $account, $target->providerMessageId, $change, forObservation: true);
+                $assertFresh = static function () use ($sendBy): void {
+                    if (Date::now()->greaterThan($sendBy)) {
+                        throw new MailWriteFailure(MailWriteCode::LockExpired);
+                    }
+                };
+                $assertFresh();
+                $callback?->__invoke($state, $assertFresh);
+
+                return $state;
+            },
         );
     }
 
@@ -133,6 +189,7 @@ final readonly class MailWriteService
         }
     }
 
+    /** @param Closure(): void|null $claimGuard */
     private function applyLocked(
         MailboxMutationDriver $driver,
         MailAccount $account,
@@ -141,14 +198,26 @@ final readonly class MailWriteService
         string $targetKey,
         \DateTimeInterface $sendBy,
         int $sendSeconds,
+        ?string $expectedFingerprint,
+        ?Closure $claimGuard,
     ): MailWriteResult {
         $intent = $targetKey.':intent:'.$change->intentName();
         $observed = $this->messageState($driver, $account, $providerMessageId, $change);
+
+        if ($expectedFingerprint !== null && ! hash_equals($expectedFingerprint, $observed->fingerprint())) {
+            throw new MailWriteFailure(MailWriteCode::StaleState);
+        }
+
+        $claimGuard?->__invoke();
 
         if ($observed->desiredStateHolds) {
             // Only the last change this package may have applied to the message counts:
             // any later write, including the inverse change, replaced its intent.
             if ($this->cache->get($intent) !== $change->intentValue()) {
+                if ($expectedFingerprint !== null || $claimGuard !== null) {
+                    return $this->result($account, $observed, MailWriteOutcome::AlreadySatisfied);
+                }
+
                 throw new MailWriteFailure($change->action->unchangedCode());
             }
 
@@ -163,6 +232,10 @@ final readonly class MailWriteService
         } catch (MailImportFailure $failure) {
             throw MailWriteFailure::fromProvider($failure, false);
         }
+
+        // Consumer work can wait on its database or supersede this claim. Both
+        // it and credential preparation must finish before checking the deadline.
+        $claimGuard?->__invoke();
 
         if (Date::now()->greaterThan($sendBy)) {
             throw new MailWriteFailure(MailWriteCode::LockExpired);
@@ -825,10 +898,12 @@ final readonly class MailWriteService
         return sprintf('mail-mirror:account:%d:message-id:%s', $account->id, hash('sha256', $messageId));
     }
 
-    private function messageState(MailboxMutationDriver $driver, MailAccount $account, string $providerMessageId, MailboxChange $change): MessageState
+    private function messageState(MailboxMutationDriver $driver, MailAccount $account, string $providerMessageId, MailboxChange $change, bool $forObservation = false): MessageState
     {
         try {
-            $state = $driver->messageState($account, $providerMessageId, $change);
+            $state = $forObservation && $driver instanceof FastmailJmapMailboxReader
+                ? $driver->messageState($account, $providerMessageId, $change, forObservation: true)
+                : $driver->messageState($account, $providerMessageId, $change);
         } catch (MailImportFailure $failure) {
             throw MailWriteFailure::fromProvider($failure, false);
         }

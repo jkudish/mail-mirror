@@ -480,8 +480,10 @@ message only. Gmail evidence contains `label_ids` and `history_id`. JMAP
 sends one `Email/set` update with `ifInState` from the pre-write read, and
 resolves each role through exactly one mailbox with that role, or fails with
 `ambiguous_mailbox_role`. JMAP evidence contains `mailbox_ids`, the
-`<role>_mailbox_id` of each role used, `keywords` for keyword changes,
-`container_id` for container changes, and `email_state`.
+`<role>_mailbox_id` of every uniquely resolved role, `keywords` for all changes,
+`container_id` for container changes, and `email_state`. Other ambiguous roles
+are recorded as role-to-ID lists in `ambiguous_mailbox_roles`; a role required
+by the requested action must still resolve uniquely.
 
 Containers are user labels or role-less mailboxes. Gmail system labels
 (upper-case IDs such as `INBOX` or `CATEGORY_UPDATES`) and JMAP role mailboxes
@@ -517,8 +519,8 @@ Any other outcome throws `MailWriteFailure`. Its `safeCode` is one of
 `writes_disabled`, `message_not_found`, `already_in_state`, `not_in_trash`,
 `ambiguous_mailbox_role`, `unsupported_container`, `container_not_found`,
 `unsupported_state`, `provider_failed`, `target_busy`, `lock_expired`,
-`unconfirmed`, or `unsupported_driver`. `providerCode` carries the underlying
-provider classification when one exists.
+`unconfirmed`, `unsupported_driver`, `stale_state`, or `claim_superseded`.
+`providerCode` carries the underlying provider classification when one exists.
 
 `writeSent` is true when the provider may have applied the write: the request
 was sent and the provider did not answer with a 4xx status or a JMAP
@@ -526,6 +528,60 @@ method-level rejection. Call the same change again to confirm it without a
 second write. `writeSent` is false when nothing was sent or the provider
 definitively rejected the write. A Gmail 401 on the write refreshes the token
 but does not re-send the write, and reports `writeSent` false.
+
+### Observe and guard durable consumer actions
+
+`observe(MailWriteTarget $target, MailboxChange $change, ?Closure $callback = null): MessageState`
+resolves the same owner tuple and holds the same target lock as `apply()`, but
+only reads provider metadata. It works with writes disabled and neither records
+nor clears mutation intents. The callback receives the returned `MessageState`
+while the lock is held. Commit your receipt-reconciliation transaction inside
+that callback, before returning; a transaction surrounding `observe()` commits
+too late. The callback's optional second argument is `Closure $assertFresh`.
+Invoke it inside your transaction after acquiring account/receipt rows and
+immediately before returning from the transaction. It throws `LockExpired`
+with `writeSent` false when the conservative observation deadline has passed,
+so the transaction rolls back instead of committing an expired read. The
+service also checks freshness before invoking the callback; existing
+one-argument callbacks remain supported. There is no post-callback check that
+could undo your already-committed receipt.
+
+Callback exceptions propagate and release the lock. Bound reads and callback
+work to the configured lock lease. The freshness deadline reserves the same
+send-step margin as writes (35 seconds with default timeouts) for the final
+commit; an arbitrary process pause between the final check and commit is not
+fenced by a time check. Consumers still need account/receipt row locking and
+durable claim fencing. This is not an indefinitely renewed lock and does not
+block other provider clients.
+
+`MessageState::fingerprint(): string` returns a versioned SHA-256 of account,
+driver, exact opaque message ID, and canonical provider evidence. Evidence map
+order and collection order do not matter; scalar types and string bytes do.
+The derived `desiredStateHolds` predicate is excluded, so a change and its
+inverse can compare the same provider state. JMAP evidence includes keywords
+and roles for every action. Provider revisions remain part of the fingerprint:
+an unrelated JMAP account Email-state change can conservatively make it stale.
+
+`apply($target, $change, ?string $expectedFingerprint = null, ?Closure $claimGuard = null)`
+keeps the two-argument behavior. A supplied fingerprint is checked against a
+fresh provider read under the lock before intent changes or write preparation;
+a mismatch throws `MailWriteFailure(MailWriteCode::StaleState)` with
+`writeSent` false, even if the destination state now holds.
+
+The no-argument claim guard must recheck your durable action status and claim
+token, throwing `new MailWriteFailure(MailWriteCode::ClaimSuperseded)` when
+superseded. It runs before returning an already-state result and, when a write
+is needed, again after credential preparation immediately before sending. The
+send deadline is checked **after** that callback. Claim refusal propagates as a
+definite no-write failure, not an unknown provider outcome. Your consumer owns
+claim storage, recovery policy, and the atomic checks inside the guard.
+
+Supplying either guard opts into `MailWriteOutcome::AlreadySatisfied` when the
+destination holds without a matching package intent. This outcome observes
+satisfaction; it does not prove earlier execution. A matching intent still
+returns `AlreadyApplied`. For an unknown durable attempt, use read-only
+`observe()` and reconcile its receipt; do not replay a divergent attempt merely
+because the package intent cache was lost.
 
 ## Manage provider drafts
 

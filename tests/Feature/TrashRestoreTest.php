@@ -224,7 +224,7 @@ final class TrashRestoreJmapProvider
                 'Email/get' => is_string($id) && isset($this->emails[$accountId][$id])
                     ? $reply('Email/get', [
                         'state' => 'synthetic-email-state-'.$this->state,
-                        'list' => [['id' => $id, 'mailboxIds' => $this->emails[$accountId][$id]]],
+                        'list' => [['id' => $id, 'mailboxIds' => $this->emails[$accountId][$id], 'keywords' => []]],
                         'notFound' => [],
                     ])
                     : $reply('Email/get', ['state' => 'synthetic-email-state-'.$this->state, 'list' => [], 'notFound' => [$id]]),
@@ -456,8 +456,10 @@ it('moves one JMAP email from the Trash role to the Inbox role and confirms it b
         ->and($result->driver)->toBe(MailDriver::Jmap)
         ->and($result->providerEvidence)->toBe([
             'mailbox_ids' => ['mb-inbox'],
-            'trash_mailbox_id' => 'mb-trash',
+            'keywords' => [],
             'inbox_mailbox_id' => 'mb-inbox',
+            'trash_mailbox_id' => 'mb-trash',
+            'archive_mailbox_id' => 'mb-archive',
             'email_state' => 'synthetic-email-state-41',
         ])
         ->and($jmap->writes)->toBe([[

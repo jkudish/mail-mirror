@@ -699,54 +699,86 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
         ];
     }
 
-    public function messageState(MailAccount $account, string $providerMessageId, MailboxChange $change): MessageState
+    /**
+     * Observation may describe conclusive unavailable prerequisites, never a
+     * failed provider read. The default remains strict for every mutation read.
+     */
+    public function messageState(MailAccount $account, string $providerMessageId, MailboxChange $change, bool $forObservation = false): MessageState
     {
         $this->assertAccount($account);
         $session = $this->session($account);
         $mailboxes = $this->fetchMailboxes($account, $session)['mailboxes'];
         $roles = [];
-
-        foreach ($this->rolesFor($change->action) as $role) {
-            $roles[$role] = $this->mailboxWithRole($mailboxes, $role);
-        }
-
         $container = $change->containerId;
+        $unavailable = null;
 
-        if ($container !== null && ! isset($mailboxes[$container])) {
-            throw new MailWriteFailure(MailWriteCode::ContainerNotFound);
+        // Only prerequisite validation is recoverable. Session, mailbox and
+        // email transport/payload failures still propagate without evidence.
+        try {
+            foreach ($this->rolesFor($change->action) as $role) {
+                $roles[$role] = $this->mailboxWithRole($mailboxes, $role);
+            }
+
+            if ($container !== null && ! isset($mailboxes[$container])) {
+                throw new MailWriteFailure(MailWriteCode::ContainerNotFound);
+            }
+
+            if ($container !== null && $mailboxes[$container]['role'] !== null) {
+                throw new MailWriteFailure(MailWriteCode::UnsupportedContainer);
+            }
+        } catch (MailWriteFailure $failure) {
+            if (! $forObservation || ! in_array($failure->safeCode, [MailWriteCode::AmbiguousMailboxRole, MailWriteCode::ContainerNotFound, MailWriteCode::UnsupportedContainer], true)) {
+                throw $failure;
+            }
+
+            $unavailable = $failure->safeCode;
         }
 
-        if ($container !== null && $mailboxes[$container]['role'] !== null) {
-            throw new MailWriteFailure(MailWriteCode::UnsupportedContainer);
-        }
-
-        $keywordChange = in_array($change->action, [
-            MailboxAction::MarkRead, MailboxAction::MarkUnread, MailboxAction::Star, MailboxAction::Unstar,
-        ], true);
         $result = $this->call($account, $session, 'Email/get', [
             'accountId' => $account->provider_account_id,
             'ids' => [$providerMessageId],
-            'properties' => $keywordChange ? ['id', 'mailboxIds', 'keywords'] : ['id', 'mailboxIds'],
+            'properties' => ['id', 'mailboxIds', 'keywords'],
         ], 'email', MailImportStage::Retrieve);
         $emailState = $this->boundedString($result['state'] ?? null, 255, MailImportStage::Retrieve);
         $email = $this->singleObject($result, $providerMessageId, MailImportStage::Retrieve);
-        $mailboxIds = array_keys($this->truthMap($email['mailboxIds'] ?? null, MailImportStage::Retrieve));
-        sort($mailboxIds);
-        $keywords = $keywordChange ? array_keys($this->truthMap($email['keywords'] ?? null, MailImportStage::Retrieve)) : [];
-        sort($keywords);
+        // JSON object keys like "2" become PHP integer keys. Restore their
+        // exact string representation; never sort opaque IDs numerically.
+        $mailboxIds = array_map(strval(...), array_keys($this->truthMap($email['mailboxIds'] ?? null, MailImportStage::Retrieve)));
+        sort($mailboxIds, SORT_STRING);
+        $keywords = array_map(strval(...), array_keys($this->truthMap($email['keywords'] ?? null, MailImportStage::Retrieve)));
+        sort($keywords, SORT_STRING);
         $in = fn (string $role): bool => in_array($roles[$role], $mailboxIds, true);
-        $evidence = ['mailbox_ids' => $mailboxIds];
+        $evidence = ['mailbox_ids' => $mailboxIds, 'keywords' => $keywords];
+        $roleIds = [];
+        $ambiguousRoles = [];
 
-        foreach ($roles as $role => $mailboxId) {
-            $evidence[$role.'_mailbox_id'] = $mailboxId;
+        // Keep role evidence independent of the action: a confirming trash
+        // read and a later untrash read must fingerprint the same provider state.
+        // Ambiguity belongs to the evidence even when this action needs no roles.
+        foreach ($mailboxes as $mailbox) {
+            if ($mailbox['role'] !== null) {
+                $roleIds[$mailbox['role']][] = $mailbox['id'];
+            }
         }
 
-        if ($keywordChange) {
-            $evidence['keywords'] = $keywords;
+        foreach ($roleIds as $role => $ids) {
+            if (count($ids) === 1) {
+                $evidence[$role.'_mailbox_id'] = $ids[0];
+            } else {
+                $ambiguousRoles[$role] = $ids;
+            }
+        }
+
+        if ($ambiguousRoles !== []) {
+            $evidence['ambiguous_mailbox_roles'] = $ambiguousRoles;
         }
 
         if ($container !== null) {
             $evidence['container_id'] = $container;
+        }
+
+        if ($unavailable !== null) {
+            $evidence['unavailable_prerequisite'] = $unavailable->value;
         }
 
         $evidence['email_state'] = $emailState;
@@ -755,7 +787,7 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
             $account->id,
             MailDriver::Jmap,
             $providerMessageId,
-            match ($change->action) {
+            $unavailable === null && match ($change->action) {
                 MailboxAction::MarkRead => in_array('$seen', $keywords, true),
                 MailboxAction::MarkUnread => ! in_array('$seen', $keywords, true),
                 MailboxAction::Star => in_array('$flagged', $keywords, true),
@@ -792,7 +824,7 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
 
         if ($observed->mailAccountId !== $account->id || $observed->driver !== MailDriver::Jmap
             || $observed->desiredStateHolds || ! is_string($state) || ! is_array($observedIds)
-            || ! array_is_list($observedIds)) {
+            || ! array_is_list($observedIds) || array_key_exists('unavailable_prerequisite', $evidence)) {
             throw new MailWriteFailure(MailWriteCode::UnsupportedState);
         }
 
@@ -2001,14 +2033,16 @@ final class FastmailJmapMailboxReader implements BudgetedDeltaMailboxReader, Mai
     /** @return array<string, true> */
     private function truthMap(mixed $value, MailImportStage $stage): array
     {
-        if (! is_array($value) || ($value !== [] && array_is_list($value)) || count($value) > 10000) {
+        if (! is_array($value) || count($value) > 10000) {
             throw new MailImportFailure($stage, MailImportCode::MalformedPayload);
         }
 
         $result = [];
 
         foreach ($value as $key => $present) {
-            if (! is_string($key) || $key === '' || mb_strlen($key) > 255 || $present !== true) {
+            $key = (string) $key;
+
+            if ($key === '' || mb_strlen($key) > 255 || $present !== true) {
                 throw new MailImportFailure($stage, MailImportCode::MalformedPayload);
             }
 
